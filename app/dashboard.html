@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orbit Wars Dashboard</title>
+<style>
+  :root {
+    --bg: #0b0d17;
+    --panel: #141826;
+    --panel-2: #1c2135;
+    --border: #252b3d;
+    --border-hot: #3b6ef0;
+    --text: #e8ecf2;
+    --muted: #8b93a8;
+    --accent: #3b6ef0;
+    --win: #7dd89f;
+    --err: #f07b7b;
+    --p1: #3b6ef0;
+    --p2: #f07b7b;
+    --p3: #7dd89f;
+    --p4: #f0c93b;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: var(--bg); color: var(--text); display: flex; flex-direction: column; overflow: hidden; }
+  header { padding: 12px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 20px; flex-shrink: 0; }
+  h1 { margin: 0; font-size: 18px; letter-spacing: 0.3px; }
+  h2 { margin: 0 0 10px 0; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+  .tabs { display: flex; gap: 2px; background: var(--panel); padding: 4px; border-radius: 6px; }
+  .tab { padding: 6px 16px; cursor: pointer; border-radius: 4px; color: var(--muted); user-select: none; font-size: 14px; }
+  .tab.active { background: #2b3350; color: #fff; }
+
+  .layout { display: flex; flex: 1; min-height: 0; }
+  aside.sidebar { width: 220px; flex-shrink: 0; border-right: 1px solid var(--border); padding: 16px; background: var(--panel); overflow-y: auto; }
+  main { flex: 1; padding: 14px 18px; overflow: hidden; min-width: 0; display: flex; flex-direction: column; }
+  .pane { display: none; }
+  .pane.active { display: flex; flex-direction: column; gap: 10px; height: 100%; min-height: 0; }
+
+  .agent-list { display: flex; flex-direction: column; gap: 6px; }
+  .agent-card { padding: 8px 12px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; cursor: grab; user-select: none; font-size: 14px; font-family: ui-monospace, "SF Mono", Menlo, monospace; transition: all 0.15s; }
+  .agent-card:hover { border-color: var(--accent); background: #232a43; }
+  .agent-card:active { cursor: grabbing; }
+  .agent-card.dragging { opacity: 0.4; }
+  .hint { font-size: 11px; color: var(--muted); line-height: 1.5; margin-top: 12px; }
+
+  .controls-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; flex-shrink: 0; }
+  button, .toggle { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-size: 13px; font-family: inherit; }
+  button { cursor: pointer; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+  button:hover:not(:disabled) { filter: brightness(1.15); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.secondary { background: var(--panel); border-color: var(--border); font-weight: 400; color: var(--muted); }
+  .toggle { padding: 2px; display: flex; gap: 2px; }
+  .toggle button { background: transparent; border: none; padding: 4px 12px; font-weight: 400; color: var(--muted); border-radius: 3px; font-size: 13px; }
+  .toggle button.active { background: #2b3350; color: #fff; }
+
+  .slots { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .slot { position: relative; display: flex; align-items: center; gap: 6px; min-width: 130px; height: 32px; padding: 0 10px 0 8px; border: 1.5px dashed var(--border); border-radius: 4px; background: var(--panel); font-size: 13px; transition: border-color 0.15s, background 0.15s; }
+  .slot.disabled { opacity: 0.35; pointer-events: none; }
+  .slot .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--border); flex-shrink: 0; }
+  .slot .pname { font-size: 10px; color: var(--muted); letter-spacing: 0.5px; text-transform: uppercase; width: 22px; flex-shrink: 0; }
+  .slot .body { font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); font-style: italic; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .slot.filled { border-style: solid; background: var(--panel-2); }
+  .slot.filled .body { color: var(--text); font-style: normal; }
+  .slot.drag-over { border-color: var(--border-hot); background: #1c2a4a; }
+  .slot.filled[data-player="0"] { border-color: var(--p1); }
+  .slot.filled[data-player="1"] { border-color: var(--p2); }
+  .slot.filled[data-player="2"] { border-color: var(--p3); }
+  .slot.filled[data-player="3"] { border-color: var(--p4); }
+  .slot[data-player="0"] .dot { background: var(--p1); }
+  .slot[data-player="1"] .dot { background: var(--p2); }
+  .slot[data-player="2"] .dot { background: var(--p3); }
+  .slot[data-player="3"] .dot { background: var(--p4); }
+  .slot .clear-btn { background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 15px; line-height: 1; padding: 0 3px; border-radius: 3px; }
+  .slot .clear-btn:hover { color: var(--err); }
+
+  #status { color: var(--muted); font-size: 12px; flex-shrink: 0; }
+  #status.error { color: var(--err); }
+  #summary { font-size: 13px; color: var(--muted); flex-shrink: 0; }
+  #summary .winner { color: var(--win); font-weight: 600; }
+  .match-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; flex: 1; min-height: 0; }
+  #replay { width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 4px; background: #000; }
+
+  .log-panel { display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; min-height: 0; }
+  .log-panel header.log-header { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; flex-shrink: 0; background: var(--panel); }
+  .log-panel .log-count { color: var(--accent); font-family: ui-monospace, "SF Mono", Menlo, monospace; text-transform: none; letter-spacing: 0; }
+  .log-body-wrap { flex: 1; overflow: auto; }
+  .log-table { width: 100%; border-collapse: collapse; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+  .log-table th, .log-table td { padding: 3px 10px; text-align: right; }
+  .log-table th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--panel); border-bottom: 1px solid var(--border); z-index: 1; }
+  .log-table th:first-child, .log-table td:first-child { text-align: left; color: var(--muted); }
+  .log-table th[data-p="0"] { color: var(--p1); }
+  .log-table th[data-p="1"] { color: var(--p2); }
+  .log-table th[data-p="2"] { color: var(--p3); }
+  .log-table th[data-p="3"] { color: var(--p4); }
+  .log-table tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.02); }
+
+  #chart { flex-shrink: 0; width: 100%; height: 180px; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 8px; }
+  #chart svg { width: 100%; height: 100%; display: block; }
+  #chart .empty { color: var(--muted); font-style: italic; font-size: 12px; padding: 12px; text-align: center; }
+
+  .placeholder { color: var(--muted); font-style: italic; padding: 60px 20px; text-align: center; border: 1px dashed var(--border); border-radius: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Orbit Wars</h1>
+  <div class="tabs" id="tabs">
+    <div class="tab active" data-tab="play">Play</div>
+    <div class="tab" data-tab="train">Train</div>
+  </div>
+</header>
+<div class="layout">
+  <aside class="sidebar">
+    <h2>Agents</h2>
+    <div class="agent-list" id="agentList"></div>
+    <p class="hint">Drag an agent onto a player slot. An agent can fill multiple slots.</p>
+  </aside>
+  <main>
+    <section class="pane active" id="pane-play">
+      <div class="controls-row">
+        <div class="toggle" id="nplayers">
+          <button data-n="2" class="active">2P</button>
+          <button data-n="4">4P</button>
+        </div>
+        <div class="slots" id="slots"></div>
+        <button id="run" disabled>Run Match</button>
+        <button id="clear" class="secondary">Clear</button>
+      </div>
+      <div id="status">ready</div>
+      <div id="summary"></div>
+      <div class="match-row">
+        <iframe id="replay" src="about:blank"></iframe>
+        <div class="log-panel">
+          <header class="log-header">
+            <span>Score log</span>
+            <span class="log-count" id="logCount">0 steps</span>
+          </header>
+          <div class="log-body-wrap" id="logWrap">
+            <table class="log-table"><thead id="logHead"></thead><tbody id="logBody"></tbody></table>
+          </div>
+        </div>
+      </div>
+      <div id="chart"><div class="empty">run a match to see per-step scores</div></div>
+    </section>
+    <section class="pane" id="pane-train">
+      <div class="placeholder">Training mode coming soon.</div>
+    </section>
+  </main>
+</div>
+<script>
+const agentListEl = document.getElementById('agentList');
+const nPlayersToggle = document.getElementById('nplayers');
+const slotsEl = document.getElementById('slots');
+const runBtn = document.getElementById('run');
+const clearBtn = document.getElementById('clear');
+const statusEl = document.getElementById('status');
+const summaryEl = document.getElementById('summary');
+const replayFrame = document.getElementById('replay');
+const chartEl = document.getElementById('chart');
+const logHeadEl = document.getElementById('logHead');
+const logBodyEl = document.getElementById('logBody');
+const logWrapEl = document.getElementById('logWrap');
+const logCountEl = document.getElementById('logCount');
+
+const PLAYER_COLORS = ['#3b6ef0', '#f07b7b', '#7dd89f', '#f0c93b'];
+
+let availableAgents = [];
+let slots = [null, null, null, null];
+let nPlayers = 2;
+let lastMatch = null;
+let chartRenderTimer = null;
+
+async function loadAgents() {
+  try {
+    const r = await fetch('/api/agents');
+    const data = await r.json();
+    availableAgents = data.agents;
+    renderAgentList();
+    statusEl.textContent = `ready · ${availableAgents.length} agents registered`;
+  } catch (err) {
+    statusEl.textContent = 'failed to load agents: ' + err.message;
+    statusEl.classList.add('error');
+  }
+}
+
+function renderAgentList() {
+  agentListEl.innerHTML = '';
+  for (const a of availableAgents) {
+    const card = document.createElement('div');
+    card.className = 'agent-card';
+    card.draggable = true;
+    card.textContent = a;
+    card.dataset.agent = a;
+    card.addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/plain', a);
+      e.dataTransfer.effectAllowed = 'copy';
+      card.classList.add('dragging');
+    });
+    card.addEventListener('dragend', () => card.classList.remove('dragging'));
+    agentListEl.appendChild(card);
+  }
+}
+
+function renderSlots() {
+  slotsEl.innerHTML = '';
+  for (let i = 0; i < 4; i++) {
+    const agent = slots[i];
+    const enabled = i < nPlayers;
+    const slot = document.createElement('div');
+    slot.className = 'slot' + (agent ? ' filled' : '') + (enabled ? '' : ' disabled');
+    slot.dataset.index = i;
+    slot.dataset.player = i;
+    slot.innerHTML = `
+      <span class="dot"></span>
+      <span class="pname">P${i + 1}</span>
+      <span class="body">${agent ? agent : 'drop agent'}</span>
+      ${agent ? `<button class="clear-btn" title="remove">×</button>` : ''}
+    `;
+    if (enabled) {
+      slot.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; slot.classList.add('drag-over'); });
+      slot.addEventListener('dragleave', () => slot.classList.remove('drag-over'));
+      slot.addEventListener('drop', e => {
+        e.preventDefault();
+        slot.classList.remove('drag-over');
+        const a = e.dataTransfer.getData('text/plain');
+        if (availableAgents.includes(a)) {
+          slots[i] = a;
+          renderSlots();
+        }
+      });
+      const cb = slot.querySelector('.clear-btn');
+      if (cb) cb.addEventListener('click', () => { slots[i] = null; renderSlots(); });
+    }
+    slotsEl.appendChild(slot);
+  }
+  updateRunButton();
+}
+
+function updateRunButton() {
+  const filled = slots.slice(0, nPlayers).every(s => s !== null);
+  runBtn.disabled = !filled;
+}
+
+function setNPlayers(n) {
+  nPlayers = n;
+  for (const b of nPlayersToggle.querySelectorAll('button')) {
+    b.classList.toggle('active', +b.dataset.n === n);
+  }
+  renderSlots();
+}
+
+nPlayersToggle.addEventListener('click', e => {
+  const btn = e.target.closest('button');
+  if (btn) setNPlayers(+btn.dataset.n);
+});
+
+clearBtn.addEventListener('click', () => {
+  slots = [null, null, null, null];
+  renderSlots();
+});
+
+document.getElementById('tabs').addEventListener('click', e => {
+  const tab = e.target.closest('.tab');
+  if (!tab) return;
+  for (const t of document.querySelectorAll('.tab')) t.classList.remove('active');
+  for (const p of document.querySelectorAll('.pane')) p.classList.remove('active');
+  tab.classList.add('active');
+  document.getElementById('pane-' + tab.dataset.tab).classList.add('active');
+});
+
+function resetMatchUI(agentIds) {
+  summaryEl.textContent = '';
+  chartEl.innerHTML = '<div class="empty">match running...</div>';
+  logBodyEl.innerHTML = '';
+  logCountEl.textContent = '0 steps';
+  logHeadEl.innerHTML = `<tr><th>step</th>${agentIds.map((a, i) => `<th data-p="${i}">P${i + 1} ${a}</th>`).join('')}</tr>`;
+}
+
+function appendLogRow(step, scores) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${step}</td>${scores.map(v => `<td>${v}</td>`).join('')}`;
+  logBodyEl.appendChild(tr);
+  logWrapEl.scrollTop = logWrapEl.scrollHeight;
+  logCountEl.textContent = `${step + 1} steps`;
+}
+
+function scheduleChartRender(scores, agentIds) {
+  if (chartRenderTimer) return;
+  chartRenderTimer = requestAnimationFrame(() => {
+    chartRenderTimer = null;
+    renderChart(scores, agentIds);
+  });
+}
+
+function renderChart(scores, agentIds) {
+  if (!scores || !scores.length) { chartEl.innerHTML = '<div class="empty">no data</div>'; return; }
+  const W = Math.max(600, chartEl.clientWidth);
+  const H = chartEl.clientHeight || 180;
+  const pad = { top: 20, right: 16, bottom: 24, left: 48 };
+  const plotW = W - pad.left - pad.right;
+  const plotH = H - pad.top - pad.bottom;
+  const T = scores.length;
+  const N = scores[0].length;
+  const maxY = Math.max(1, ...scores.flat());
+  const xAt = t => pad.left + (T <= 1 ? 0 : (t / (T - 1)) * plotW);
+  const yAt = v => pad.top + plotH - (v / maxY) * plotH;
+  const parts = [];
+
+  const yTicks = 4;
+  for (let i = 0; i <= yTicks; i++) {
+    const v = Math.round((maxY * i) / yTicks);
+    const y = yAt(v);
+    parts.push(`<line x1="${pad.left}" x2="${W - pad.right}" y1="${y}" y2="${y}" stroke="#252b3d"/>`);
+    parts.push(`<text x="${pad.left - 6}" y="${y + 4}" fill="#8b93a8" font-size="11" text-anchor="end">${v}</text>`);
+  }
+  const xTicks = 5;
+  for (let i = 0; i <= xTicks; i++) {
+    const t = Math.round(((T - 1) * i) / xTicks);
+    const x = xAt(t);
+    parts.push(`<text x="${x}" y="${H - 8}" fill="#8b93a8" font-size="11" text-anchor="middle">${t}</text>`);
+  }
+  parts.push(`<line x1="${pad.left}" x2="${pad.left}" y1="${pad.top}" y2="${H - pad.bottom}" stroke="#3a4157"/>`);
+  parts.push(`<line x1="${pad.left}" x2="${W - pad.right}" y1="${H - pad.bottom}" y2="${H - pad.bottom}" stroke="#3a4157"/>`);
+
+  for (let p = 0; p < N; p++) {
+    const pts = scores.map((s, t) => `${xAt(t).toFixed(1)},${yAt(s[p]).toFixed(1)}`).join(' ');
+    parts.push(`<polyline fill="none" stroke="${PLAYER_COLORS[p]}" stroke-width="1.8" points="${pts}"/>`);
+  }
+
+  let lx = pad.left;
+  for (let p = 0; p < N; p++) {
+    const label = `P${p + 1} ${agentIds[p]}`;
+    parts.push(`<circle cx="${lx + 5}" cy="12" r="4" fill="${PLAYER_COLORS[p]}"/>`);
+    parts.push(`<text x="${lx + 14}" y="16" fill="#e8ecf2" font-size="12">${label}</text>`);
+    lx += Math.max(90, label.length * 7 + 30);
+  }
+
+  chartEl.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">${parts.join('')}</svg>`;
+}
+
+runBtn.addEventListener('click', async () => {
+  const chosen = slots.slice(0, nPlayers);
+  runBtn.disabled = true;
+  statusEl.classList.remove('error');
+  statusEl.textContent = `running match (${chosen.join(' vs ')})...`;
+  resetMatchUI(chosen);
+  lastMatch = null;
+
+  try {
+    const r = await fetch('/api/play', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agents: chosen }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: r.statusText }));
+      throw new Error(err.detail || 'request failed');
+    }
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const streamedScores = [];
+    let streamAgents = chosen;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line) continue;
+        let msg;
+        try { msg = JSON.parse(line); } catch { continue; }
+        if (msg.type === 'init') {
+          streamAgents = msg.agents;
+        } else if (msg.type === 'step') {
+          streamedScores.push(msg.scores);
+          appendLogRow(msg.step, msg.scores);
+          scheduleChartRender(streamedScores, streamAgents);
+        } else if (msg.type === 'done') {
+          renderChart(streamedScores, streamAgents);
+          statusEl.textContent = `done · ${msg.run_id}`;
+          summaryEl.innerHTML = msg.rewards.map((rw, i) => {
+            const label = `P${i + 1} (${msg.agents[i]}): ${rw}`;
+            return i === msg.winner ? `<span class="winner">${label} ← winner</span>` : label;
+          }).join(' · ');
+          replayFrame.src = msg.replay_url;
+          lastMatch = { scores: streamedScores, agents: streamAgents };
+        }
+      }
+    }
+  } catch (err) {
+    statusEl.textContent = 'error: ' + err.message;
+    statusEl.classList.add('error');
+  } finally {
+    updateRunButton();
+  }
+});
+
+window.addEventListener('resize', () => {
+  if (lastMatch) renderChart(lastMatch.scores, lastMatch.agents);
+});
+
+renderSlots();
+loadAgents();
+</script>
+</body>
+</html>

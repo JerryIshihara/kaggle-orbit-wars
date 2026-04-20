@@ -1,0 +1,35 @@
+# python
+__pycache__/
+*.pyc
+*.egg
+*.egg-info/
+build/
+dist/
+
+# virtualenvs
+.venv/
+venv/
+
+# jupyter
+.ipynb_checkpoints/
+
+# tests / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+
+# os
+.DS_Store
+
+# secrets
+.env
+.env.*
+
+# project artifacts
+replays/
+*.log
+logs/
