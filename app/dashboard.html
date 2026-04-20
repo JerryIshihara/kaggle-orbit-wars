@@ -37,7 +37,9 @@
   .pane.active { display: flex; flex-direction: column; gap: 10px; height: 100%; min-height: 0; }
 
   .agent-list { display: flex; flex-direction: column; gap: 6px; }
-  .agent-card { padding: 8px 12px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; cursor: grab; user-select: none; font-size: 14px; font-family: ui-monospace, "SF Mono", Menlo, monospace; transition: all 0.15s; }
+  .agent-card { padding: 8px 12px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; cursor: grab; user-select: none; transition: all 0.15s; display: flex; flex-direction: column; gap: 3px; }
+  .agent-card .aid { font-size: 14px; font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--text); }
+  .agent-card .adesc { font-size: 11px; color: var(--muted); line-height: 1.35; }
   .agent-card:hover { border-color: var(--accent); background: #232a43; }
   .agent-card:active { cursor: grabbing; }
   .agent-card.dragging { opacity: 0.4; }
@@ -183,16 +185,22 @@ async function loadAgents() {
   }
 }
 
+function describeAgent(id) {
+  const a = availableAgents.find(x => x.id === id);
+  return a ? a.description : '';
+}
+
 function renderAgentList() {
   agentListEl.innerHTML = '';
   for (const a of availableAgents) {
     const card = document.createElement('div');
     card.className = 'agent-card';
     card.draggable = true;
-    card.textContent = a;
-    card.dataset.agent = a;
+    card.title = a.description;
+    card.dataset.agent = a.id;
+    card.innerHTML = `<span class="aid">${a.id}</span><span class="adesc">${a.description}</span>`;
     card.addEventListener('dragstart', e => {
-      e.dataTransfer.setData('text/plain', a);
+      e.dataTransfer.setData('text/plain', a.id);
       e.dataTransfer.effectAllowed = 'copy';
       card.classList.add('dragging');
     });
@@ -210,6 +218,7 @@ function renderSlots() {
     slot.className = 'slot' + (agent ? ' filled' : '') + (enabled ? '' : ' disabled');
     slot.dataset.index = i;
     slot.dataset.player = i;
+    slot.title = agent ? describeAgent(agent) : '';
     slot.innerHTML = `
       <span class="dot"></span>
       <span class="pname">P${i + 1}</span>
@@ -223,7 +232,7 @@ function renderSlots() {
         e.preventDefault();
         slot.classList.remove('drag-over');
         const a = e.dataTransfer.getData('text/plain');
-        if (availableAgents.includes(a)) {
+        if (availableAgents.some(x => x.id === a)) {
           slots[i] = a;
           renderSlots();
         }

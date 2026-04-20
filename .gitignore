@@ -30,6 +30,5 @@ htmlcov/
 .env.*
 
 # project artifacts
-replays/
-*.log
 logs/
+*.log

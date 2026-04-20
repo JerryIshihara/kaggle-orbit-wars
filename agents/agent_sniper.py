@@ -5,7 +5,11 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
 from .registry import register
 
 
-@register("sniper")
+@register(
+    "sniper",
+    "Greedy nearest-target sniper — each owned planet sends ships to the "
+    "closest non-owned planet when it has ≥20 ships and enough to capture.",
+)
 def nearest_planet_sniper(obs):
     moves = []
     player = obs.get("player", 0) if isinstance(obs, dict) else obs.player

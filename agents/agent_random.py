@@ -8,7 +8,11 @@ from .registry import register
 LAUNCH_PROB = 0.1
 
 
-@register("random")
+@register(
+    "random",
+    "Random valid moves — each owned planet has a 10% chance to launch a "
+    "random-sized fleet at a uniformly random angle.",
+)
 def random_valid_agent(obs):
     moves = []
     player = obs.get("player", 0) if isinstance(obs, dict) else obs.player
