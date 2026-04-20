@@ -15,10 +15,10 @@
     --accent: #3b6ef0;
     --win: #7dd89f;
     --err: #f07b7b;
-    --p1: #3b6ef0;
-    --p2: #f07b7b;
-    --p3: #7dd89f;
-    --p4: #f0c93b;
+    --p1: #0072B2;
+    --p2: #E69F00;
+    --p3: #009E73;
+    --p4: #F0E442;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -127,6 +127,13 @@
         <div class="slots" id="slots"></div>
         <button id="run" disabled>Run Match</button>
         <button id="clear" class="secondary">Clear</button>
+        <div class="toggle" id="replaySpeed" title="replay playback speed">
+          <button data-key="3">0.5x</button>
+          <button data-key="4" class="active">1x</button>
+          <button data-key="5">2x</button>
+          <button data-key="7">4x</button>
+          <button data-key="9">max</button>
+        </div>
       </div>
       <div id="status">ready</div>
       <div id="summary"></div>
@@ -163,8 +170,10 @@ const logHeadEl = document.getElementById('logHead');
 const logBodyEl = document.getElementById('logBody');
 const logWrapEl = document.getElementById('logWrap');
 const logCountEl = document.getElementById('logCount');
+const replaySpeedToggle = document.getElementById('replaySpeed');
+let replaySpeedKey = 4;  // index into renderer's speeds[] (default 333 ms/step)
 
-const PLAYER_COLORS = ['#3b6ef0', '#f07b7b', '#7dd89f', '#f0c93b'];
+const PLAYER_COLORS = ['#0072B2', '#E69F00', '#009E73', '#F0E442'];
 
 let availableAgents = [];
 let slots = [null, null, null, null];
@@ -268,6 +277,32 @@ clearBtn.addEventListener('click', () => {
   renderSlots();
 });
 
+function applyReplaySpeed() {
+  try {
+    const w = replayFrame.contentWindow;
+    if (!w) return;
+    w.dispatchEvent(new KeyboardEvent('keydown', {
+      keyCode: replaySpeedKey + 48,
+      which: replaySpeedKey + 48,
+    }));
+  } catch (_) {}
+}
+
+replaySpeedToggle.addEventListener('click', e => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  replaySpeedKey = +btn.dataset.key;
+  for (const b of replaySpeedToggle.querySelectorAll('button')) {
+    b.classList.toggle('active', +b.dataset.key === replaySpeedKey);
+  }
+  applyReplaySpeed();
+});
+
+replayFrame.addEventListener('load', () => {
+  // The outer player installs its keydown listener in a setTimeout(0).
+  setTimeout(applyReplaySpeed, 400);
+});
+
 document.getElementById('tabs').addEventListener('click', e => {
   const tab = e.target.closest('.tab');
   if (!tab) return;
@@ -303,8 +338,11 @@ function scheduleChartRender(scores, agentIds) {
 
 function renderChart(scores, agentIds) {
   if (!scores || !scores.length) { chartEl.innerHTML = '<div class="empty">no data</div>'; return; }
-  const W = Math.max(600, chartEl.clientWidth);
-  const H = chartEl.clientHeight || 180;
+  const cs = getComputedStyle(chartEl);
+  const padX = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+  const padY = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+  const W = Math.max(320, chartEl.clientWidth - padX);
+  const H = Math.max(120, chartEl.clientHeight - padY);
   const pad = { top: 20, right: 16, bottom: 24, left: 48 };
   const plotW = W - pad.left - pad.right;
   const plotH = H - pad.top - pad.bottom;
@@ -344,7 +382,7 @@ function renderChart(scores, agentIds) {
     lx += Math.max(90, label.length * 7 + 30);
   }
 
-  chartEl.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">${parts.join('')}</svg>`;
+  chartEl.innerHTML = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${parts.join('')}</svg>`;
 }
 
 runBtn.addEventListener('click', async () => {

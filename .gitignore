@@ -31,4 +31,5 @@ htmlcov/
 
 # project artifacts
 logs/
+agents/weights/
 *.log

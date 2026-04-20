@@ -51,7 +51,50 @@ def cmd_play(args: argparse.Namespace) -> int:
 
 
 def cmd_train(args: argparse.Namespace) -> int:
-    train_match()
+    import torch  # noqa: F401
+
+    from training import collect_bc_dataset, evaluate_agent, train_bc, train_ppo
+    from training.collect import default_dataset_path
+
+    stages = args.stages or ["collect", "bc", "eval"]
+    dataset = None
+
+    if "collect" in stages:
+        ds_path = default_dataset_path(args.teacher, args.collect_games)
+        if ds_path.exists() and not args.force_collect:
+            print(f"dataset exists: {ds_path} (use --force-collect to rebuild)")
+            dataset = torch.load(ds_path)
+        else:
+            print(f"collecting BC dataset: {args.collect_games} games of "
+                  f"{args.teacher} vs {args.opponent}")
+            dataset = collect_bc_dataset(
+                num_games=args.collect_games,
+                teacher_id=args.teacher,
+                opponent_id=args.opponent,
+                save_to=ds_path,
+            )
+    if "bc" in stages:
+        if dataset is None:
+            ds_path = default_dataset_path(args.teacher, args.collect_games)
+            if not ds_path.exists():
+                print(f"error: no dataset at {ds_path}; run with --stages collect first",
+                      file=sys.stderr)
+                return 2
+            dataset = torch.load(ds_path)
+        print(f"training BC for {args.bc_epochs} epochs ({dataset['channels'].size(0)} samples)")
+        train_bc(dataset, epochs=args.bc_epochs, batch_size=args.batch_size)
+    if "ppo" in stages:
+        print(f"training PPO for {args.ppo_iters} iterations x {args.ppo_episodes} eps")
+        train_ppo(
+            iterations=args.ppo_iters,
+            episodes_per_iter=args.ppo_episodes,
+            opponents=args.ppo_opponents,
+            resume_from=None,  # uses the saved weights path by default
+        )
+    if "eval" in stages:
+        print(f"evaluating cnn_v1 vs {args.eval_opponents} ({args.eval_games} games each)")
+        evaluate_agent("cnn_v1", opponents=args.eval_opponents, games_per=args.eval_games)
+
     return 0
 
 
@@ -91,6 +134,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bundle", action="store_true", help="emit tar.gz (pack/submit)")
     p.add_argument("--note", default="", help="submission note (submit mode)")
     p.add_argument("--dry-run", action="store_true", help="submit mode: preview only")
+    p.add_argument(
+        "--stages",
+        nargs="+",
+        choices=["collect", "bc", "ppo", "eval"],
+        help="training stages to run (default: collect bc eval)",
+    )
+    p.add_argument("--teacher", default="sniper", help="BC teacher agent")
+    p.add_argument("--opponent", default="sniper", help="BC data collection opponent")
+    p.add_argument("--collect-games", type=int, default=30)
+    p.add_argument("--force-collect", action="store_true")
+    p.add_argument("--bc-epochs", type=int, default=3)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--ppo-iters", type=int, default=3)
+    p.add_argument("--ppo-episodes", type=int, default=8)
+    p.add_argument("--ppo-opponents", nargs="+", default=["random", "sniper"])
+    p.add_argument(
+        "--eval-opponents",
+        nargs="+",
+        default=["random", "sniper", "physical_v2"],
+    )
+    p.add_argument("--eval-games", type=int, default=10)
     return p
 
 
