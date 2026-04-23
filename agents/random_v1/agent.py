@@ -3,13 +3,13 @@ import random
 
 from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
 
-from .registry import register
+from ..registry import register
 
 LAUNCH_PROB = 0.1
 
 
 @register(
-    "random",
+    "random_v1",
     "Random valid moves — each owned planet has a 10% chance to launch a "
     "random-sized fleet at a uniformly random angle.",
 )

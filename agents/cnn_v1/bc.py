@@ -10,8 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from agents.agent_cnn_v1 import CNNv1
-
+from .agent import CNNv1
 from .common import fresh_model, load_model, save_model
 
 

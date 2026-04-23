@@ -9,11 +9,11 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from agents.agent_cnn_v1 import BOARD_SIZE, CELL, GRID, WEIGHTS_PATH, CNNv1
+from .agent import BOARD_SIZE, CELL, GRID, WEIGHTS_PATH, CNNv1
 
 RAY_DIST = 30.0  # units along the angle that we treat as the "target" of a launch
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TRAIN_ROOT = _REPO_ROOT / "logs" / "training"
 WEIGHTS_DIR = Path(WEIGHTS_PATH).parent
 
@@ -80,5 +80,5 @@ def load_model(path: Path | str | None = None) -> CNNv1:
     src = Path(path) if path else WEIGHTS_PATH
     m = fresh_model()
     if src.exists():
-        m.load_state_dict(torch.load(src, map_location="cpu"))
+        m.load_state_dict(torch.load(src, map_location="cpu"), strict=False)
     return m

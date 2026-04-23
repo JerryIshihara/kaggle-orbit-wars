@@ -1,16 +1,22 @@
-"""Heuristic physical agent v3 — v2 + multi-target launches per source per turn.
+"""Heuristic physical agent v2 — v1 + defensive threat accounting.
 
-Single improvement over v2: instead of picking the single best target from a
-source planet and emitting one launch, v3 collects ALL viable candidates,
-sorts them by score ascending, then greedily allocates the defensive surplus
-budget across multiple launches until the remaining surplus falls below
-MIN_LAUNCH_SHIPS.  Duplicate targets from the same source in the same turn
-are skipped.
+Single improvement over v1: before picking a target from a source planet,
+compute the minimum garrison the planet will see over the timeline of
+incoming enemy fleets. Only the *surplus* above that minimum (minus a
+defensive buffer) is available for offense. Sources under threat hold.
+
+Threat model per source:
+  1. For each enemy fleet in flight, compute when its straight-line
+     trajectory comes within the planet's radius (None if it misses or
+     is moving away).
+  2. Sort threats by arrival turn; walk the timeline forward:
+       garrison(t) = garrison(last_t) + production · (t − last_t) − threat_ships(t)
+     Track the minimum garrison across all arrivals.
+  3. Surplus = min_garrison − DEFENSE_BUFFER.
 
 Everything else (lead-aim, sun-dodge, rotation sign inference,
-travel_time/production scoring, production-during-travel allocation,
-fleet_eta_to_planet, compute_surplus) is copied verbatim from v2 so the
-file stays self-contained for packing.
+travel_time/production scoring, production-during-travel allocation) is
+copied verbatim from v1 so the file stays self-contained for packing.
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ import math
 
 from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet, Planet
 
-from .registry import register
+from ..registry import register
 
 SUN_CX = 50.0
 SUN_CY = 50.0
@@ -159,11 +165,11 @@ def _score(turns: float, target: Planet) -> float:
 
 
 @register(
-    "physical_v3",
-    "physical_v2 + multi-target per source per turn. Greedy allocation "
-    "under the defensive surplus budget — sorted by score ascending.",
+    "physical_v2",
+    "physical_v1 + defensive threat accounting. Incoming enemy fleet trajectories "
+    "constrain the launch budget per planet so threatened sources hold.",
 )
-def physical_v3_agent(obs):
+def physical_v2_agent(obs):
     player = obs.get("player", 0) if isinstance(obs, dict) else obs.player
     get = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
     raw_planets = get("planets") or []
@@ -188,8 +194,11 @@ def physical_v3_agent(obs):
         if surplus < MIN_LAUNCH_SHIPS:
             continue
 
-        # Collect all viable candidates for this source.
-        candidates = []  # (score, target_id, angle, ships_needed)
+        best = None
+        best_score = float("inf")
+        best_angle = 0.0
+        best_ships = 0
+
         for target in targets:
             orbiting = is_orbiting(target, angular_velocity)
             fleet_guess = min(max(target.ships + 10, 20), surplus)
@@ -209,25 +218,14 @@ def physical_v3_agent(obs):
             if ships_needed > surplus:
                 continue
 
-            angle = math.atan2(py - source.y, px - source.x)
             sc = _score(turns, target)
-            candidates.append((sc, target.id, angle, ships_needed))
+            if sc < best_score:
+                best_score = sc
+                best = target
+                best_angle = math.atan2(py - source.y, px - source.x)
+                best_ships = ships_needed
 
-        # Sort by score ascending (best first).
-        candidates.sort(key=lambda c: c[0])
-
-        # Greedy allocation: emit launches while budget allows, no duplicate targets.
-        remaining_surplus = surplus
-        launched_targets: set[int] = set()
-        for sc, target_id, angle, ships_needed in candidates:
-            if remaining_surplus < MIN_LAUNCH_SHIPS:
-                break
-            if target_id in launched_targets:
-                continue
-            if ships_needed > remaining_surplus:
-                continue
-            moves.append([source.id, angle, ships_needed])
-            remaining_surplus -= ships_needed
-            launched_targets.add(target_id)
+        if best is not None and best_ships > 0:
+            moves.append([source.id, best_angle, best_ships])
 
     return moves

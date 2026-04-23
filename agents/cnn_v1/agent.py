@@ -64,7 +64,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .registry import register
+from ..registry import register
 
 BOARD_SIZE = 100.0
 GRID = 50
@@ -192,6 +192,7 @@ class CNNv1(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(32, 1),
         )
+        self.frac_log_std = nn.Parameter(torch.log(torch.tensor(0.2)))
 
     def forward(self, channels, scalars):
         feat_map = self.conv(channels)
@@ -234,11 +235,17 @@ def _get_model() -> CNNv1:
         m.eval()
         if WEIGHTS_PATH.exists():
             try:
-                m.load_state_dict(torch.load(WEIGHTS_PATH, map_location="cpu"))
+                m.load_state_dict(torch.load(WEIGHTS_PATH, map_location="cpu"), strict=False)
             except Exception as e:
                 warnings.warn(f"cnn_v1: failed to load weights: {e}")
         _MODEL = m
     return _MODEL
+
+
+def reload_weights() -> None:
+    """Invalidate the cached model so the next call reloads from disk."""
+    global _MODEL
+    _MODEL = None
 
 
 @register(

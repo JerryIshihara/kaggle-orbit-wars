@@ -2,11 +2,11 @@ import math
 
 from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
 
-from .registry import register
+from ..registry import register
 
 
 @register(
-    "sniper",
+    "sniper_v1",
     "Greedy nearest-target sniper — each owned planet sends ships to the "
     "closest non-owned planet when it has ≥20 ships and enough to capture.",
 )

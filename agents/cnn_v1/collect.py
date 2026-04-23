@@ -18,9 +18,9 @@ from typing import Any
 import torch
 
 from agents import Agent
-from agents.agent_cnn_v1 import GRID, featurize
 from kaggle_environments import make
 
+from .agent import GRID, featurize
 from .common import TRAIN_ROOT, decode_teacher_action
 
 MAX_PLANETS = 16
@@ -89,8 +89,8 @@ def _one_game(teacher: Agent, opponent: Agent, teacher_slot: int, seed: int | No
 
 def collect_bc_dataset(
     num_games: int,
-    teacher_id: str = "sniper",
-    opponent_id: str = "sniper",
+    teacher_id: str = "sniper_v1",
+    opponent_id: str = "sniper_v1",
     save_to: Path | str | None = None,
     seed_start: int = 0,
     verbose: bool = True,

@@ -7,7 +7,7 @@ from typing import Iterable
 
 from utils import run_match
 
-DEFAULT_OPPONENTS = ["random", "sniper", "physical_v2"]
+DEFAULT_OPPONENTS = ["random_v1", "sniper_v1", "physical_v2"]
 
 
 def evaluate_agent(

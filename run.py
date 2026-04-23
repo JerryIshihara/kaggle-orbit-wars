@@ -53,10 +53,15 @@ def cmd_play(args: argparse.Namespace) -> int:
 def cmd_train(args: argparse.Namespace) -> int:
     import torch  # noqa: F401
 
-    from training import collect_bc_dataset, evaluate_agent, train_bc, train_ppo
-    from training.collect import default_dataset_path
+    from agents.cnn_v1 import (
+        collect_bc_dataset,
+        default_dataset_path,
+        evaluate_agent,
+        train_bc,
+        train_ppo,
+    )
 
-    stages = args.stages or ["collect", "bc", "eval"]
+    stages = args.stages or ["ppo", "eval"]
     dataset = None
 
     if "collect" in stages:
@@ -140,19 +145,24 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["collect", "bc", "ppo", "eval"],
         help="training stages to run (default: collect bc eval)",
     )
-    p.add_argument("--teacher", default="sniper", help="BC teacher agent")
-    p.add_argument("--opponent", default="sniper", help="BC data collection opponent")
+    p.add_argument("--teacher", default="sniper_v1", help="BC teacher agent")
+    p.add_argument("--opponent", default="sniper_v1", help="BC data collection opponent")
     p.add_argument("--collect-games", type=int, default=30)
     p.add_argument("--force-collect", action="store_true")
     p.add_argument("--bc-epochs", type=int, default=3)
     p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--ppo-iters", type=int, default=3)
-    p.add_argument("--ppo-episodes", type=int, default=8)
-    p.add_argument("--ppo-opponents", nargs="+", default=["random", "sniper"])
+    p.add_argument("--ppo-iters", type=int, default=200)
+    p.add_argument("--ppo-episodes", type=int, default=32)
+    p.add_argument(
+        "--ppo-opponents",
+        nargs="*",
+        default=[],
+        help="external opponents to mix in (default: [] = pure self-play)",
+    )
     p.add_argument(
         "--eval-opponents",
         nargs="+",
-        default=["random", "sniper", "physical_v2"],
+        default=["random_v1", "sniper_v1", "physical_v2"],
     )
     p.add_argument("--eval-games", type=int, default=10)
     return p
