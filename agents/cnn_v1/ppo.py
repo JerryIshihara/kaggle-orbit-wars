@@ -33,7 +33,17 @@ from agents import Agent
 from kaggle_environments import make
 
 from . import agent as _cnn_mod
-from .agent import BOARD_SIZE, CELL, GRID, LAUNCH_THRESHOLD, WEIGHTS_PATH, CNNv1, featurize
+from .agent import (
+    BOARD_SIZE,
+    CELL,
+    GRID,
+    LAUNCH_THRESHOLD,
+    NUM_CHANNELS,
+    SCALAR_DIM,
+    WEIGHTS_PATH,
+    CNNv1,
+    featurize,
+)
 from .bc import _planet_features
 from .common import TRAIN_ROOT, fresh_model, load_model, save_model
 from .eval import evaluate_agent
@@ -78,6 +88,15 @@ class StochasticPolicyAgent:
         return self._act(obs)
 
     def _act(self, obs):
+        try:
+            return self._act_impl(obs)
+        except Exception as e:
+            if not getattr(self, "_warned_exc", False):
+                self._warned_exc = True
+                print(f"[_act] EXCEPTION: {type(e).__name__}: {e}", flush=True)
+            return []
+
+    def _act_impl(self, obs):
         channels, scalars, my_planets = featurize(obs)
         moves = []
         if not my_planets:
@@ -98,6 +117,28 @@ class StochasticPolicyAgent:
             frac_std = float(torch.exp(self.model.frac_log_std).item())
 
         launch, target, ship = launch.squeeze(0), target.squeeze(0), ship.squeeze(0)
+
+        # Defensive: if the model produced NaN/Inf (diverged policy), emit no
+        # moves rather than crashing the env with invalid actions. Training
+        # will recover via the post-update NaN check; rollout just wastes the
+        # episode.
+        launch_ok = torch.isfinite(launch).all().item()
+        target_ok = torch.isfinite(target).all().item()
+        ship_ok = torch.isfinite(ship).all().item()
+        value_ok = torch.isfinite(value).all().item()
+        frac_ok = math.isfinite(frac_std) and frac_std > 0
+        if not (launch_ok and target_ok and ship_ok and value_ok and frac_ok):
+            # One-shot diagnostic per agent instance so we know which head is
+            # producing garbage when this fires.
+            if not getattr(self, "_warned_nan", False):
+                self._warned_nan = True
+                print(
+                    f"[_act] non-finite output: launch_ok={launch_ok} "
+                    f"target_ok={target_ok} ship_ok={ship_ok} "
+                    f"value_ok={value_ok} frac_std={frac_std}",
+                    flush=True,
+                )
+            return moves
 
         if self.training:
             launch_actions = Bernoulli(logits=launch).sample()
@@ -155,6 +196,9 @@ def _wrap_as_fn(sp_agent: StochasticPolicyAgent) -> Callable:
     return fn
 
 
+_WARNED_SHORT_GAME = [False]
+
+
 def _play_episode(
     learner: StochasticPolicyAgent,
     opponent_fn: Callable,
@@ -169,6 +213,19 @@ def _play_episode(
     players = [learner_fn, opponent_fn] if learner_slot == 0 else [opponent_fn, learner_fn]
     env.run(players)
     final_reward = env.steps[-1][learner_slot].reward or 0
+
+    # Diagnostic: if the game ended much earlier than expected, surface the
+    # per-player status + info so we can see WHY (TIMEOUT / INVALID / ERROR).
+    if len(env.steps) < 50 and not _WARNED_SHORT_GAME[0]:
+        _WARNED_SHORT_GAME[0] = True
+        final = env.steps[-1]
+        statuses = [getattr(s, "status", "?") for s in final]
+        infos = [getattr(s, "info", None) for s in final]
+        print(
+            f"[short game] steps={len(env.steps)} learner_slot={learner_slot} "
+            f"statuses={statuses} infos={infos}",
+            flush=True,
+        )
     return learner.trajectory, final_reward, env
 
 
@@ -253,9 +310,10 @@ def _ppo_update(
     entropy_coef: float = 0.01,
     epochs: int = 2,
     minibatch: int = 32,
-    lr: float = 3e-4,
-    kl_stop: float = 0.05,
-    ratio_max: float = 5.0,
+    lr: float = 1e-4,
+    kl_stop: float = 0.4,
+    ratio_max: float = 3.0,
+    max_grad_norm: float = 0.1,
 ):
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     device = next(model.parameters()).device
@@ -276,10 +334,12 @@ def _ppo_update(
     stop_early = False
     last_policy = last_value = last_entropy = 0.0
     last_frac_std = float(torch.exp(model.frac_log_std).item())
+    epoch_times: list[float] = []
 
     for _ in range(epochs):
         if stop_early:
             break
+        epoch_t0 = time.time()
         idx = torch.randperm(N)
         for start in range(0, N, minibatch):
             sel = idx[start : start + minibatch]
@@ -337,7 +397,7 @@ def _ppo_update(
             if bad_grad:
                 skipped += 1
                 continue
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             opt.step()
 
             # Keep learned exploration std in a sane range.
@@ -358,6 +418,8 @@ def _ppo_update(
                 stop_early = True
                 break
 
+        epoch_times.append(time.time() - epoch_t0)
+
     return {
         "policy_loss": last_policy,
         "value_loss": last_value,
@@ -367,6 +429,7 @@ def _ppo_update(
         "frac_std": last_frac_std,
         "skipped_mb": skipped,
         "early_stopped": stop_early,
+        "epoch_times": epoch_times,
     }
 
 
@@ -409,6 +472,13 @@ def _save_latest(model: CNNv1, iter_num: int) -> None:
     torch.save(model.state_dict(), LATEST_PATH)
 
 
+def _has_nan_params(model: CNNv1) -> bool:
+    for p in model.parameters():
+        if not torch.isfinite(p).all():
+            return True
+    return False
+
+
 def _fmt_duration(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.0f}s"
@@ -438,6 +508,9 @@ def train_ppo(
     episode_progress: bool = True,
     replay_every: int = 10,
     replay_dir: Path | str | None = None,
+    checkpoint_dir: Path | str | None = None,
+    kl_stop_start: float = 0.4,
+    kl_stop_end: float | None = 0.05,
     verbose: bool = True,
 ) -> CNNv1:
     """Pure self-play PPO with a snapshot ring buffer.
@@ -453,11 +526,52 @@ def train_ppo(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device)
 
-    model = load_model(resume_from) if resume_from else fresh_model()
-    model = model.to(device)
-    learner = StochasticPolicyAgent(model, training=True, record=True)
-    snapshots: deque[CNNv1] = deque(maxlen=snapshot_pool_size)
+    # External checkpoint dir (e.g. mounted Google Drive, GCS) — survives
+    # Colab runtime shutdown. Checked first for resume, written to every iter.
+    ext_ckpt_dir = Path(checkpoint_dir) if checkpoint_dir else None
+    if ext_ckpt_dir is not None:
+        ext_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ext_latest = ext_ckpt_dir / "latest.pt" if ext_ckpt_dir else None
+    ext_best = ext_ckpt_dir / "cnn_v1.pt" if ext_ckpt_dir else None
 
+    # Auto-resume: prefer external checkpoint (if provided and exists),
+    # then local latest.pt, then local cnn_v1.pt, else fresh.
+    resume_msg = "fresh weights"
+    if resume_from is None:
+        if ext_latest is not None and ext_latest.exists():
+            resume_from = ext_latest
+            resume_msg = f"resumed ext latest: {ext_latest}"
+        elif ext_best is not None and ext_best.exists():
+            resume_from = ext_best
+            resume_msg = f"resumed ext best: {ext_best}"
+        elif LATEST_PATH.exists():
+            resume_from = LATEST_PATH
+            resume_msg = f"resumed local latest: {LATEST_PATH}"
+        elif WEIGHTS_PATH.exists():
+            resume_from = WEIGHTS_PATH
+            resume_msg = f"resumed local best: {WEIGHTS_PATH}"
+    else:
+        resume_msg = f"resumed: {resume_from}"
+
+    model = load_model(resume_from) if resume_from else fresh_model()
+
+    # GPU compat probe: torch 2.10+cu128 drops SM_60 (P100). If the assigned
+    # GPU can't run torch kernels, fall back to CPU so training still runs.
+    if device.type == "cuda":
+        try:
+            _probe = torch.zeros(4, device=device) + 1.0
+            _probe.cpu()
+        except Exception as e:
+            print(
+                f"WARN: GPU unusable ({type(e).__name__}: {e}); falling back to CPU. "
+                f"On Kaggle: Settings → Accelerator → GPU T4 x2 to avoid this.",
+                flush=True,
+            )
+            device = torch.device("cpu")
+
+    model = model.to(device)
+
+    # Emit device line BEFORE warmup so the log is never empty on a GPU error.
     if verbose:
         gpu_info = ""
         if device.type == "cuda":
@@ -466,12 +580,35 @@ def train_ppo(
             except Exception:
                 pass
         param_count = sum(p.numel() for p in model.parameters())
+        kl_sched = (
+            f"kl_stop: {kl_stop_start}→{kl_stop_end}"
+            if kl_stop_end is not None
+            else f"kl_stop: {kl_stop_start}"
+        )
         print(
             f"device: {device}{gpu_info}  params: {param_count / 1e6:.2f}M  "
-            f"iters: {iterations}  ep/iter: {episodes_per_iter}",
-            file=sys.stderr,
+            f"iters: {iterations}  ep/iter: {episodes_per_iter}  {kl_sched}  "
+            f"{resume_msg}",
             flush=True,
         )
+
+    # Warmup: first CUDA forward pass triggers context init which can take
+    # several seconds — well over orbit_wars' 1s actTimeout.
+    try:
+        with torch.no_grad():
+            _warm_ch = torch.zeros(1, NUM_CHANNELS, GRID, GRID, device=device)
+            _warm_sc = torch.zeros(1, SCALAR_DIM, device=device)
+            _warm_coords = torch.zeros(1, 1, 2, device=device)
+            _fm, _sf = model(_warm_ch, _warm_sc)
+            _planet_features(model, _warm_ch, _warm_sc, _warm_coords)
+            model.value(_fm, _sf)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+    except Exception as e:
+        print(f"WARN: warmup failed ({type(e).__name__}: {e}); continuing anyway", flush=True)
+
+    learner = StochasticPolicyAgent(model, training=True, record=True)
+    snapshots: deque[CNNv1] = deque(maxlen=snapshot_pool_size)
 
     ext_opponents = list(opponents or [])
 
@@ -553,10 +690,47 @@ def train_ppo(
                     )
 
             if not buffers:
+                # All rollouts returned empty trajectories — usually policy
+                # collapse. Print a loud notice instead of silently skipping,
+                # so the user sees iter-level signal even in this failure mode.
+                wins = sum(1 for r in rewards_hist if r > 0.5)
+                losses = sum(1 for r in rewards_hist if r < -0.5)
+                draws = len(rewards_hist) - wins - losses
+                total_elapsed = time.time() - train_start
+                print(
+                    f"iter {it + 1:3d}/{iterations}  EMPTY_BUFFERS  "
+                    f"W/L/D={wins}/{losses}/{draws}  "
+                    f"opp={ep_types['self']}s/{ep_types['snapshot']}p/{ep_types['external']}x  "
+                    f"elapsed={_fmt_duration(total_elapsed)}  "
+                    f"(policy likely diverged; reverting to best_state)",
+                    flush=True,
+                )
+                # Revert to the last-known-good state and continue.
+                model.load_state_dict(best_state)
+                _save_latest(model, it + 1)
                 continue
 
             batch = {k: torch.cat([b[k] for b in buffers], dim=0) for k in buffers[0]}
-            stats = _ppo_update(model, batch)
+
+            # Dynamic kl_stop: linear decay from kl_stop_start to kl_stop_end
+            # as training progresses (tighter tolerance late, more exploration early).
+            if kl_stop_end is not None and iterations > 1:
+                progress = it / (iterations - 1)
+                kl_stop_now = kl_stop_start + (kl_stop_end - kl_stop_start) * progress
+            else:
+                kl_stop_now = kl_stop_start
+            stats = _ppo_update(model, batch, kl_stop=kl_stop_now)
+
+            # NaN recovery: if the update produced non-finite params, revert
+            # to best_state and keep training from there instead of emitting
+            # garbage for the rest of the run.
+            if _has_nan_params(model):
+                if verbose:
+                    print(
+                        f"  iter {it + 1}: NaN in params detected; reverting to best_state",
+                        flush=True,
+                    )
+                model.load_state_dict(best_state)
 
             if (it + 1) % snapshot_every == 0:
                 snap = _freeze(copy.deepcopy(model))
@@ -565,6 +739,12 @@ def train_ppo(
             # Checkpoint the current model every iter so training can resume
             # from the most recent state (separate from best-by-eval cnn_v1.pt).
             _save_latest(model, it + 1)
+            if ext_latest is not None:
+                try:
+                    torch.save(model.state_dict(), ext_latest)
+                except Exception as e:
+                    if verbose:
+                        print(f"  ext latest save failed: {e}", flush=True)
 
             # Flush a replay of the last episode periodically.
             if replay_every > 0 and (it + 1) % replay_every == 0 and last_env is not None:
@@ -572,10 +752,10 @@ def train_ppo(
                 try:
                     rpath.write_text(last_env.render(mode="html"))
                     if verbose:
-                        print(f"  replay: {rpath}", file=sys.stderr, flush=True)
+                        print(f"  replay: {rpath}", flush=True)
                 except Exception as e:
                     if verbose:
-                        print(f"  replay save failed: {e}", file=sys.stderr, flush=True)
+                        print(f"  replay save failed: {e}", flush=True)
 
             eval_wr = None
             if (it + 1) % eval_every == 0:
@@ -585,7 +765,14 @@ def train_ppo(
                 if eval_wr > best_winrate:
                     best_winrate = eval_wr
                     best_state = copy.deepcopy(model.state_dict())
-                    # current weights already saved on disk by _eval_winrate
+                    # current weights already saved on disk by _eval_winrate;
+                    # also mirror best to external dir.
+                    if ext_best is not None:
+                        try:
+                            torch.save(best_state, ext_best)
+                        except Exception as e:
+                            if verbose:
+                                print(f"  ext best save failed: {e}", flush=True)
                 else:
                     _save_state_and_reload(best_state)
 
@@ -624,6 +811,8 @@ def train_ppo(
                 "ep_types": ep_types,
                 "early_stopped": bool(stats["early_stopped"]),
                 "skipped_mb": int(stats["skipped_mb"]),
+                "epoch_times_s": [round(t, 3) for t in stats.get("epoch_times", [])],
+                "kl_stop_now": round(kl_stop_now, 4),
                 "time_s": round(iter_time, 2),
                 "elapsed_s": round(total_elapsed, 2),
                 "eta_s": round(eta_s, 2),
@@ -648,6 +837,8 @@ def train_ppo(
                 ep_types_str = (
                     f"{ep_types['self']}s/{ep_types['snapshot']}p/{ep_types['external']}x"
                 )
+                epoch_t = stats.get("epoch_times", [])
+                epoch_str = "/".join(f"{t:.1f}" for t in epoch_t) if epoch_t else "-"
                 print(
                     f"iter {it + 1:3d}/{iterations}  "
                     f"W/L/D={wins}/{losses}/{draws}  "
@@ -657,11 +848,11 @@ def train_ppo(
                     f"clip={stats['clip_frac']:.2f}  std={stats['frac_std']:.2f}  "
                     f"opp={ep_types_str}  snap={len(snapshots)}  "
                     f"n={batch['channels'].size(0)}  "
+                    f"ep_t={epoch_str}s  "
                     f"t={_fmt_duration(iter_time)} "
                     f"elapsed={_fmt_duration(total_elapsed)} "
                     f"ETA={_fmt_duration(eta_s)}"
                     f"{mem_str}{eval_str}",
-                    file=sys.stderr,
                     flush=True,
                 )
     finally:
@@ -675,6 +866,6 @@ def train_ppo(
         print(
             f"saved best weights: {path} (best_winrate={best_winrate:.3f}, "
             f"log: {log_path})",
-            file=sys.stderr,
+            flush=True,
         )
     return model
