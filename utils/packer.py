@@ -44,7 +44,7 @@ def pack_agent(
         raise RuntimeError(f"could not resolve source module for agent {agent_id!r}")
     source = inspect.getsource(module)
 
-    main_code = _transform_source(
+    main_code, sibling_modules = _transform_source(
         source,
         fn_name=spec.fn.__name__,
         agent_id=agent_id,
@@ -52,6 +52,14 @@ def pack_agent(
     )
     main_path = out_dir / "main.py"
     main_path.write_text(main_code)
+
+    # Copy any sibling helper modules (e.g. agents/physics_utils.py) that the
+    # transformed main.py now imports as top-level, so they sit next to main.py
+    # in the bundle and resolve at submission time.
+    for mod_name in sibling_modules:
+        sibling_path = _REPO_ROOT / "agents" / f"{mod_name}.py"
+        if sibling_path.exists():
+            (out_dir / f"{mod_name}.py").write_bytes(sibling_path.read_bytes())
 
     if extra_files:
         for f in extra_files:
@@ -68,12 +76,28 @@ def pack_agent(
     return {"main": main_path, "bundle": bundle_path, "dir": out_dir}
 
 
-def _transform_source(source: str, fn_name: str, agent_id: str, description: str) -> str:
+def _transform_source(source: str, fn_name: str, agent_id: str, description: str) -> tuple[str, set[str]]:
+    """Return (transformed_source, set_of_sibling_module_names_to_bundle).
+
+    Transforms applied:
+      - drop ``from ..registry import register``
+      - drop ``@register(...)`` decorators
+      - rewrite cross-agent relative imports like ``from ..physics_utils import X``
+        into top-level ``from physics_utils import X`` (so the bundled module
+        next to ``main.py`` resolves) and record the module name so the
+        packer can copy the file alongside.
+      - append ``agent = <fn_name>`` alias.
+    """
     tree = ast.parse(source)
     new_body: list[ast.stmt] = []
+    sibling_modules: set[str] = set()
     for node in tree.body:
         if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[-1] == "registry":
             continue
+        if isinstance(node, ast.ImportFrom) and node.level and node.level >= 2 and node.module:
+            # `from ..foo import X`  →  `from foo import X` (foo is bundled).
+            sibling_modules.add(node.module)
+            node.level = 0
         if isinstance(node, ast.FunctionDef):
             node.decorator_list = [
                 d for d in node.decorator_list if not _is_register_decorator(d)
@@ -95,7 +119,7 @@ def _transform_source(source: str, fn_name: str, agent_id: str, description: str
         f"# description: {description}\n"
         f"# packed at  : {datetime.now().isoformat(timespec='seconds')}\n\n"
     )
-    return header + ast.unparse(tree) + "\n"
+    return header + ast.unparse(tree) + "\n", sibling_modules
 
 
 def _is_register_decorator(d: ast.expr) -> bool:
