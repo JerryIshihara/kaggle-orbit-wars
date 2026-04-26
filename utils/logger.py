@@ -1,20 +1,14 @@
 """Post-match logging utilities.
 
-Currently exposes a single feature: **fleet waste ratio** — the fraction of
-fleets a player launched that did not contribute to capturing or reinforcing
-a planet (i.e., were annihilated in combat, destroyed by the sun, or sailed
-off the map).
+Two features:
 
-Usage:
+1. **Fleet waste ratio** — fraction of launched fleets that did not contribute
+   to capturing or reinforcing a planet (annihilated, destroyed by sun, exited
+   map, or unresolved). See ``waste_ratio`` and ``format_waste_summary``.
 
-    from utils import run_match
-    from utils.logger import waste_ratio
-
-    r = run_match(["physical_v4", "physical_v2"], seed=0)
-    stats = waste_ratio(r.env)
-    for owner, d in stats.items():
-        print(f"player {owner}: {d['useless']}/{d['total']} wasted "
-              f"= {d['waste_ratio']:.1%}  (ships: {d['ship_waste_ratio']:.1%})")
+2. **Time-to-target** — for each fleet, the number of turns between launch and
+   resolution (whether by collision, sun, or end-of-game). Aggregates per
+   player and per outcome. See ``time_to_target`` and ``format_tto_summary``.
 """
 
 from __future__ import annotations
@@ -43,6 +37,11 @@ class FleetRecord:
     outcome: str           # "captured" | "reinforced" | "annihilated"
                            # | "destroyed_sun" | "out_of_map"
                            # | "still_in_flight" | "unknown"
+
+    @property
+    def travel_time(self) -> int:
+        """Turns between launch and resolution (i.e., end_step - launch_step)."""
+        return self.end_step - self.launch_step
 
 
 def _seg_hits_circle(x1, y1, x2, y2, cx, cy, r):
@@ -221,6 +220,110 @@ def waste_ratio(env) -> dict[int, dict]:
         )
 
     return out
+
+
+def _percentile(sorted_vals, p):
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return float(sorted_vals[0])
+    k = (len(sorted_vals) - 1) * p
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    frac = k - lo
+    return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
+
+
+def time_to_target(env, include_in_flight: bool = False) -> dict[int, dict]:
+    """Per-owner time-to-target statistics.
+
+    Returns a dict keyed by player slot. Each value::
+
+        {
+            "n_fleets":         <fleets considered>,
+            "n_ships":          <total ships in those fleets>,
+            "tt_mean":          <mean travel time, turns>,
+            "tt_median":        <median travel time>,
+            "tt_p25":           <25th percentile>,
+            "tt_p75":           <75th percentile>,
+            "tt_min":           <min>,
+            "tt_max":           <max>,
+            "tt_ship_weighted": <Σ(ships * tt) / Σ(ships) — average turn a ship spends in transit>,
+            "by_outcome":       {outcome: {"n_fleets": int, "tt_mean": float, "tt_median": float}, ...},
+        }
+
+    `include_in_flight=False` (default) excludes fleets still moving when the
+    game ended (they don't have a real "time to target"). Set True to include
+    them with their elapsed-so-far value.
+    """
+    records = trace_fleets(env)
+    by_owner: dict[int, list] = {}
+    for r in records:
+        if not include_in_flight and r.outcome == "still_in_flight":
+            continue
+        by_owner.setdefault(r.owner, []).append(r)
+
+    out: dict[int, dict] = {}
+    for owner, recs in by_owner.items():
+        tts = sorted(r.travel_time for r in recs)
+        ships_total = sum(r.initial_ships for r in recs)
+        ship_weighted = (
+            sum(r.initial_ships * r.travel_time for r in recs) / ships_total
+            if ships_total > 0 else 0.0
+        )
+
+        # Per-outcome breakdown
+        per_outcome: dict[str, list[int]] = {}
+        for r in recs:
+            per_outcome.setdefault(r.outcome, []).append(r.travel_time)
+        outcome_stats = {}
+        for outcome, vals in per_outcome.items():
+            vs = sorted(vals)
+            outcome_stats[outcome] = {
+                "n_fleets": len(vs),
+                "tt_mean": sum(vs) / len(vs),
+                "tt_median": _percentile(vs, 0.5),
+            }
+
+        out[owner] = {
+            "n_fleets": len(recs),
+            "n_ships": ships_total,
+            "tt_mean": sum(tts) / len(tts) if tts else 0.0,
+            "tt_median": _percentile(tts, 0.5),
+            "tt_p25": _percentile(tts, 0.25),
+            "tt_p75": _percentile(tts, 0.75),
+            "tt_min": tts[0] if tts else 0,
+            "tt_max": tts[-1] if tts else 0,
+            "tt_ship_weighted": ship_weighted,
+            "by_outcome": outcome_stats,
+        }
+    return out
+
+
+def format_tto_summary(env, agent_ids: list[str] | None = None,
+                       include_in_flight: bool = False) -> str:
+    """Pretty-printable per-player time-to-target summary."""
+    stats = time_to_target(env, include_in_flight=include_in_flight)
+    lines = []
+    for owner in sorted(stats):
+        label = agent_ids[owner] if agent_ids and owner < len(agent_ids) else f"p{owner}"
+        d = stats[owner]
+        outcome_bits = []
+        # Show top 3 outcomes by count.
+        for outcome, od in sorted(d["by_outcome"].items(),
+                                  key=lambda kv: -kv[1]["n_fleets"])[:3]:
+            outcome_bits.append(f"{outcome}: n={od['n_fleets']} med={od['tt_median']:.1f}")
+        outcome_str = " | ".join(outcome_bits)
+        lines.append(
+            f"  {label:<14} "
+            f"n={d['n_fleets']:>3}  ships={d['n_ships']:>5}  "
+            f"tt_mean={d['tt_mean']:5.1f}  med={d['tt_median']:5.1f}  "
+            f"p25={d['tt_p25']:4.1f}  p75={d['tt_p75']:5.1f}  "
+            f"min={d['tt_min']:>2}  max={d['tt_max']:>3}  "
+            f"ship_w={d['tt_ship_weighted']:5.1f}  "
+            f"[{outcome_str}]"
+        )
+    return "\n".join(lines)
 
 
 def format_waste_summary(env, agent_ids: list[str] | None = None) -> str:

@@ -13,13 +13,21 @@ from .submitter import submit_agent
 
 # Logger imported last so its (pure, dependency-free) load doesn't trigger any
 # transitive import that races with utils/__init__'s own exports.
-from .logger import FleetRecord, format_waste_summary, trace_fleets, waste_ratio
+from .logger import (
+    FleetRecord,
+    format_tto_summary,
+    format_waste_summary,
+    time_to_target,
+    trace_fleets,
+    waste_ratio,
+)
 
 __all__ = [
     "FleetRecord",
     "MatchResult",
     "REPLAY_ROOT",
     "compute_scores",
+    "format_tto_summary",
     "format_waste_summary",
     "make_run_id",
     "pack_agent",
@@ -27,6 +35,7 @@ __all__ = [
     "run_match",
     "save_replay",
     "submit_agent",
+    "time_to_target",
     "trace_fleets",
     "train_match",
     "waste_ratio",
