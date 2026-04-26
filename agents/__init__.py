@@ -3,6 +3,7 @@ from .registry import Agent, AgentSpec, list_agent_specs, list_agents, register
 from . import physical_v1  # noqa: F401
 from . import physical_v2  # noqa: F401
 from . import physical_v3  # noqa: F401
+from . import physical_v4  # noqa: F401
 from . import random_v1  # noqa: F401
 from . import sniper_v1  # noqa: F401
 
