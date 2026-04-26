@@ -230,6 +230,7 @@ def candidates_for_source(
     frontier_w: float,
     safety: int,
     raw_planets: list,
+    raw_fleets: list,
     raw_by_id: dict,
     player: int,
 ) -> list[tuple]:
@@ -250,13 +251,16 @@ def candidates_for_source(
         if ships_needed > surplus:
             continue
         angle = math.atan2(py - source.y, px - source.x)
-        # Unified validation: subsumes sun + boundary + wrong-planet + insufficient-garrison.
-        # Pass our lead-aim ETA so the validator computes production-during-travel
-        # using the same eta the agent picked the launch with.
+        # Unified validation: now also feeds in-flight fleets so the validator
+        # can predict garrison-at-arrival via the per-arrival combat timeline
+        # (incoming enemy reinforcements + concurrent friendly fleets), and
+        # the lead-aim ETA so production growth is computed accurately for
+        # orbiting targets.
         if src_raw is not None:
             ok, _reason = validate_launch(
                 src_raw, angle, ships_needed, target.id, raw_planets, player, safety,
                 eta_override=turns,
+                fleets=raw_fleets,
             )
             if not ok:
                 continue
@@ -280,6 +284,7 @@ def find_coalition(
     safety: int,
     min_launch: int,
     raw_planets: list,
+    raw_fleets: list,
     raw_by_id: dict,
     player: int,
 ):
@@ -341,6 +346,7 @@ def find_coalition(
                 ok, _reason = validate_launch(
                     src_raw, angle, ships, target.id, raw_planets, player, safety,
                     eta_override=eta,
+                    fleets=raw_fleets,
                 )
                 if ok:
                     validated.append((src, ships, angle, eta))
@@ -415,6 +421,7 @@ def physical_v4_agent(obs):
             safety,
             min_launch,
             raw_planets,
+            raw_fleets,
             raw_by_id,
             player,
         )
@@ -440,6 +447,7 @@ def physical_v4_agent(obs):
             frontier_w,
             safety,
             raw_planets,
+            raw_fleets,
             raw_by_id,
             player,
         )
