@@ -29,6 +29,7 @@ import math
 
 from kaggle_environments.envs.orbit_wars.orbit_wars import Fleet, Planet
 
+from ..physics_utils import validate_launch
 from ..registry import register
 
 # ---------- Physics constants (shared with v1/v2) ----------
@@ -228,17 +229,19 @@ def candidates_for_source(
     neutral_bonus: float,
     frontier_w: float,
     safety: int,
+    raw_planets: list,
+    raw_by_id: dict,
+    player: int,
 ) -> list[tuple]:
     """Return [(target, eta, ships_needed, angle, score), ...] sorted by score asc."""
     out = []
+    src_raw = raw_by_id.get(source.id)
     for target in targets:
         orbiting = is_orbiting(target, angular_velocity)
         fleet_guess = min(max(target.ships + 10, 20), surplus)
         if fleet_guess < 1:
             continue
         px, py, turns = lead_aim(source, target, fleet_guess, av_signed, orbiting)
-        if crosses_sun(source.x, source.y, px, py):
-            continue
         if target.owner == -1:
             ships_on_arrival = target.ships
         else:
@@ -246,9 +249,20 @@ def candidates_for_source(
         ships_needed = ships_on_arrival + safety
         if ships_needed > surplus:
             continue
+        angle = math.atan2(py - source.y, px - source.x)
+        # Unified validation: subsumes sun + boundary + wrong-planet + insufficient-garrison.
+        if src_raw is not None:
+            ok, _reason = validate_launch(
+                src_raw, angle, ships_needed, target.id, raw_planets, player, safety
+            )
+            if not ok:
+                continue
+        else:
+            # Fallback: at least keep the original sun check.
+            if crosses_sun(source.x, source.y, px, py):
+                continue
         fd = frontier_distance(target, my_planets)
         sc = score_target(turns, target, fd, neutral_bonus, frontier_w)
-        angle = math.atan2(py - source.y, px - source.x)
         out.append((target, turns, ships_needed, angle, sc))
     out.sort(key=lambda x: x[4])
     return out
@@ -262,6 +276,9 @@ def find_coalition(
     eta_tolerance: int,
     safety: int,
     min_launch: int,
+    raw_planets: list,
+    raw_by_id: dict,
+    player: int,
 ):
     """Try to assemble 2–4 of our planets to swarm `target` within eta_tolerance.
 
@@ -310,7 +327,24 @@ def find_coalition(
             # Sanity: combined fleet must still beat defenders even after caps.
             if sum(ships for _, ships, _, _ in per_source) < total_needed:
                 continue
-            return (target, per_source)
+            # Validate every per-source launch; drop any that fail. If the
+            # surviving fleets can't still meet total_needed, skip this window.
+            validated: list[tuple] = []
+            for src, ships, angle, eta in per_source:
+                src_raw = raw_by_id.get(src.id)
+                if src_raw is None:
+                    validated.append((src, ships, angle, eta))
+                    continue
+                ok, _reason = validate_launch(
+                    src_raw, angle, ships, target.id, raw_planets, player, safety
+                )
+                if ok:
+                    validated.append((src, ships, angle, eta))
+            if not validated:
+                continue
+            if sum(ships for _, ships, _, _ in validated) < total_needed:
+                continue
+            return (target, validated)
     return None
 
 
@@ -335,6 +369,10 @@ def physical_v4_agent(obs):
     fleets = [Fleet(*f) for f in raw_fleets]
     av_sign = infer_rotation_sign(planets, initial_planets)
     av_signed = angular_velocity * av_sign
+
+    # Map planet.id → raw env tuple so validate_launch can run without
+    # reconstructing from the namedtuple.
+    raw_by_id = {row[0]: row for row in raw_planets}
 
     my_planets = [p for p in planets if p.owner == player and p.ships >= min_launch]
     targets = [p for p in planets if p.owner != player]
@@ -372,6 +410,9 @@ def physical_v4_agent(obs):
             eta_tol,
             safety,
             min_launch,
+            raw_planets,
+            raw_by_id,
+            player,
         )
         if coalition is None:
             continue
@@ -394,6 +435,9 @@ def physical_v4_agent(obs):
             neutral_bonus,
             frontier_w,
             safety,
+            raw_planets,
+            raw_by_id,
+            player,
         )
         if not cands:
             continue
