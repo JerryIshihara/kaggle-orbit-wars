@@ -251,9 +251,12 @@ def candidates_for_source(
             continue
         angle = math.atan2(py - source.y, px - source.x)
         # Unified validation: subsumes sun + boundary + wrong-planet + insufficient-garrison.
+        # Pass our lead-aim ETA so the validator computes production-during-travel
+        # using the same eta the agent picked the launch with.
         if src_raw is not None:
             ok, _reason = validate_launch(
-                src_raw, angle, ships_needed, target.id, raw_planets, player, safety
+                src_raw, angle, ships_needed, target.id, raw_planets, player, safety,
+                eta_override=turns,
             )
             if not ok:
                 continue
@@ -336,7 +339,8 @@ def find_coalition(
                     validated.append((src, ships, angle, eta))
                     continue
                 ok, _reason = validate_launch(
-                    src_raw, angle, ships, target.id, raw_planets, player, safety
+                    src_raw, angle, ships, target.id, raw_planets, player, safety,
+                    eta_override=eta,
                 )
                 if ok:
                     validated.append((src, ships, angle, eta))

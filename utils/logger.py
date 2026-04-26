@@ -107,19 +107,45 @@ def trace_fleets(env) -> list[FleetRecord]:
             ))
             continue
 
-        # Find first planet whose disc the segment crossed (use planet positions
-        # from the END-step obs, since orbiting planets move per step).
+        # Find first planet whose disc the segment crossed. Orbiting planets
+        # move 1–3 units per step, so we must check their positions at BOTH
+        # the start and end of the transition: a fleet that legitimately
+        # collided with an orbiting planet will only intersect one of those.
+        # Also extend the planet's effective radius slightly to absorb the
+        # planet's own swept-arc length during the step.
         obs_end = env.steps[end_step][0].observation
+        obs_before = env.steps[last_step][0].observation
         planets_end = obs_end.get("planets") or []
-        target = None
-        for p in planets_end:
-            pid, _, px, py, prad, _, _ = p
-            if _seg_hits_circle(last_x, last_y, next_x, next_y, px, py, prad):
-                target = p
+        planets_before = obs_before.get("planets") or []
+        before_by_id = {p[0]: p for p in planets_before}
+        end_by_id = {p[0]: p for p in planets_end}
+
+        target_id = None
+        target_position_planet = None  # the (x,y,r) we used for the hit test
+        for pid in set(before_by_id) | set(end_by_id):
+            pb = before_by_id.get(pid)
+            pe = end_by_id.get(pid)
+            # Estimate orbital sweep: distance between start and end positions.
+            sweep = 0.0
+            if pb and pe:
+                sweep = math.hypot(pe[2] - pb[2], pe[3] - pb[3])
+            for p in (pb, pe):
+                if p is None:
+                    continue
+                # Inflate the disc by the orbital sweep so we catch fleets
+                # whose collision point falls between the start- and
+                # end-of-step planet positions.
+                if _seg_hits_circle(
+                    last_x, last_y, next_x, next_y,
+                    p[2], p[3], p[4] + sweep,
+                ):
+                    target_id = pid
+                    target_position_planet = p
+                    break
+            if target_id is not None:
                 break
 
-        if target is None:
-            # No planet hit. Out of map?
+        if target_id is None:
             outside = not (
                 BOARD_MIN <= next_x <= BOARD_MAX and BOARD_MIN <= next_y <= BOARD_MAX
             )
@@ -130,14 +156,9 @@ def trace_fleets(env) -> list[FleetRecord]:
             ))
             continue
 
-        target_id = target[0]
         # Compare planet state before/after the resolution to classify outcome.
-        obs_before = env.steps[last_step][0].observation
-        before = next(
-            (pp for pp in obs_before.get("planets") or [] if pp[0] == target_id),
-            None,
-        )
-        after = next((pp for pp in planets_end if pp[0] == target_id), None)
+        before = before_by_id.get(target_id)
+        after = end_by_id.get(target_id)
 
         outcome = "unknown"
         if before is not None and after is not None:

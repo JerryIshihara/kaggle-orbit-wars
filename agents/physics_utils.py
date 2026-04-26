@@ -152,11 +152,19 @@ def validate_launch(
     planets: list,
     player: int,
     safety_buffer: int = 3,
+    eta_override: float | None = None,
 ) -> tuple[bool, str]:
     """Return (is_valid, reason). False ⇒ drop the launch.
 
     `source` and entries of `planets` are raw env tuples
     ``[id, owner, x, y, radius, ships, production]``.
+
+    `eta_override` (optional) — turns until the fleet reaches the intended
+    target as estimated by the caller (e.g. ``lead_aim`` for orbiting
+    targets). If provided, used in place of the validator's straight-line
+    ETA when computing production-during-travel for garrison growth — this
+    closes the orbital-target gap where the validator's eta is shorter
+    than the actual lead-aim eta and so under-estimates the defender.
     """
     src_x = source[P_X]
     src_y = source[P_Y]
@@ -178,13 +186,18 @@ def validate_launch(
     pships = p[P_SHIPS]
     pprod = p[P_PRODUCTION]
     eta = hit["eta"]
+    # Use the longer of validator-eta and caller-eta when computing how much
+    # production the defender will have stacked up by arrival. Conservative
+    # (we'd rather drop a marginal launch than approve one that gets
+    # annihilated mid-flight by an unforeseen orbital crawl).
+    eta_for_growth = max(eta, eta_override) if eta_override is not None else eta
     if pid != intended_target_id:
         # Hit a planet we didn't aim at. If it's mine, that's fine (reinforcement-ish).
         # If it's enemy/neutral with garrison >= fleet, we'd waste ships.
         if powner != player:
             garrison = pships
             if powner != -1:
-                garrison = pships + int(pprod * eta)
+                garrison = pships + int(pprod * eta_for_growth)
             if garrison >= fleet_ships:
                 return (
                     False,
@@ -197,7 +210,7 @@ def validate_launch(
     if powner == -1:
         garrison = pships
     else:
-        garrison = pships + int(pprod * eta)
+        garrison = pships + int(pprod * eta_for_growth)
     if fleet_ships <= garrison:
         return (
             False,

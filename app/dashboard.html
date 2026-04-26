@@ -32,9 +32,9 @@
 
   .layout { display: flex; flex: 1; min-height: 0; }
   aside.sidebar { width: 320px; flex-shrink: 0; border-right: 1px solid var(--border); padding: 16px; background: var(--panel); overflow-y: auto; }
-  main { flex: 1; padding: 14px 18px; overflow: hidden; min-width: 0; display: flex; flex-direction: column; }
+  main { flex: 1; padding: 14px 18px; overflow: auto; min-width: 0; display: flex; flex-direction: column; }
   .pane { display: none; }
-  .pane.active { display: flex; flex-direction: column; gap: 10px; height: 100%; min-height: 0; }
+  .pane.active { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
 
   .agent-list { display: flex; flex-direction: column; gap: 6px; }
   .agent-card { padding: 8px 12px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; cursor: grab; user-select: none; transition: all 0.15s; display: flex; flex-direction: column; gap: 3px; }
@@ -82,9 +82,11 @@
   .match-row { display: flex; gap: 12px; flex: 1; min-height: 0; }
   #replay { flex: 1; min-width: 0; height: 100%; border: 1px solid var(--border); border-radius: 4px; background: #000; }
 
-  /* Charts area: stacked under the replay, three charts side-by-side. */
-  .charts-row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1.2fr) minmax(0, 1.2fr); gap: 10px; flex-shrink: 0; height: 200px; }
-  .chart-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 8px; display: flex; flex-direction: column; min-width: 0; }
+  /* Replay sits at the top of the main pane; charts stack vertically below
+     it, each spanning the full width. */
+  .match-row { display: flex; flex: 1; min-height: 320px; }
+  .charts-col { display: flex; flex-direction: column; gap: 10px; flex-shrink: 0; min-width: 0; }
+  .chart-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 8px; display: flex; flex-direction: column; min-width: 0; height: 220px; }
   .chart-panel .chart-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 4px; flex-shrink: 0; }
   .chart-panel .chart-body { flex: 1; min-height: 0; }
   .chart-panel svg { width: 100%; height: 100%; display: block; }
@@ -130,7 +132,7 @@
       <div class="match-row">
         <iframe id="replay" src="about:blank"></iframe>
       </div>
-      <div class="charts-row">
+      <div class="charts-col">
         <div class="chart-panel">
           <div class="chart-title">Ships over time</div>
           <div class="chart-body" id="chart"><div class="empty">run a match to see per-step scores</div></div>
