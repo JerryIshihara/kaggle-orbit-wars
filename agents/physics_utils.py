@@ -1,22 +1,37 @@
-"""Shared trajectory-validation utilities for physical agents.
+"""Shared trajectory + launch-planning utilities for physical agents.
 
-Centralizes the segment-vs-disc collision math, fleet-speed formula,
-and a `validate_launch` filter that drops obviously wasteful launches:
+Two layers of API:
 
-    - trajectory crosses the sun
-    - fleet exits the board without hitting anything
-    - first hit is a non-target enemy/neutral with garrison >= our fleet
-    - first hit is the intended target but garrison-on-arrival >= our fleet
+1. Low-level helpers — `fleet_speed`, `crosses_sun`, `_seg_hits_circle`,
+   `find_first_collision`, `lead_aim`, `predict_garrison_at_arrival`,
+   `validate_launch` — operate on raw env tuples for cheapness and
+   composability.
+
+2. High-level `plan_launch(from_planet, to_planet, ...) -> Launch` — the
+   recommended entry point. Sizes the fleet, runs deterministic lead-aim,
+   predicts garrison-at-arrival from the in-flight fleet timeline,
+   validates the trajectory, and returns a single ``Launch`` record with
+   ``.ok``, ``.reason``, ``.angle``, ``.eta``, and ``.ships``.
+
+   Trajectory determinism: static and orbiting planet positions are fully
+   determined by ``(initial position, angular_velocity)`` at any future
+   turn. Comets, by contrast, only become predictable once they SPAWN
+   (their pre-computed path appears in ``obs["comets"]`` at the spawn
+   step). Before spawn, no agent — heuristic or learned — can target a
+   comet correctly, so we don't try; comets in flight are treated as
+   orbiting planets here, which is approximate (their orbits are
+   elliptical, not circular) but adequate for the agent's purposes.
 
 Planets/fleets are passed as raw env tuples
 ``[id, owner, x, y, radius, ships, production]``
 ``[id, owner, x, y, angle, from_planet_id, ships]``
-to keep the validator import-light (no Planet/Fleet construction needed).
+to keep imports light (no Planet/Fleet namedtuple construction needed).
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 SUN_CX = 50.0
@@ -45,6 +60,38 @@ F_Y = 3
 F_ANGLE = 4
 F_FROM = 5
 F_SHIPS = 6
+
+# Orbital geometry
+ROTATION_RADIUS_LIMIT = 50.0
+LEAD_AIM_ITERS = 6
+
+
+@dataclass
+class Launch:
+    """Result of `plan_launch`.
+
+    Always populated even on failure (so callers can inspect why we passed
+    on a candidate). `.ok` is the gate; `.reason` is one of:
+
+      "capture"               — will capture target (success)
+      "reinforcement"         — target is already ours (success)
+      "no_surplus"            — sized fleet exceeds available surplus
+      "sun"                   — trajectory crosses the sun
+      "boundary"              — trajectory exits the 100×100 board
+      "no_collision"          — trajectory hits nothing within max distance
+      "wrong_planet_<id>_garrison_<g>"
+                              — first hit is a different planet with too much garrison
+      "insufficient_garrison_<g>_vs_ships_<n>"
+                              — target garrison-at-arrival ≥ our fleet
+    """
+
+    from_id: int
+    target_id: int
+    angle: float
+    eta: float
+    ships: int
+    ok: bool
+    reason: str
 
 
 def fleet_speed(ships: int) -> float:
@@ -335,3 +382,162 @@ def validate_launch(
             f"insufficient_garrison_{garrison}_vs_ships_{fleet_ships}",
         )
     return (True, "ok")
+
+
+# ---------- High-level launch planner ----------
+def _is_orbiting_xy(x: float, y: float, radius: float, angular_velocity: float) -> bool:
+    if angular_velocity == 0:
+        return False
+    return math.hypot(x - SUN_CX, y - SUN_CY) + radius < ROTATION_RADIUS_LIMIT
+
+
+def lead_aim(
+    sx: float, sy: float,
+    tx0: float, ty0: float,
+    target_radius: float,
+    fleet_ships: int,
+    av_signed: float,
+    target_orbiting: bool,
+    iters: int = LEAD_AIM_ITERS,
+) -> tuple[float, float, float]:
+    """Compute (predicted_target_x, predicted_target_y, eta_turns).
+
+    For static or zero-angular-velocity targets, this is a straight line.
+    For orbiting targets, iterates: estimate eta from current target
+    position → predict where target will be after eta → recompute eta to
+    that predicted position → repeat. Converges in <6 iterations because
+    the displacement is small per step.
+    """
+    speed = fleet_speed(fleet_ships)
+    if not target_orbiting or av_signed == 0 or speed <= 0:
+        dist = math.hypot(tx0 - sx, ty0 - sy)
+        return tx0, ty0, dist / max(speed, 1e-6)
+    dx = tx0 - SUN_CX
+    dy = ty0 - SUN_CY
+    r = math.hypot(dx, dy)
+    initial_angle = math.atan2(dy, dx)
+    px, py = tx0, ty0
+    turns = math.hypot(px - sx, py - sy) / speed
+    for _ in range(iters):
+        a = initial_angle + av_signed * turns
+        px = SUN_CX + r * math.cos(a)
+        py = SUN_CY + r * math.sin(a)
+        turns = math.hypot(px - sx, py - sy) / speed
+    return px, py, turns
+
+
+def plan_launch(
+    from_planet: tuple,
+    to_planet: tuple,
+    *,
+    planets: list,
+    fleets: list,
+    player: int,
+    angular_velocity: float,
+    av_sign: int = 1,
+    fleet_ships: int | None = None,
+    surplus: int | None = None,
+    safety_buffer: int = 3,
+    convergence_iters: int = 3,
+) -> Launch:
+    """Compute the best from→to launch and validate it end-to-end.
+
+    Steps performed:
+      1. Detect target's motion class (static / orbiting).
+      2. Iteratively converge ``(eta, ships_needed)`` against
+         ``predict_garrison_at_arrival`` so production growth, in-flight
+         enemy reinforcements and friendly attacks are all factored in
+         when sizing the fleet.
+      3. Validate trajectory: sun-cross, board-exit, first-hit-must-be-target.
+      4. Return a Launch record with ``.ok`` True iff the launch is sound.
+
+    `fleet_ships`: pin the fleet size. If None, sizes to the smallest count
+    that captures the predicted defenders (clamped by `surplus`).
+
+    `surplus`: maximum ships available from the source. If the planner's
+    sized fleet exceeds this, returns Launch(ok=False, reason="no_surplus").
+    """
+    sx = from_planet[P_X]
+    sy = from_planet[P_Y]
+    sr = from_planet[P_RADIUS]
+    src_id = from_planet[P_ID]
+
+    tid = to_planet[P_ID]
+    tx0 = to_planet[P_X]
+    ty0 = to_planet[P_Y]
+    tr = to_planet[P_RADIUS]
+    tships = to_planet[P_SHIPS]
+    towner = to_planet[P_OWNER]
+
+    av_signed = float(angular_velocity) * (1 if av_sign >= 0 else -1)
+    target_orbiting = _is_orbiting_xy(tx0, ty0, tr, angular_velocity)
+
+    # ---- Iterative size-and-aim convergence ----
+    # Initial fleet guess: enough for the static defender + a margin. This
+    # primes lead_aim with a reasonable speed so the eta estimate is sane.
+    if fleet_ships is not None:
+        ships = int(fleet_ships)
+    else:
+        ships = max(20, tships + 10)
+        if surplus is not None:
+            ships = min(ships, surplus)
+
+    eta = 0.0
+    angle = 0.0
+    for _ in range(convergence_iters):
+        px, py, eta = lead_aim(sx, sy, tx0, ty0, tr, ships, av_signed, target_orbiting)
+        angle = math.atan2(py - sy, px - sx)
+        if fleet_ships is not None:
+            break  # caller fixed the size; just compute angle/eta with it
+        # Re-size against predicted garrison so we don't under-fund the launch
+        # when production-during-travel + enemy reinforcement is high.
+        garrison = predict_garrison_at_arrival(to_planet, eta, player, fleets)
+        new_ships = garrison + safety_buffer
+        if surplus is not None:
+            new_ships = min(new_ships, surplus)
+        if new_ships <= ships:
+            ships = new_ships
+            break
+        ships = new_ships
+
+    # ---- Surplus check ----
+    if surplus is not None and ships > surplus:
+        return Launch(src_id, tid, angle, eta, ships, ok=False, reason="no_surplus")
+
+    # ---- Trajectory validation ----
+    hit = find_first_collision(sx, sy, sr, src_id, angle, ships, planets)
+    if hit is None:
+        return Launch(src_id, tid, angle, eta, ships, ok=False, reason="no_collision")
+    if hit["kind"] == "sun":
+        return Launch(src_id, tid, angle, eta, ships, ok=False, reason="sun")
+    if hit["kind"] == "boundary":
+        return Launch(src_id, tid, angle, eta, ships, ok=False, reason="boundary")
+
+    hit_planet = hit["planet"]
+    hit_pid = hit_planet[P_ID]
+    if hit_pid != tid:
+        # First-hit isn't the intended target. If it's enemy/neutral with
+        # enough garrison to absorb our fleet, fail. If it's our own planet,
+        # the intervening collision is a free reinforcement — that's fine.
+        h_owner = hit_planet[P_OWNER]
+        if h_owner != player:
+            h_garrison = predict_garrison_at_arrival(hit_planet, eta, player, fleets)
+            if h_garrison >= ships:
+                return Launch(
+                    src_id, tid, angle, eta, ships, ok=False,
+                    reason=f"wrong_planet_{hit_pid}_garrison_{h_garrison}",
+                )
+        # Non-target collision but it's ours / undefended; allow.
+        return Launch(src_id, tid, angle, eta, ships, ok=True, reason="reinforcement")
+
+    # Hit intended target.
+    if towner == player:
+        return Launch(src_id, tid, angle, eta, ships, ok=True, reason="reinforcement")
+
+    garrison = predict_garrison_at_arrival(to_planet, eta, player, fleets)
+    if ships <= garrison:
+        return Launch(
+            src_id, tid, angle, eta, ships, ok=False,
+            reason=f"insufficient_garrison_{garrison}_vs_ships_{ships}",
+        )
+    return Launch(src_id, tid, angle, eta, ships, ok=True, reason="capture")

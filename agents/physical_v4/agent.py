@@ -251,11 +251,10 @@ def candidates_for_source(
         if ships_needed > surplus:
             continue
         angle = math.atan2(py - source.y, px - source.x)
-        # Unified validation: now also feeds in-flight fleets so the validator
-        # can predict garrison-at-arrival via the per-arrival combat timeline
-        # (incoming enemy reinforcements + concurrent friendly fleets), and
-        # the lead-aim ETA so production growth is computed accurately for
-        # orbiting targets.
+        # Unified validation: feeds in-flight fleets so the validator can
+        # predict garrison-at-arrival via the per-arrival combat timeline,
+        # and the lead-aim eta so production-during-travel is computed
+        # against the same eta the agent used to size the fleet.
         if src_raw is not None:
             ok, _reason = validate_launch(
                 src_raw, angle, ships_needed, target.id, raw_planets, player, safety,
@@ -265,7 +264,6 @@ def candidates_for_source(
             if not ok:
                 continue
         else:
-            # Fallback: at least keep the original sun check.
             if crosses_sun(source.x, source.y, px, py):
                 continue
         fd = frontier_distance(target, my_planets)
