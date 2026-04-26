@@ -24,6 +24,9 @@ from utils import (
     record_match,
     run_match,
     save_replay,
+    time_to_target,
+    trace_fleets,
+    waste_ratio,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -88,6 +91,15 @@ async def play(req: PlayRequest):
             if STREAM_DELAY_SEC > 0:
                 await asyncio.sleep(STREAM_DELAY_SEC)
 
+        # Per-player fleet diagnostics — fed to the waste + tto charts.
+        ws = waste_ratio(result.env)
+        ts = time_to_target(result.env)
+        # Compact per-fleet records (owner, travel_time, outcome) for histograms.
+        records = [
+            {"owner": r.owner, "tt": r.travel_time,
+             "outcome": r.outcome, "ships": r.initial_ships}
+            for r in trace_fleets(result.env)
+        ]
         yield json.dumps(
             {
                 "type": "done",
@@ -96,6 +108,9 @@ async def play(req: PlayRequest):
                 "agents": req.agents,
                 "rewards": result.rewards,
                 "winner": result.winner,
+                "waste_stats": {str(k): v for k, v in ws.items()},
+                "tto_stats": {str(k): v for k, v in ts.items()},
+                "fleet_records": records,
             }
         ) + "\n"
 

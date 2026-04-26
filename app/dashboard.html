@@ -31,7 +31,7 @@
   .tab.active { background: #2b3350; color: #fff; }
 
   .layout { display: flex; flex: 1; min-height: 0; }
-  aside.sidebar { width: 220px; flex-shrink: 0; border-right: 1px solid var(--border); padding: 16px; background: var(--panel); overflow-y: auto; }
+  aside.sidebar { width: 320px; flex-shrink: 0; border-right: 1px solid var(--border); padding: 16px; background: var(--panel); overflow-y: auto; }
   main { flex: 1; padding: 14px 18px; overflow: hidden; min-width: 0; display: flex; flex-direction: column; }
   .pane { display: none; }
   .pane.active { display: flex; flex-direction: column; gap: 10px; height: 100%; min-height: 0; }
@@ -79,26 +79,16 @@
   #status.error { color: var(--err); }
   #summary { font-size: 13px; color: var(--muted); flex-shrink: 0; }
   #summary .winner { color: var(--win); font-weight: 600; }
-  .match-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; flex: 1; min-height: 0; }
-  #replay { width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 4px; background: #000; }
+  .match-row { display: flex; gap: 12px; flex: 1; min-height: 0; }
+  #replay { flex: 1; min-width: 0; height: 100%; border: 1px solid var(--border); border-radius: 4px; background: #000; }
 
-  .log-panel { display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; min-height: 0; }
-  .log-panel header.log-header { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; flex-shrink: 0; background: var(--panel); }
-  .log-panel .log-count { color: var(--accent); font-family: ui-monospace, "SF Mono", Menlo, monospace; text-transform: none; letter-spacing: 0; }
-  .log-body-wrap { flex: 1; overflow: auto; }
-  .log-table { width: 100%; border-collapse: collapse; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
-  .log-table th, .log-table td { padding: 3px 10px; text-align: right; }
-  .log-table th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--panel); border-bottom: 1px solid var(--border); z-index: 1; }
-  .log-table th:first-child, .log-table td:first-child { text-align: left; color: var(--muted); }
-  .log-table th[data-p="0"] { color: var(--p1); }
-  .log-table th[data-p="1"] { color: var(--p2); }
-  .log-table th[data-p="2"] { color: var(--p3); }
-  .log-table th[data-p="3"] { color: var(--p4); }
-  .log-table tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.02); }
-
-  #chart { flex-shrink: 0; width: 100%; height: 180px; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 8px; }
-  #chart svg { width: 100%; height: 100%; display: block; }
-  #chart .empty { color: var(--muted); font-style: italic; font-size: 12px; padding: 12px; text-align: center; }
+  /* Charts area: stacked under the replay, three charts side-by-side. */
+  .charts-row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1.2fr) minmax(0, 1.2fr); gap: 10px; flex-shrink: 0; height: 200px; }
+  .chart-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 8px; display: flex; flex-direction: column; min-width: 0; }
+  .chart-panel .chart-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 4px; flex-shrink: 0; }
+  .chart-panel .chart-body { flex: 1; min-height: 0; }
+  .chart-panel svg { width: 100%; height: 100%; display: block; }
+  .chart-panel .empty { color: var(--muted); font-style: italic; font-size: 12px; padding: 12px; text-align: center; }
 
   .placeholder { color: var(--muted); font-style: italic; padding: 60px 20px; text-align: center; border: 1px dashed var(--border); border-radius: 6px; }
 </style>
@@ -139,17 +129,21 @@
       <div id="summary"></div>
       <div class="match-row">
         <iframe id="replay" src="about:blank"></iframe>
-        <div class="log-panel">
-          <header class="log-header">
-            <span>Score log</span>
-            <span class="log-count" id="logCount">0 steps</span>
-          </header>
-          <div class="log-body-wrap" id="logWrap">
-            <table class="log-table"><thead id="logHead"></thead><tbody id="logBody"></tbody></table>
-          </div>
+      </div>
+      <div class="charts-row">
+        <div class="chart-panel">
+          <div class="chart-title">Ships over time</div>
+          <div class="chart-body" id="chart"><div class="empty">run a match to see per-step scores</div></div>
+        </div>
+        <div class="chart-panel">
+          <div class="chart-title">Fleet outcomes (waste)</div>
+          <div class="chart-body" id="wasteChart"><div class="empty">no data</div></div>
+        </div>
+        <div class="chart-panel">
+          <div class="chart-title">Time-to-target distribution</div>
+          <div class="chart-body" id="ttoChart"><div class="empty">no data</div></div>
         </div>
       </div>
-      <div id="chart"><div class="empty">run a match to see per-step scores</div></div>
     </section>
     <section class="pane" id="pane-train">
       <div class="placeholder">Training mode coming soon.</div>
@@ -166,10 +160,8 @@ const statusEl = document.getElementById('status');
 const summaryEl = document.getElementById('summary');
 const replayFrame = document.getElementById('replay');
 const chartEl = document.getElementById('chart');
-const logHeadEl = document.getElementById('logHead');
-const logBodyEl = document.getElementById('logBody');
-const logWrapEl = document.getElementById('logWrap');
-const logCountEl = document.getElementById('logCount');
+const wasteChartEl = document.getElementById('wasteChart');
+const ttoChartEl = document.getElementById('ttoChart');
 const replaySpeedToggle = document.getElementById('replaySpeed');
 let replaySpeedKey = 4;  // index into renderer's speeds[] (default 333 ms/step)
 
@@ -315,17 +307,8 @@ document.getElementById('tabs').addEventListener('click', e => {
 function resetMatchUI(agentIds) {
   summaryEl.textContent = '';
   chartEl.innerHTML = '<div class="empty">match running...</div>';
-  logBodyEl.innerHTML = '';
-  logCountEl.textContent = '0 steps';
-  logHeadEl.innerHTML = `<tr><th>step</th>${agentIds.map((a, i) => `<th data-p="${i}">P${i + 1} ${a}</th>`).join('')}</tr>`;
-}
-
-function appendLogRow(step, scores) {
-  const tr = document.createElement('tr');
-  tr.innerHTML = `<td>${step}</td>${scores.map(v => `<td>${v}</td>`).join('')}`;
-  logBodyEl.appendChild(tr);
-  logWrapEl.scrollTop = logWrapEl.scrollHeight;
-  logCountEl.textContent = `${step + 1} steps`;
+  wasteChartEl.innerHTML = '<div class="empty">waiting for end of match...</div>';
+  ttoChartEl.innerHTML = '<div class="empty">waiting for end of match...</div>';
 }
 
 function scheduleChartRender(scores, agentIds) {
@@ -385,6 +368,144 @@ function renderChart(scores, agentIds) {
   chartEl.innerHTML = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${parts.join('')}</svg>`;
 }
 
+// ---------- Waste chart: stacked horizontal bar per player by outcome ----------
+const OUTCOME_COLORS = {
+  captured:      '#7dd89f',  // green — useful
+  reinforced:    '#56b370',  // green — useful
+  annihilated:   '#f07b7b',  // red
+  destroyed_sun: '#f0b878',  // orange
+  out_of_map:    '#8b6cd8',  // purple
+  unknown:       '#5a6378',  // grey
+  still_in_flight: '#3a4157', // dark grey
+};
+const OUTCOME_ORDER = ['captured', 'reinforced', 'annihilated', 'destroyed_sun', 'out_of_map', 'unknown', 'still_in_flight'];
+
+function renderWasteChart(wasteStats, agentIds) {
+  if (!wasteStats || Object.keys(wasteStats).length === 0) {
+    wasteChartEl.innerHTML = '<div class="empty">no fleet data</div>';
+    return;
+  }
+  const W = Math.max(220, wasteChartEl.clientWidth);
+  const H = Math.max(120, wasteChartEl.clientHeight);
+  const pad = { top: 8, right: 8, bottom: 32, left: 60 };
+  const plotW = W - pad.left - pad.right;
+  const plotH = H - pad.top - pad.bottom;
+  const players = Object.keys(wasteStats).sort((a, b) => +a - +b);
+  const N = players.length;
+  if (!N) { wasteChartEl.innerHTML = '<div class="empty">no fleet data</div>'; return; }
+  const barH = Math.min(28, plotH / N - 6);
+  const parts = [];
+
+  players.forEach((pkey, idx) => {
+    const owner = +pkey;
+    const d = wasteStats[pkey];
+    const total = d.total || 1;
+    const y = pad.top + idx * (plotH / N) + (plotH / N - barH) / 2;
+    const label = `P${owner + 1} ${agentIds[owner] || ''}`;
+    parts.push(`<text x="${pad.left - 6}" y="${y + barH / 2 + 4}" fill="#e8ecf2" font-size="11" text-anchor="end">${label}</text>`);
+
+    let x = pad.left;
+    for (const oc of OUTCOME_ORDER) {
+      const cnt = (d.by_outcome || {})[oc] || 0;
+      if (!cnt) continue;
+      const w = (cnt / total) * plotW;
+      const color = OUTCOME_COLORS[oc] || '#5a6378';
+      parts.push(`<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${barH}" fill="${color}"><title>${oc}: ${cnt} (${(100*cnt/total).toFixed(1)}%)</title></rect>`);
+      if (w > 30) {
+        parts.push(`<text x="${(x + w/2).toFixed(1)}" y="${(y + barH/2 + 4).toFixed(1)}" fill="#0b0d17" font-size="10" text-anchor="middle" font-weight="600">${cnt}</text>`);
+      }
+      x += w;
+    }
+    // Waste percentage at right edge
+    const pct = (d.waste_ratio * 100).toFixed(0);
+    parts.push(`<text x="${(pad.left + plotW + 4).toFixed(1)}" y="${(y + barH/2 + 4).toFixed(1)}" fill="#8b93a8" font-size="11">${pct}%</text>`);
+  });
+
+  // Legend at the bottom
+  let lx = pad.left;
+  const ly = H - 16;
+  for (const oc of OUTCOME_ORDER) {
+    if (!players.some(pk => (wasteStats[pk].by_outcome || {})[oc])) continue;
+    const color = OUTCOME_COLORS[oc] || '#5a6378';
+    parts.push(`<rect x="${lx}" y="${ly}" width="10" height="10" fill="${color}"/>`);
+    parts.push(`<text x="${lx + 14}" y="${ly + 9}" fill="#8b93a8" font-size="10">${oc}</text>`);
+    lx += 14 + (oc.length * 6) + 12;
+    if (lx > W - 60) break;
+  }
+
+  wasteChartEl.innerHTML = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${parts.join('')}</svg>`;
+}
+
+// ---------- Time-to-target histogram per player ----------
+function renderTtoChart(records, agentIds) {
+  if (!records || !records.length) { ttoChartEl.innerHTML = '<div class="empty">no fleet data</div>'; return; }
+  const resolved = records.filter(r => r.outcome !== 'still_in_flight');
+  if (!resolved.length) { ttoChartEl.innerHTML = '<div class="empty">no resolved fleets</div>'; return; }
+
+  const W = Math.max(220, ttoChartEl.clientWidth);
+  const H = Math.max(120, ttoChartEl.clientHeight);
+  const pad = { top: 8, right: 8, bottom: 24, left: 30 };
+  const plotW = W - pad.left - pad.right;
+  const plotH = H - pad.top - pad.bottom;
+
+  const maxTT = Math.max(5, ...resolved.map(r => r.tt));
+  const NUM_BINS = 16;
+  const binWidth = Math.max(1, Math.ceil(maxTT / NUM_BINS));
+  const players = Array.from(new Set(resolved.map(r => r.owner))).sort((a, b) => a - b);
+  const bins = {};  // owner → array of counts
+  for (const p of players) bins[p] = new Array(NUM_BINS).fill(0);
+  for (const r of resolved) {
+    const b = Math.min(NUM_BINS - 1, Math.floor(r.tt / binWidth));
+    bins[r.owner][b]++;
+  }
+  const maxCount = Math.max(1, ...Object.values(bins).flat());
+  const parts = [];
+
+  // Y axis (count)
+  for (let i = 0; i <= 4; i++) {
+    const v = Math.round((maxCount * i) / 4);
+    const y = pad.top + plotH - (v / maxCount) * plotH;
+    parts.push(`<line x1="${pad.left}" x2="${W - pad.right}" y1="${y}" y2="${y}" stroke="#252b3d"/>`);
+    parts.push(`<text x="${pad.left - 4}" y="${y + 4}" fill="#8b93a8" font-size="10" text-anchor="end">${v}</text>`);
+  }
+  // X axis (tt bins)
+  parts.push(`<line x1="${pad.left}" x2="${W - pad.right}" y1="${H - pad.bottom}" y2="${H - pad.bottom}" stroke="#3a4157"/>`);
+  for (let i = 0; i <= 4; i++) {
+    const tt = Math.round((maxTT * i) / 4);
+    const x = pad.left + (i / 4) * plotW;
+    parts.push(`<text x="${x}" y="${H - 8}" fill="#8b93a8" font-size="10" text-anchor="middle">${tt}</text>`);
+  }
+
+  // Grouped bars: per-bin, side-by-side per player.
+  const groupW = plotW / NUM_BINS;
+  const subW = (groupW * 0.8) / players.length;
+  for (let b = 0; b < NUM_BINS; b++) {
+    players.forEach((owner, pi) => {
+      const cnt = bins[owner][b];
+      if (!cnt) return;
+      const h = (cnt / maxCount) * plotH;
+      const x = pad.left + b * groupW + (groupW * 0.1) + pi * subW;
+      const y = pad.top + plotH - h;
+      const color = PLAYER_COLORS[owner];
+      const lo = b * binWidth, hi = (b + 1) * binWidth;
+      parts.push(`<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(1, subW - 1).toFixed(1)}" height="${h.toFixed(1)}" fill="${color}"><title>P${owner + 1} tt ${lo}-${hi}: ${cnt}</title></rect>`);
+    });
+  }
+
+  // Legend with median annotation
+  let lx = pad.left;
+  for (const owner of players) {
+    const tts = resolved.filter(r => r.owner === owner).map(r => r.tt).sort((a, b) => a - b);
+    const median = tts.length ? tts[Math.floor(tts.length / 2)] : 0;
+    const label = `P${owner + 1} ${agentIds[owner] || ''} (med ${median})`;
+    parts.push(`<rect x="${lx}" y="2" width="10" height="10" fill="${PLAYER_COLORS[owner]}"/>`);
+    parts.push(`<text x="${lx + 14}" y="11" fill="#e8ecf2" font-size="10">${label}</text>`);
+    lx += 14 + label.length * 6 + 14;
+  }
+
+  ttoChartEl.innerHTML = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${parts.join('')}</svg>`;
+}
+
 runBtn.addEventListener('click', async () => {
   const chosen = slots.slice(0, nPlayers);
   runBtn.disabled = true;
@@ -424,17 +545,23 @@ runBtn.addEventListener('click', async () => {
           streamAgents = msg.agents;
         } else if (msg.type === 'step') {
           streamedScores.push(msg.scores);
-          appendLogRow(msg.step, msg.scores);
           scheduleChartRender(streamedScores, streamAgents);
         } else if (msg.type === 'done') {
           renderChart(streamedScores, streamAgents);
+          renderWasteChart(msg.waste_stats, msg.agents);
+          renderTtoChart(msg.fleet_records, msg.agents);
           statusEl.textContent = `done · ${msg.run_id}`;
           summaryEl.innerHTML = msg.rewards.map((rw, i) => {
             const label = `P${i + 1} (${msg.agents[i]}): ${rw}`;
             return i === msg.winner ? `<span class="winner">${label} ← winner</span>` : label;
           }).join(' · ');
           replayFrame.src = msg.replay_url;
-          lastMatch = { scores: streamedScores, agents: streamAgents };
+          lastMatch = {
+            scores: streamedScores,
+            agents: streamAgents,
+            wasteStats: msg.waste_stats,
+            fleetRecords: msg.fleet_records,
+          };
         }
       }
     }
@@ -447,7 +574,10 @@ runBtn.addEventListener('click', async () => {
 });
 
 window.addEventListener('resize', () => {
-  if (lastMatch) renderChart(lastMatch.scores, lastMatch.agents);
+  if (!lastMatch) return;
+  renderChart(lastMatch.scores, lastMatch.agents);
+  renderWasteChart(lastMatch.wasteStats, lastMatch.agents);
+  renderTtoChart(lastMatch.fleetRecords, lastMatch.agents);
 });
 
 renderSlots();
