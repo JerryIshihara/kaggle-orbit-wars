@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gzip
 import importlib.util
 import json
 import sys
@@ -54,13 +55,15 @@ def main() -> int:
     for i in indices:
         entry = manifest[i]
         eid, n, slot = entry["eid"], entry["n"], entry["slot"]
-        out = args.out_dir / f"{eid}_{n}_{slot}.json"
-        if out.exists() and out.stat().st_size > 1024:
+        out = args.out_dir / f"{eid}_{n}_{slot}.json.gz"
+        if out.exists() and out.stat().st_size > 256:
             skipped += 1
             print(f"SKIP {eid}", flush=True)
             continue
         try:
-            helper.fetch_episode(eid, save_to=out)
+            payload = helper.fetch_episode(eid)
+            with gzip.open(out, "wt", compresslevel=9) as fh:
+                json.dump(payload, fh)
             ok += 1
             print(f"OK {eid}", flush=True)
         except Exception as e:  # noqa: BLE001 — log and continue

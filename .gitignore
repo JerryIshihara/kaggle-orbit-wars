@@ -33,8 +33,11 @@ htmlcov/
 logs/
 agents/*/weights/
 episodes/
-data/
 *.log
+
+# uncompressed replay JSONs (we commit .json.gz instead)
+data/replays/**/*.json
+!data/replays/**/_manifest.json
 
 # claude code session files
 .claude/
