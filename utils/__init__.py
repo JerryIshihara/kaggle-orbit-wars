@@ -1,3 +1,4 @@
+from .kaggle_episodes import fetch_episode, get_episodes, list_submission_episodes
 from .packer import pack_agent
 from .recorder import record_match
 from .runner import (
@@ -27,8 +28,11 @@ __all__ = [
     "MatchResult",
     "REPLAY_ROOT",
     "compute_scores",
+    "fetch_episode",
     "format_tto_summary",
     "format_waste_summary",
+    "get_episodes",
+    "list_submission_episodes",
     "make_run_id",
     "pack_agent",
     "record_match",
