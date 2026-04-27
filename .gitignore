@@ -32,6 +32,7 @@ htmlcov/
 # project artifacts
 logs/
 agents/*/weights/
+episodes/
 *.log
 
 # claude code session files
