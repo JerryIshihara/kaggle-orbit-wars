@@ -27,7 +27,9 @@ from pathlib import Path
 from typing import Any
 
 _BASE_URL = "https://www.kaggle.com/api/i/competitions.EpisodeService"
-_USER_AGENT = "kaggle-orbit-wars/utils.kaggle_episodes"
+# Kaggle's CDN returns 503 ("DNS cache overflow") for non-browser UAs like
+# python-urllib's default — pin to a Mozilla UA so requests get through.
+_USER_AGENT = "Mozilla/5.0"
 
 
 def fetch_episode(

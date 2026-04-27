@@ -33,6 +33,7 @@ htmlcov/
 logs/
 agents/*/weights/
 episodes/
+data/
 *.log
 
 # claude code session files
