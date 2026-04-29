@@ -39,5 +39,10 @@ episodes/
 data/replays/**/*.json
 !data/replays/**/_manifest.json
 
+# derived encoder-pretrain CSVs (~600MB) — regenerable via
+# scripts/build_encoder_dataset.py and the planet-equivalent flow.
+data/encoders/*.csv
+data/encoders_planet/*.csv
+
 # claude code session files
 .claude/

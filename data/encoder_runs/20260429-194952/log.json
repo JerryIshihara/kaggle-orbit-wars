@@ -1,0 +1,3502 @@
+[
+  {
+    "epoch": 1,
+    "train_total": 7.749794030389866,
+    "train_per_head": {
+      "mission_type_coarse": 0.6136442332708535,
+      "target_relationship": 0.5644499454177728,
+      "ships_log_bucket": 1.1123195115257711,
+      "is_long_haul": 0.3848927726014322,
+      "eta_bucket": 1.1404871880507268,
+      "heading_sector": 1.1507316477158491,
+      "quadrant": 0.9879604768352348,
+      "distance_to_sun_bucket": 1.6052739239540421,
+      "recon_x_norm": 0.07919369855144319,
+      "recon_y_norm": 0.06178279988812048,
+      "recon_vx_norm": 0.015651259457833376,
+      "recon_vy_norm": 0.016870907083263293,
+      "recon_ships_log": 0.016535670852617305
+    },
+    "elapsed_s": 9.83,
+    "val_mean_loss": 0.39701357052793457,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.34358826617620397,
+        "acc": 0.8595313142387282
+      },
+      "target_relationship": {
+        "loss": 0.33307759488550875,
+        "acc": 0.8650495637476588
+      },
+      "ships_log_bucket": {
+        "loss": 0.904500859728313,
+        "acc": 0.6194600520761957
+      },
+      "is_long_haul": {
+        "loss": 0.13705637749157046,
+        "acc": 0.9794892878351834
+      },
+      "eta_bucket": {
+        "loss": 0.7140962844408804,
+        "acc": 0.7615367045817916
+      },
+      "heading_sector": {
+        "loss": 0.720015119298456,
+        "acc": 0.8691242976565712
+      },
+      "quadrant": {
+        "loss": 0.4084711744766685,
+        "acc": 0.9280800328902289
+      },
+      "distance_to_sun_bucket": {
+        "loss": 1.5714249630984194,
+        "acc": 0.2636700013704262
+      },
+      "recon_x_norm": {
+        "loss": 0.006965012872950428
+      },
+      "recon_y_norm": {
+        "loss": 0.008095403619596942
+      },
+      "recon_vx_norm": {
+        "loss": 0.00458126765150046
+      },
+      "recon_vy_norm": {
+        "loss": 0.003875545233176323
+      },
+      "recon_ships_log": {
+        "loss": 0.0054285478899049906
+      }
+    }
+  },
+  {
+    "epoch": 2,
+    "train_total": 4.23480660374425,
+    "train_per_head": {
+      "mission_type_coarse": 0.25041162998986843,
+      "target_relationship": 0.23601580023014246,
+      "ships_log_bucket": 0.6468846194383477,
+      "is_long_haul": 0.09415829482198763,
+      "eta_bucket": 0.5885307966661053,
+      "heading_sector": 0.5938045763168014,
+      "quadrant": 0.25373957888418885,
+      "distance_to_sun_bucket": 1.5452274965638875,
+      "recon_x_norm": 0.005999634778048812,
+      "recon_y_norm": 0.00784868185854509,
+      "recon_vx_norm": 0.004518332664205246,
+      "recon_vy_norm": 0.003779985280629216,
+      "recon_ships_log": 0.003887205063795843
+    },
+    "elapsed_s": 21.45,
+    "val_mean_loss": 0.2798438975652186,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.19565706354557452,
+        "acc": 0.9312594216801425
+      },
+      "target_relationship": {
+        "loss": 0.17989408634104412,
+        "acc": 0.9338358229409346
+      },
+      "ships_log_bucket": {
+        "loss": 0.4293197555859143,
+        "acc": 0.8890228861175826
+      },
+      "is_long_haul": {
+        "loss": 0.06735393922699576,
+        "acc": 0.9908181444429217
+      },
+      "eta_bucket": {
+        "loss": 0.49145064386834203,
+        "acc": 0.8695719702160706
+      },
+      "heading_sector": {
+        "loss": 0.5080419627447496,
+        "acc": 0.929715408158604
+      },
+      "quadrant": {
+        "loss": 0.1957029677489465,
+        "acc": 0.9686903293590974
+      },
+      "distance_to_sun_bucket": {
+        "loss": 1.547512364170778,
+        "acc": 0.3003974235987392
+      },
+      "recon_x_norm": {
+        "loss": 0.005213536314833383
+      },
+      "recon_y_norm": {
+        "loss": 0.007233783815500752
+      },
+      "recon_vx_norm": {
+        "loss": 0.003956337004721636
+      },
+      "recon_vy_norm": {
+        "loss": 0.003878911510521724
+      },
+      "recon_ships_log": {
+        "loss": 0.002755316469919948
+      }
+    }
+  },
+  {
+    "epoch": 3,
+    "train_total": 3.1078475122692204,
+    "train_per_head": {
+      "mission_type_coarse": 0.05407817545933884,
+      "target_relationship": 0.04546246276933606,
+      "ships_log_bucket": 0.36153092229065775,
+      "is_long_haul": 0.0618391442386543,
+      "eta_bucket": 0.4516959348145653,
+      "heading_sector": 0.42669966942122,
+      "quadrant": 0.1724141935090057,
+      "distance_to_sun_bucket": 1.515018564312398,
+      "recon_x_norm": 0.005015677420281563,
+      "recon_y_norm": 0.005635707232193286,
+      "recon_vx_norm": 0.003202167259404013,
+      "recon_vy_norm": 0.0031142461782775258,
+      "recon_ships_log": 0.0021406852203898694
+    },
+    "elapsed_s": 33.4,
+    "val_mean_loss": 0.2266939689321841,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.08006226083620356,
+        "acc": 0.9739344936275182
+      },
+      "target_relationship": {
+        "loss": 0.0720934406726794,
+        "acc": 0.9751404686857613
+      },
+      "ships_log_bucket": {
+        "loss": 0.29214048695364964,
+        "acc": 0.9256680827737427
+      },
+      "is_long_haul": {
+        "loss": 0.05001073600898343,
+        "acc": 0.9930016901923164
+      },
+      "eta_bucket": {
+        "loss": 0.39991515246169945,
+        "acc": 0.8936914713809329
+      },
+      "heading_sector": {
+        "loss": 0.3727230694299313,
+        "acc": 0.9434379425334612
+      },
+      "quadrant": {
+        "loss": 0.14753964053702864,
+        "acc": 0.9786853044630214
+      },
+      "distance_to_sun_bucket": {
+        "loss": 1.5152365519791238,
+        "acc": 0.3268192407838838
+      },
+      "recon_x_norm": {
+        "loss": 0.005052816249754532
+      },
+      "recon_y_norm": {
+        "loss": 0.0047111068003457875
+      },
+      "recon_vx_norm": {
+        "loss": 0.002734239426729128
+      },
+      "recon_vy_norm": {
+        "loss": 0.0029921178324161246
+      },
+      "recon_ships_log": {
+        "loss": 0.0018099769298484984
+      }
+    }
+  },
+  {
+    "epoch": 4,
+    "train_total": 2.6447954979263435,
+    "train_per_head": {
+      "mission_type_coarse": 0.022520836779237295,
+      "target_relationship": 0.018601968407067432,
+      "ships_log_bucket": 0.26515062178383353,
+      "is_long_haul": 0.04840843310626615,
+      "eta_bucket": 0.37145732005103294,
+      "heading_sector": 0.31780852515156527,
+      "quadrant": 0.13167039236100783,
+      "distance_to_sun_bucket": 1.4543610460617964,
+      "recon_x_norm": 0.004002384219256018,
+      "recon_y_norm": 0.004235019844745388,
+      "recon_vx_norm": 0.0024023694416680256,
+      "recon_vy_norm": 0.0025339971723019323,
+      "recon_ships_log": 0.0016425813356524006
+    },
+    "elapsed_s": 45.95,
+    "val_mean_loss": 0.19183093864387113,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.030403063565303395,
+        "acc": 0.9948746060024668
+      },
+      "target_relationship": {
+        "loss": 0.025735347992287695,
+        "acc": 0.9958156319948838
+      },
+      "ships_log_bucket": {
+        "loss": 0.2350470547569135,
+        "acc": 0.9309853364396328
+      },
+      "is_long_haul": {
+        "loss": 0.04070496132427068,
+        "acc": 0.9933214563062446
+      },
+      "eta_bucket": {
+        "loss": 0.3325541532479101,
+        "acc": 0.9012014069709012
+      },
+      "heading_sector": {
+        "loss": 0.28070076444978814,
+        "acc": 0.947476131743639
+      },
+      "quadrant": {
+        "loss": 0.11600961544466762,
+        "acc": 0.9813347951212827
+      },
+      "distance_to_sun_bucket": {
+        "loss": 1.418936769641348,
+        "acc": 0.3862226485770408
+      },
+      "recon_x_norm": {
+        "loss": 0.003657986919439148
+      },
+      "recon_y_norm": {
+        "loss": 0.0037589378438835186
+      },
+      "recon_vx_norm": {
+        "loss": 0.0022785235167932863
+      },
+      "recon_vy_norm": {
+        "loss": 0.0026752867883165837
+      },
+      "recon_ships_log": {
+        "loss": 0.0013397368794028622
+      }
+    }
+  },
+  {
+    "epoch": 5,
+    "train_total": 2.2251407839670905,
+    "train_per_head": {
+      "mission_type_coarse": 0.01265952585875487,
+      "target_relationship": 0.01043812936844946,
+      "ships_log_bucket": 0.21261321947354228,
+      "is_long_haul": 0.04077730030447495,
+      "eta_bucket": 0.31335450546080323,
+      "heading_sector": 0.227197155481627,
+      "quadrant": 0.10580262710817721,
+      "distance_to_sun_bucket": 1.2889729177250582,
+      "recon_x_norm": 0.003619437843576825,
+      "recon_y_norm": 0.003790207371553954,
+      "recon_vx_norm": 0.002261967767037827,
+      "recon_vy_norm": 0.002420363945792578,
+      "recon_ships_log": 0.0012334138678363328
+    },
+    "elapsed_s": 57.65,
+    "val_mean_loss": 0.15535585630997442,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.01497618161299454,
+        "acc": 0.999141199579736
+      },
+      "target_relationship": {
+        "loss": 0.012279395522154688,
+        "acc": 0.9993330592480928
+      },
+      "ships_log_bucket": {
+        "loss": 0.196808560872262,
+        "acc": 0.9450093645790507
+      },
+      "is_long_haul": {
+        "loss": 0.0355821428703666,
+        "acc": 0.9938787629619479
+      },
+      "eta_bucket": {
+        "loss": 0.286961550645278,
+        "acc": 0.9108583436115298
+      },
+      "heading_sector": {
+        "loss": 0.19887661576015114,
+        "acc": 0.9553880590196885
+      },
+      "quadrant": {
+        "loss": 0.09765739620404433,
+        "acc": 0.9827052213238318
+      },
+      "distance_to_sun_bucket": {
+        "loss": 1.1632985453853752,
+        "acc": 0.49779361381389614
+      },
+      "recon_x_norm": {
+        "loss": 0.003489640317671775
+      },
+      "recon_y_norm": {
+        "loss": 0.003187073258907971
+      },
+      "recon_vx_norm": {
+        "loss": 0.002270419245514241
+      },
+      "recon_vy_norm": {
+        "loss": 0.002324482938391736
+      },
+      "recon_ships_log": {
+        "loss": 0.001914127396554848
+      }
+    }
+  },
+  {
+    "epoch": 6,
+    "train_total": 1.784216012273516,
+    "train_per_head": {
+      "mission_type_coarse": 0.008461479363696916,
+      "target_relationship": 0.007138652836575228,
+      "ships_log_bucket": 0.1794204924787794,
+      "is_long_haul": 0.0360483648177205,
+      "eta_bucket": 0.2767602192754505,
+      "heading_sector": 0.16623205222001597,
+      "quadrant": 0.0950021328670638,
+      "distance_to_sun_bucket": 1.0016236370351135,
+      "recon_x_norm": 0.0037877267293099847,
+      "recon_y_norm": 0.0037508621310987393,
+      "recon_vx_norm": 0.002344960466168132,
+      "recon_vy_norm": 0.0025463263590295776,
+      "recon_ships_log": 0.0010991131264653778
+    },
+    "elapsed_s": 69.69,
+    "val_mean_loss": 0.12596185183615816,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.009633420602928197,
+        "acc": 0.999917774427847
+      },
+      "target_relationship": {
+        "loss": 0.007989426899901652,
+        "acc": 0.9999360467772144
+      },
+      "ships_log_bucket": {
+        "loss": 0.1695253260405425,
+        "acc": 0.9546845735690467
+      },
+      "is_long_haul": {
+        "loss": 0.03327964750302725,
+        "acc": 0.9922982047416746
+      },
+      "eta_bucket": {
+        "loss": 0.2601071726153513,
+        "acc": 0.9091041980722672
+      },
+      "heading_sector": {
+        "loss": 0.1571265329858732,
+        "acc": 0.9579644602804805
+      },
+      "quadrant": {
+        "loss": 0.09271733595614708,
+        "acc": 0.9828331277694029
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.8948041151507754,
+        "acc": 0.5819103741263533
+      },
+      "recon_x_norm": {
+        "loss": 0.0036073820439912387
+      },
+      "recon_y_norm": {
+        "loss": 0.0031480554719485535
+      },
+      "recon_vx_norm": {
+        "loss": 0.002525884233512807
+      },
+      "recon_vy_norm": {
+        "loss": 0.002111036167264143
+      },
+      "recon_ships_log": {
+        "loss": 0.0009287381987928729
+      }
+    }
+  },
+  {
+    "epoch": 7,
+    "train_total": 1.4423072267981136,
+    "train_per_head": {
+      "mission_type_coarse": 0.00666137137098097,
+      "target_relationship": 0.005663865895456627,
+      "ships_log_bucket": 0.155980874009493,
+      "is_long_haul": 0.03195674542118521,
+      "eta_bucket": 0.24986247643202292,
+      "heading_sector": 0.1388464859303306,
+      "quadrant": 0.08958290799074814,
+      "distance_to_sun_bucket": 0.7502258935896289,
+      "recon_x_norm": 0.003620486082352635,
+      "recon_y_norm": 0.004025927267405165,
+      "recon_vx_norm": 0.0022384827954600715,
+      "recon_vy_norm": 0.0026402150000985557,
+      "recon_ships_log": 0.001001490736399785
+    },
+    "elapsed_s": 81.76,
+    "val_mean_loss": 0.10161638286679972,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.007460464232531326,
+        "acc": 0.9999634553012654
+      },
+      "target_relationship": {
+        "loss": 0.006160259329599056,
+        "acc": 0.999972591475949
+      },
+      "ships_log_bucket": {
+        "loss": 0.1517837419161806,
+        "acc": 0.9617651089488831
+      },
+      "is_long_haul": {
+        "loss": 0.029317027287106164,
+        "acc": 0.9932118222100407
+      },
+      "eta_bucket": {
+        "loss": 0.2330156800713264,
+        "acc": 0.9298615869535426
+      },
+      "heading_sector": {
+        "loss": 0.1386604466960416,
+        "acc": 0.9616463386779955
+      },
+      "quadrant": {
+        "loss": 0.0853373586034215,
+        "acc": 0.9844685030377781
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.657288323130082,
+        "acc": 0.7398200173587319
+      },
+      "recon_x_norm": {
+        "loss": 0.004148849803409974
+      },
+      "recon_y_norm": {
+        "loss": 0.002993279519346207
+      },
+      "recon_vx_norm": {
+        "loss": 0.0020104080439975287
+      },
+      "recon_vy_norm": {
+        "loss": 0.002094965097396786
+      },
+      "recon_ships_log": {
+        "loss": 0.0007421735379570753
+      }
+    }
+  },
+  {
+    "epoch": 8,
+    "train_total": 1.1976728719823502,
+    "train_per_head": {
+      "mission_type_coarse": 0.005574042083178999,
+      "target_relationship": 0.004707171440813221,
+      "ships_log_bucket": 0.1385928146979388,
+      "is_long_haul": 0.028800646046630473,
+      "eta_bucket": 0.2245041019275409,
+      "heading_sector": 0.12356105966477834,
+      "quadrant": 0.08328168526166628,
+      "distance_to_sun_bucket": 0.5752913363340522,
+      "recon_x_norm": 0.003488233864714368,
+      "recon_y_norm": 0.00397670384840805,
+      "recon_vx_norm": 0.002214151147964309,
+      "recon_vy_norm": 0.0026309567536892636,
+      "recon_ships_log": 0.0010499634829882001
+    },
+    "elapsed_s": 93.61,
+    "val_mean_loss": 0.0846356443123717,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.006394545799207624,
+        "acc": 0.9999269106025307
+      },
+      "target_relationship": {
+        "loss": 0.005254527677445658,
+        "acc": 0.999972591475949
+      },
+      "ships_log_bucket": {
+        "loss": 0.13766536927855982,
+        "acc": 0.9569960257640127
+      },
+      "is_long_haul": {
+        "loss": 0.025555445921273477,
+        "acc": 0.9953496870860171
+      },
+      "eta_bucket": {
+        "loss": 0.21170563849637836,
+        "acc": 0.9375359736878169
+      },
+      "heading_sector": {
+        "loss": 0.12389122867675714,
+        "acc": 0.9660042940021013
+      },
+      "quadrant": {
+        "loss": 0.0814735337666414,
+        "acc": 0.9816819697592618
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.49582360941889647,
+        "acc": 0.8344342423827144
+      },
+      "recon_x_norm": {
+        "loss": 0.003016942413568464
+      },
+      "recon_y_norm": {
+        "loss": 0.004374425158875981
+      },
+      "recon_vx_norm": {
+        "loss": 0.002327063674930243
+      },
+      "recon_vy_norm": {
+        "loss": 0.0019226459112660075
+      },
+      "recon_ships_log": {
+        "loss": 0.0008583998670312694
+      }
+    }
+  },
+  {
+    "epoch": 9,
+    "train_total": 1.0344591501380216,
+    "train_per_head": {
+      "mission_type_coarse": 0.0047339479098519105,
+      "target_relationship": 0.003943172291296871,
+      "ships_log_bucket": 0.1253188912357603,
+      "is_long_haul": 0.02643153318712691,
+      "eta_bucket": 0.20341955526035374,
+      "heading_sector": 0.11279199128391362,
+      "quadrant": 0.0772810028005047,
+      "distance_to_sun_bucket": 0.4673730923848994,
+      "recon_x_norm": 0.0034182328484295044,
+      "recon_y_norm": 0.004018315871269638,
+      "recon_vx_norm": 0.0022978021326952244,
+      "recon_vy_norm": 0.0025215495021685083,
+      "recon_ships_log": 0.0009100610055733754
+    },
+    "elapsed_s": 105.31,
+    "val_mean_loss": 0.07368871136657157,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.005443735363593321,
+        "acc": 0.999945182951898
+      },
+      "target_relationship": {
+        "loss": 0.004468425374159365,
+        "acc": 0.999972591475949
+      },
+      "ships_log_bucket": {
+        "loss": 0.12172988432255621,
+        "acc": 0.9715134073363483
+      },
+      "is_long_haul": {
+        "loss": 0.023484628928387825,
+        "acc": 0.9958430405189347
+      },
+      "eta_bucket": {
+        "loss": 0.19214409564227664,
+        "acc": 0.954730254442465
+      },
+      "heading_sector": {
+        "loss": 0.11370384938088142,
+        "acc": 0.9689187337261889
+      },
+      "quadrant": {
+        "loss": 0.07448058471428755,
+        "acc": 0.9833904344251062
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.4102153618977976,
+        "acc": 0.8688684847654287
+      },
+      "recon_x_norm": {
+        "loss": 0.0032498782039706983
+      },
+      "recon_y_norm": {
+        "loss": 0.002923115176186534
+      },
+      "recon_vx_norm": {
+        "loss": 0.00212045654917933
+      },
+      "recon_vy_norm": {
+        "loss": 0.0029245223892725627
+      },
+      "recon_ships_log": {
+        "loss": 0.0010647098228813911
+      }
+    }
+  },
+  {
+    "epoch": 10,
+    "train_total": 0.9069361441275653,
+    "train_per_head": {
+      "mission_type_coarse": 0.004058979598398344,
+      "target_relationship": 0.0033460776869426757,
+      "ships_log_bucket": 0.11310155977721975,
+      "is_long_haul": 0.024592826315084425,
+      "eta_bucket": 0.18566604684881804,
+      "heading_sector": 0.10375409761146337,
+      "quadrant": 0.07189278279532905,
+      "distance_to_sun_bucket": 0.388787973327797,
+      "recon_x_norm": 0.0031499534360125286,
+      "recon_y_norm": 0.0035592555146695686,
+      "recon_vx_norm": 0.0019581065358625365,
+      "recon_vy_norm": 0.0022158505064396174,
+      "recon_ships_log": 0.0008526278068820218
+    },
+    "elapsed_s": 117.19,
+    "val_mean_loss": 0.0662433953326654,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.004909703641249075,
+        "acc": 0.9999269106025307
+      },
+      "target_relationship": {
+        "loss": 0.003975691256671906,
+        "acc": 0.9999817276506326
+      },
+      "ships_log_bucket": {
+        "loss": 0.1126266917927084,
+        "acc": 0.9725366589009182
+      },
+      "is_long_haul": {
+        "loss": 0.021937598884146526,
+        "acc": 0.9962084875062811
+      },
+      "eta_bucket": {
+        "loss": 0.17702215849130706,
+        "acc": 0.9514229592069801
+      },
+      "heading_sector": {
+        "loss": 0.11073024088095565,
+        "acc": 0.96512722123247
+      },
+      "quadrant": {
+        "loss": 0.06883064901881589,
+        "acc": 0.9852998949339912
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.35013120871769504,
+        "acc": 0.8907130784340597
+      },
+      "recon_x_norm": {
+        "loss": 0.0036964001245417192
+      },
+      "recon_y_norm": {
+        "loss": 0.0028862453542769207
+      },
+      "recon_vx_norm": {
+        "loss": 0.001816495512277984
+      },
+      "recon_vy_norm": {
+        "loss": 0.0017531080704707715
+      },
+      "recon_ships_log": {
+        "loss": 0.0008479475795332334
+      }
+    }
+  },
+  {
+    "epoch": 11,
+    "train_total": 0.8173019460269383,
+    "train_per_head": {
+      "mission_type_coarse": 0.003524212689068513,
+      "target_relationship": 0.0028994438950629797,
+      "ships_log_bucket": 0.10432439623009257,
+      "is_long_haul": 0.023021947013355103,
+      "eta_bucket": 0.17134628037945562,
+      "heading_sector": 0.09666022414169392,
+      "quadrant": 0.06719093369085248,
+      "distance_to_sun_bucket": 0.33583804514227794,
+      "recon_x_norm": 0.0032118443681412386,
+      "recon_y_norm": 0.0035206723113019927,
+      "recon_vx_norm": 0.0023609320613547785,
+      "recon_vy_norm": 0.0024687743426824943,
+      "recon_ships_log": 0.0009342357413569355
+    },
+    "elapsed_s": 129.46,
+    "val_mean_loss": 0.059956957841738594,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0041463492650830195,
+        "acc": 0.999945182951898
+      },
+      "target_relationship": {
+        "loss": 0.003382638673632922,
+        "acc": 0.999972591475949
+      },
+      "ships_log_bucket": {
+        "loss": 0.10301530930456937,
+        "acc": 0.9790598876250514
+      },
+      "is_long_haul": {
+        "loss": 0.020522501672214394,
+        "acc": 0.9965556621442602
+      },
+      "eta_bucket": {
+        "loss": 0.16465522606143793,
+        "acc": 0.9602302316020283
+      },
+      "heading_sector": {
+        "loss": 0.10164386208542824,
+        "acc": 0.9649170892147458
+      },
+      "quadrant": {
+        "loss": 0.070865876773435,
+        "acc": 0.9771778356402174
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.30029211613701834,
+        "acc": 0.9129870723128226
+      },
+      "recon_x_norm": {
+        "loss": 0.0033488802190816103
+      },
+      "recon_y_norm": {
+        "loss": 0.0031107939513265164
+      },
+      "recon_vx_norm": {
+        "loss": 0.0017924941815158503
+      },
+      "recon_vy_norm": {
+        "loss": 0.0021130444552506216
+      },
+      "recon_ships_log": {
+        "loss": 0.0005513591626079166
+      }
+    }
+  },
+  {
+    "epoch": 12,
+    "train_total": 0.7447922720628626,
+    "train_per_head": {
+      "mission_type_coarse": 0.0030675244423709496,
+      "target_relationship": 0.002520650120436394,
+      "ships_log_bucket": 0.09567028972782007,
+      "is_long_haul": 0.021818967003907477,
+      "eta_bucket": 0.1584642848798207,
+      "heading_sector": 0.09041004709335936,
+      "quadrant": 0.06282989959381208,
+      "distance_to_sun_bucket": 0.29849453633572876,
+      "recon_x_norm": 0.003218962754193349,
+      "recon_y_norm": 0.0032289237480516695,
+      "recon_vx_norm": 0.002112935481107786,
+      "recon_vy_norm": 0.002086000204939364,
+      "recon_ships_log": 0.0008692509084333423
+    },
+    "elapsed_s": 141.99,
+    "val_mean_loss": 0.057319552048485295,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0037935028112766203,
+        "acc": 0.999945182951898
+      },
+      "target_relationship": {
+        "loss": 0.003072273241673646,
+        "acc": 0.9999634553012654
+      },
+      "ships_log_bucket": {
+        "loss": 0.09549134156739998,
+        "acc": 0.9809967566579872
+      },
+      "is_long_haul": {
+        "loss": 0.019436573643523417,
+        "acc": 0.9963912109999543
+      },
+      "eta_bucket": {
+        "loss": 0.15281149995021498,
+        "acc": 0.9645607784020831
+      },
+      "heading_sector": {
+        "loss": 0.09131875372941506,
+        "acc": 0.97361472751359
+      },
+      "quadrant": {
+        "loss": 0.06382674721310984,
+        "acc": 0.981033301356722
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.3028680250124195,
+        "acc": 0.8864373486821068
+      },
+      "recon_x_norm": {
+        "loss": 0.003929379479619684
+      },
+      "recon_y_norm": {
+        "loss": 0.004272211006955337
+      },
+      "recon_vx_norm": {
+        "loss": 0.0017762038070708683
+      },
+      "recon_vy_norm": {
+        "loss": 0.002128966520857579
+      },
+      "recon_ships_log": {
+        "loss": 0.000428698646772295
+      }
+    }
+  },
+  {
+    "epoch": 13,
+    "train_total": 0.6866850171770368,
+    "train_per_head": {
+      "mission_type_coarse": 0.002704659985581867,
+      "target_relationship": 0.0022066291186864638,
+      "ships_log_bucket": 0.08898551693233121,
+      "is_long_haul": 0.020752040152790165,
+      "eta_bucket": 0.14806151978608942,
+      "heading_sector": 0.08449803380405202,
+      "quadrant": 0.05877630265445268,
+      "distance_to_sun_bucket": 0.2693841508707079,
+      "recon_x_norm": 0.0031718432770243715,
+      "recon_y_norm": 0.0033880568328587446,
+      "recon_vx_norm": 0.002028080983040463,
+      "recon_vy_norm": 0.002071594478006811,
+      "recon_ships_log": 0.0006565831397648337
+    },
+    "elapsed_s": 154.12,
+    "val_mean_loss": 0.05052020674394276,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0030898458682887928,
+        "acc": 0.999972591475949
+      },
+      "target_relationship": {
+        "loss": 0.002571502513205018,
+        "acc": 0.999972591475949
+      },
+      "ships_log_bucket": {
+        "loss": 0.08799387091156183,
+        "acc": 0.9795441048832854
+      },
+      "is_long_haul": {
+        "loss": 0.018729015139663026,
+        "acc": 0.9964643003974236
+      },
+      "eta_bucket": {
+        "loss": 0.1413432009707721,
+        "acc": 0.9651454935818373
+      },
+      "heading_sector": {
+        "loss": 0.08850255897092947,
+        "acc": 0.9734045954958659
+      },
+      "quadrant": {
+        "loss": 0.05703693947694686,
+        "acc": 0.9880590196884564
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.24482055123163485,
+        "acc": 0.9289753780092276
+      },
+      "recon_x_norm": {
+        "loss": 0.003169928459190831
+      },
+      "recon_y_norm": {
+        "loss": 0.003287006451536742
+      },
+      "recon_vx_norm": {
+        "loss": 0.002483507758174501
+      },
+      "recon_vy_norm": {
+        "loss": 0.002498688810429628
+      },
+      "recon_ships_log": {
+        "loss": 0.0012360711089222174
+      }
+    }
+  },
+  {
+    "epoch": 14,
+    "train_total": 0.6481023180384596,
+    "train_per_head": {
+      "mission_type_coarse": 0.0024011050881191836,
+      "target_relationship": 0.0019457626524342208,
+      "ships_log_bucket": 0.0822767500742143,
+      "is_long_haul": 0.01972577769403197,
+      "eta_bucket": 0.13709050942869747,
+      "heading_sector": 0.08063057716153249,
+      "quadrant": 0.05516276089083247,
+      "distance_to_sun_bucket": 0.2581537027819818,
+      "recon_x_norm": 0.0028397555173445147,
+      "recon_y_norm": 0.0031666905685727087,
+      "recon_vx_norm": 0.0018903284065597574,
+      "recon_vy_norm": 0.0021992203771692364,
+      "recon_ships_log": 0.0006193812352511249
+    },
+    "elapsed_s": 166.24,
+    "val_mean_loss": 0.052688613823228474,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0027899065479921404,
+        "acc": 0.999972591475949
+      },
+      "target_relationship": {
+        "loss": 0.0022338092999647603,
+        "acc": 0.9999908638253163
+      },
+      "ships_log_bucket": {
+        "loss": 0.08275358118084522,
+        "acc": 0.9836462473162487
+      },
+      "is_long_haul": {
+        "loss": 0.018194958010399893,
+        "acc": 0.9954501850075373
+      },
+      "eta_bucket": {
+        "loss": 0.13509023439061357,
+        "acc": 0.9651820382805719
+      },
+      "heading_sector": {
+        "loss": 0.08640410611608902,
+        "acc": 0.9733040975743457
+      },
+      "quadrant": {
+        "loss": 0.05436473789104434,
+        "acc": 0.9867160020099585
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.2923454848917649,
+        "acc": 0.8646201635375268
+      },
+      "recon_x_norm": {
+        "loss": 0.003660324094588583
+      },
+      "recon_y_norm": {
+        "loss": 0.0030094122158038513
+      },
+      "recon_vx_norm": {
+        "loss": 0.0016173492707143634
+      },
+      "recon_vy_norm": {
+        "loss": 0.0015723136097477296
+      },
+      "recon_ships_log": {
+        "loss": 0.0009157621824018734
+      }
+    }
+  },
+  {
+    "epoch": 15,
+    "train_total": 0.5980062394582925,
+    "train_per_head": {
+      "mission_type_coarse": 0.002134710572808668,
+      "target_relationship": 0.0017313435761758885,
+      "ships_log_bucket": 0.07691188119038814,
+      "is_long_haul": 0.0188212505220866,
+      "eta_bucket": 0.1287806533715304,
+      "heading_sector": 0.07595129667961296,
+      "quadrant": 0.052076206988647206,
+      "distance_to_sun_bucket": 0.23127484847517574,
+      "recon_x_norm": 0.002902159794085041,
+      "recon_y_norm": 0.002768129378385028,
+      "recon_vx_norm": 0.001937700408127378,
+      "recon_vy_norm": 0.0020709528182750615,
+      "recon_ships_log": 0.0006451064834719477
+    },
+    "elapsed_s": 177.96,
+    "val_mean_loss": 0.0494008010548072,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.002712124773161173,
+        "acc": 0.999972591475949
+      },
+      "target_relationship": {
+        "loss": 0.0021705782662345876,
+        "acc": 0.999972591475949
+      },
+      "ships_log_bucket": {
+        "loss": 0.0772818690617095,
+        "acc": 0.9851902608377873
+      },
+      "is_long_haul": {
+        "loss": 0.0169723516318466,
+        "acc": 0.9966378877164132
+      },
+      "eta_bucket": {
+        "loss": 0.12298759218926657,
+        "acc": 0.97463797907816
+      },
+      "heading_sector": {
+        "loss": 0.07880220096492815,
+        "acc": 0.9751587410351286
+      },
+      "quadrant": {
+        "loss": 0.05063403638718002,
+        "acc": 0.9885158284226394
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.27700944150938883,
+        "acc": 0.8745237768946142
+      },
+      "recon_x_norm": {
+        "loss": 0.0067968993160594056
+      },
+      "recon_y_norm": {
+        "loss": 0.0029468705146506904
+      },
+      "recon_vx_norm": {
+        "loss": 0.0017275009610088652
+      },
+      "recon_vy_norm": {
+        "loss": 0.0017518216644087758
+      },
+      "recon_ships_log": {
+        "loss": 0.0004171264726505399
+      }
+    }
+  },
+  {
+    "epoch": 16,
+    "train_total": 0.5568192611221506,
+    "train_per_head": {
+      "mission_type_coarse": 0.0019247572939498584,
+      "target_relationship": 0.0015494259653472098,
+      "ships_log_bucket": 0.0723329678553493,
+      "is_long_haul": 0.018058905143196843,
+      "eta_bucket": 0.1221589108600336,
+      "heading_sector": 0.07221190412254895,
+      "quadrant": 0.04953864717683872,
+      "distance_to_sun_bucket": 0.20830677023955754,
+      "recon_x_norm": 0.0030903003996378985,
+      "recon_y_norm": 0.0029797589371153036,
+      "recon_vx_norm": 0.0019923569771515973,
+      "recon_vy_norm": 0.0020546516669648035,
+      "recon_ships_log": 0.0006199056199974843
+    },
+    "elapsed_s": 190.0,
+    "val_mean_loss": 0.04540692867759732,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.002203084070812893,
+        "acc": 0.999972591475949
+      },
+      "target_relationship": {
+        "loss": 0.0017792370542526507,
+        "acc": 0.9999908638253163
+      },
+      "ships_log_bucket": {
+        "loss": 0.07542447335897262,
+        "acc": 0.9864967338175505
+      },
+      "is_long_haul": {
+        "loss": 0.016493959563237317,
+        "acc": 0.9965373897948929
+      },
+      "eta_bucket": {
+        "loss": 0.11556219744228151,
+        "acc": 0.9756795029920972
+      },
+      "heading_sector": {
+        "loss": 0.07597845048849092,
+        "acc": 0.9779635466630122
+      },
+      "quadrant": {
+        "loss": 0.05044891021451096,
+        "acc": 0.9861221506555206
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.24293980521122407,
+        "acc": 0.8960942853227354
+      },
+      "recon_x_norm": {
+        "loss": 0.002814076683159793
+      },
+      "recon_y_norm": {
+        "loss": 0.0025764048418084515
+      },
+      "recon_vx_norm": {
+        "loss": 0.001710958739173488
+      },
+      "recon_vy_norm": {
+        "loss": 0.001991458242140269
+      },
+      "recon_ships_log": {
+        "loss": 0.0003670568987002222
+      }
+    }
+  },
+  {
+    "epoch": 17,
+    "train_total": 0.5427946413264555,
+    "train_per_head": {
+      "mission_type_coarse": 0.0017263600837533213,
+      "target_relationship": 0.0013889716126165596,
+      "ships_log_bucket": 0.06806885676474131,
+      "is_long_haul": 0.017210652128237636,
+      "eta_bucket": 0.1153575323459481,
+      "heading_sector": 0.06878517411586617,
+      "quadrant": 0.04737175515845042,
+      "distance_to_sun_bucket": 0.21297381943514368,
+      "recon_x_norm": 0.002895502365749924,
+      "recon_y_norm": 0.0027947599800037487,
+      "recon_vx_norm": 0.001799184179418728,
+      "recon_vy_norm": 0.0018914347463639593,
+      "recon_ships_log": 0.0005306362660167378
+    },
+    "elapsed_s": 201.97,
+    "val_mean_loss": 0.03964270282796942,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0021524683869689355,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.001733153739072892,
+        "acc": 0.9999908638253163
+      },
+      "ships_log_bucket": {
+        "loss": 0.07007965970336696,
+        "acc": 0.9862774656251427
+      },
+      "is_long_haul": {
+        "loss": 0.016006346943880423,
+        "acc": 0.9961628066328628
+      },
+      "eta_bucket": {
+        "loss": 0.11079109090475966,
+        "acc": 0.973669544561692
+      },
+      "heading_sector": {
+        "loss": 0.07338569581516804,
+        "acc": 0.9758622264857704
+      },
+      "quadrant": {
+        "loss": 0.04591848756695103,
+        "acc": 0.9898223014024028
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.18589502660197113,
+        "acc": 0.949303366680371
+      },
+      "recon_x_norm": {
+        "loss": 0.00261652682339539
+      },
+      "recon_y_norm": {
+        "loss": 0.0027854484222483208
+      },
+      "recon_vx_norm": {
+        "loss": 0.0015814034425075817
+      },
+      "recon_vy_norm": {
+        "loss": 0.001946186249342501
+      },
+      "recon_ships_log": {
+        "loss": 0.0004636421639695685
+      }
+    }
+  },
+  {
+    "epoch": 18,
+    "train_total": 0.5089746443163446,
+    "train_per_head": {
+      "mission_type_coarse": 0.0015821977178057452,
+      "target_relationship": 0.0012643137494759524,
+      "ships_log_bucket": 0.06385374491830834,
+      "is_long_haul": 0.016796121138985418,
+      "eta_bucket": 0.1090684638929968,
+      "heading_sector": 0.06626093603607987,
+      "quadrant": 0.04529346021659234,
+      "distance_to_sun_bucket": 0.1950419458771954,
+      "recon_x_norm": 0.002768385476440567,
+      "recon_y_norm": 0.002620915968378051,
+      "recon_vx_norm": 0.0018531847999532934,
+      "recon_vy_norm": 0.0019689907472455453,
+      "recon_ships_log": 0.0006019873625281885
+    },
+    "elapsed_s": 213.83,
+    "val_mean_loss": 0.038321847685309565,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0018491389812315961,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.0014831093708031534,
+        "acc": 0.9999908638253163
+      },
+      "ships_log_bucket": {
+        "loss": 0.06565398465916715,
+        "acc": 0.98946599058974
+      },
+      "is_long_haul": {
+        "loss": 0.015071575880475415,
+        "acc": 0.9968662920835046
+      },
+      "eta_bucket": {
+        "loss": 0.10511522565370043,
+        "acc": 0.9760449499794436
+      },
+      "heading_sector": {
+        "loss": 0.06848730500534787,
+        "acc": 0.980896258736467
+      },
+      "quadrant": {
+        "loss": 0.04320067529903574,
+        "acc": 0.9905531953770956
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.18635879397408608,
+        "acc": 0.9398656982321502
+      },
+      "recon_x_norm": {
+        "loss": 0.002732719620738675
+      },
+      "recon_y_norm": {
+        "loss": 0.0026833572621201974
+      },
+      "recon_vx_norm": {
+        "loss": 0.0016586526369995157
+      },
+      "recon_vy_norm": {
+        "loss": 0.003484797232670867
+      },
+      "recon_ships_log": {
+        "loss": 0.0004046843326476769
+      }
+    }
+  },
+  {
+    "epoch": 19,
+    "train_total": 0.4856286973011594,
+    "train_per_head": {
+      "mission_type_coarse": 0.0014177568622731737,
+      "target_relationship": 0.0011302777267640316,
+      "ships_log_bucket": 0.06058660969764244,
+      "is_long_haul": 0.016025217664780236,
+      "eta_bucket": 0.10376339061420504,
+      "heading_sector": 0.06327709101703989,
+      "quadrant": 0.043055462017029277,
+      "distance_to_sun_bucket": 0.18679473768262303,
+      "recon_x_norm": 0.002649730638827847,
+      "recon_y_norm": 0.0027550436016328694,
+      "recon_vx_norm": 0.0018129804026836356,
+      "recon_vy_norm": 0.0018112430673781312,
+      "recon_ships_log": 0.0005491584037555804
+    },
+    "elapsed_s": 225.7,
+    "val_mean_loss": 0.03604532053678859,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0016183705835463081,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.001268076586269166,
+        "acc": 0.9999908638253163
+      },
+      "ships_log_bucket": {
+        "loss": 0.06190224009255908,
+        "acc": 0.9871819469188251
+      },
+      "is_long_haul": {
+        "loss": 0.014902771596937758,
+        "acc": 0.9962084875062811
+      },
+      "eta_bucket": {
+        "loss": 0.10070298037921727,
+        "acc": 0.9760449499794436
+      },
+      "heading_sector": {
+        "loss": 0.06897255722087023,
+        "acc": 0.9771869718149011
+      },
+      "quadrant": {
+        "loss": 0.04139065168528073,
+        "acc": 0.991859668356859
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.16889029359061658,
+        "acc": 0.95282079393358
+      },
+      "recon_x_norm": {
+        "loss": 0.0026988253271719694
+      },
+      "recon_y_norm": {
+        "loss": 0.0025130773471732774
+      },
+      "recon_vx_norm": {
+        "loss": 0.0018779752199050033
+      },
+      "recon_vy_norm": {
+        "loss": 0.0015340023350951975
+      },
+      "recon_ships_log": {
+        "loss": 0.00031734501360910285
+      }
+    }
+  },
+  {
+    "epoch": 20,
+    "train_total": 0.4713922328307849,
+    "train_per_head": {
+      "mission_type_coarse": 0.0013158162576420343,
+      "target_relationship": 0.001033799078593328,
+      "ships_log_bucket": 0.05742954926080063,
+      "is_long_haul": 0.015562507323920727,
+      "eta_bucket": 0.09905588971216138,
+      "heading_sector": 0.061228225618099964,
+      "quadrant": 0.04130641267705364,
+      "distance_to_sun_bucket": 0.18515446519150452,
+      "recon_x_norm": 0.0025811104139140924,
+      "recon_y_norm": 0.0025438920559533755,
+      "recon_vx_norm": 0.001738463482475143,
+      "recon_vy_norm": 0.0019436872744259715,
+      "recon_ships_log": 0.000498414781881778
+    },
+    "elapsed_s": 237.49,
+    "val_mean_loss": 0.035717987384125176,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0015187628517187473,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.001210533774823194,
+        "acc": 0.9999908638253163
+      },
+      "ships_log_bucket": {
+        "loss": 0.061475010100313233,
+        "acc": 0.9862866017998264
+      },
+      "is_long_haul": {
+        "loss": 0.014152731783703383,
+        "acc": 0.9966470238910968
+      },
+      "eta_bucket": {
+        "loss": 0.09422109920248511,
+        "acc": 0.9793613813896122
+      },
+      "heading_sector": {
+        "loss": 0.06635410106175019,
+        "acc": 0.9782467680782057
+      },
+      "quadrant": {
+        "loss": 0.041276473131215095,
+        "acc": 0.9898497099264538
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.17313929512449466,
+        "acc": 0.9435201681056142
+      },
+      "recon_x_norm": {
+        "loss": 0.003554004695154
+      },
+      "recon_y_norm": {
+        "loss": 0.002778010729716153
+      },
+      "recon_vx_norm": {
+        "loss": 0.0015650146075389824
+      },
+      "recon_vy_norm": {
+        "loss": 0.002261933809461363
+      },
+      "recon_ships_log": {
+        "loss": 0.0008268651212532204
+      }
+    }
+  },
+  {
+    "epoch": 21,
+    "train_total": 0.44556013450903054,
+    "train_per_head": {
+      "mission_type_coarse": 0.0011969429466231656,
+      "target_relationship": 0.0009402433917035951,
+      "ships_log_bucket": 0.05399039343875997,
+      "is_long_haul": 0.015031511903184802,
+      "eta_bucket": 0.09421142810533027,
+      "heading_sector": 0.059278104610803746,
+      "quadrant": 0.039852638893267685,
+      "distance_to_sun_bucket": 0.17200207722788097,
+      "recon_x_norm": 0.002512959878844749,
+      "recon_y_norm": 0.0024395015172879488,
+      "recon_vx_norm": 0.0018194941255976172,
+      "recon_vy_norm": 0.0017408800297690665,
+      "recon_ships_log": 0.0005439569304908524
+    },
+    "elapsed_s": 249.29,
+    "val_mean_loss": 0.03399569013993782,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0013689570513852447,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.0010674481546343515,
+        "acc": 0.9999908638253163
+      },
+      "ships_log_bucket": {
+        "loss": 0.05732705149947467,
+        "acc": 0.986405372070714
+      },
+      "is_long_haul": {
+        "loss": 0.01348142719308007,
+        "acc": 0.9970033347037596
+      },
+      "eta_bucket": {
+        "loss": 0.09190483816435335,
+        "acc": 0.9764743501895756
+      },
+      "heading_sector": {
+        "loss": 0.06502960624693081,
+        "acc": 0.9770407930199625
+      },
+      "quadrant": {
+        "loss": 0.03871605034792855,
+        "acc": 0.9916678086885021
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.16441843441386442,
+        "acc": 0.9442053812068887
+      },
+      "recon_x_norm": {
+        "loss": 0.0028761522814908505
+      },
+      "recon_y_norm": {
+        "loss": 0.0022902600582583366
+      },
+      "recon_vx_norm": {
+        "loss": 0.0015343108296334447
+      },
+      "recon_vy_norm": {
+        "loss": 0.001628725704391596
+      },
+      "recon_ships_log": {
+        "loss": 0.00030070987376597794
+      }
+    }
+  },
+  {
+    "epoch": 22,
+    "train_total": 0.4241691837791635,
+    "train_per_head": {
+      "mission_type_coarse": 0.0011111610767650692,
+      "target_relationship": 0.0008649812270730671,
+      "ships_log_bucket": 0.051164411978811775,
+      "is_long_haul": 0.014511365130418489,
+      "eta_bucket": 0.09029982583362516,
+      "heading_sector": 0.05655252523407215,
+      "quadrant": 0.038428279751238706,
+      "distance_to_sun_bucket": 0.16240240746185558,
+      "recon_x_norm": 0.0024931649188315416,
+      "recon_y_norm": 0.002342185390987942,
+      "recon_vx_norm": 0.0017834496195232418,
+      "recon_vy_norm": 0.0017608414998888469,
+      "recon_ships_log": 0.000454577080760652
+    },
+    "elapsed_s": 260.94,
+    "val_mean_loss": 0.0324860768094857,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0012641860995371733,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.0009829464359970897,
+        "acc": 0.9999908638253163
+      },
+      "ships_log_bucket": {
+        "loss": 0.05390441177979464,
+        "acc": 0.9886071901694761
+      },
+      "is_long_haul": {
+        "loss": 0.014003033886536963,
+        "acc": 0.9962084875062811
+      },
+      "eta_bucket": {
+        "loss": 0.09455087738504123,
+        "acc": 0.9671006349641406
+      },
+      "heading_sector": {
+        "loss": 0.061661095601993614,
+        "acc": 0.9808323055136814
+      },
+      "quadrant": {
+        "loss": 0.039159181028594975,
+        "acc": 0.9890183180302408
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.1482919435177413,
+        "acc": 0.958759307477959
+      },
+      "recon_x_norm": {
+        "loss": 0.0027225229511537185
+      },
+      "recon_y_norm": {
+        "loss": 0.0022841877872187702
+      },
+      "recon_vx_norm": {
+        "loss": 0.0015227391957136685
+      },
+      "recon_vy_norm": {
+        "loss": 0.0016114386877905352
+      },
+      "recon_ships_log": {
+        "loss": 0.0003604341662004689
+      }
+    }
+  },
+  {
+    "epoch": 23,
+    "train_total": 0.41581401529432344,
+    "train_per_head": {
+      "mission_type_coarse": 0.0010165335936276165,
+      "target_relationship": 0.0007883133821604194,
+      "ships_log_bucket": 0.048774017975861284,
+      "is_long_haul": 0.01403717856322016,
+      "eta_bucket": 0.08658518679753072,
+      "heading_sector": 0.05506069576289473,
+      "quadrant": 0.03734038958028585,
+      "distance_to_sun_bucket": 0.16331584538732255,
+      "recon_x_norm": 0.0025596601062869073,
+      "recon_y_norm": 0.002324246566648744,
+      "recon_vx_norm": 0.001790974200155367,
+      "recon_vy_norm": 0.00172087993421944,
+      "recon_ships_log": 0.0005000910353396839
+    },
+    "elapsed_s": 272.56,
+    "val_mean_loss": 0.0321815246222616,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0011513991035913454,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.0008748364314585985,
+        "acc": 0.9999908638253163
+      },
+      "ships_log_bucket": {
+        "loss": 0.05122490199300208,
+        "acc": 0.9910465488100132
+      },
+      "is_long_haul": {
+        "loss": 0.012834715419534213,
+        "acc": 0.9971860581974328
+      },
+      "eta_bucket": {
+        "loss": 0.08247584626606147,
+        "acc": 0.9816362888858435
+      },
+      "heading_sector": {
+        "loss": 0.061080392136394525,
+        "acc": 0.9790142067516331
+      },
+      "quadrant": {
+        "loss": 0.03794076480510862,
+        "acc": 0.9895573523365767
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.16145658517002565,
+        "acc": 0.9374902928143987
+      },
+      "recon_x_norm": {
+        "loss": 0.0024125743503682954
+      },
+      "recon_y_norm": {
+        "loss": 0.003218099824921863
+      },
+      "recon_vx_norm": {
+        "loss": 0.0018283076950895046
+      },
+      "recon_vy_norm": {
+        "loss": 0.001456560634835914
+      },
+      "recon_ships_log": {
+        "loss": 0.00040483625900870093
+      }
+    }
+  },
+  {
+    "epoch": 24,
+    "train_total": 0.397348610793843,
+    "train_per_head": {
+      "mission_type_coarse": 0.0009490802953559749,
+      "target_relationship": 0.0007283015004476579,
+      "ships_log_bucket": 0.046299707801903,
+      "is_long_haul": 0.01375448501848874,
+      "eta_bucket": 0.0832503997102505,
+      "heading_sector": 0.05348088398200123,
+      "quadrant": 0.03591128928633798,
+      "distance_to_sun_bucket": 0.1543129316898955,
+      "recon_x_norm": 0.0024059714765107933,
+      "recon_y_norm": 0.00229857924409962,
+      "recon_vx_norm": 0.0017524033896390255,
+      "recon_vy_norm": 0.0017824066742205946,
+      "recon_ships_log": 0.0004221671060345942
+    },
+    "elapsed_s": 284.52,
+    "val_mean_loss": 0.03017594732951883,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.00101723840861708,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.0007690755954247712,
+        "acc": 0.9999908638253163
+      },
+      "ships_log_bucket": {
+        "loss": 0.04704532038653067,
+        "acc": 0.9911927276049518
+      },
+      "is_long_haul": {
+        "loss": 0.013671696837902134,
+        "acc": 0.9957151340733634
+      },
+      "eta_bucket": {
+        "loss": 0.0879056594832601,
+        "acc": 0.9695399936046777
+      },
+      "heading_sector": {
+        "loss": 0.0563849609954933,
+        "acc": 0.982887944817505
+      },
+      "quadrant": {
+        "loss": 0.035820768904453994,
+        "acc": 0.9905988762505139
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.14150346070534836,
+        "acc": 0.9578822347083277
+      },
+      "recon_x_norm": {
+        "loss": 0.002326853013584283
+      },
+      "recon_y_norm": {
+        "loss": 0.002647575537690423
+      },
+      "recon_vx_norm": {
+        "loss": 0.0014619047266771204
+      },
+      "recon_vy_norm": {
+        "loss": 0.0014801387848727074
+      },
+      "recon_ships_log": {
+        "loss": 0.00025266190388983456
+      }
+    }
+  },
+  {
+    "epoch": 25,
+    "train_total": 0.39187479920747903,
+    "train_per_head": {
+      "mission_type_coarse": 0.00086852115287422,
+      "target_relationship": 0.0006640836295178708,
+      "ships_log_bucket": 0.04470128713160002,
+      "is_long_haul": 0.013393515407913873,
+      "eta_bucket": 0.0815389893886422,
+      "heading_sector": 0.05196115913010445,
+      "quadrant": 0.03484765945800713,
+      "distance_to_sun_bucket": 0.15540440818842718,
+      "recon_x_norm": 0.0023954289206186263,
+      "recon_y_norm": 0.002173142385387308,
+      "recon_vx_norm": 0.00172383343789163,
+      "recon_vy_norm": 0.0017800530939198593,
+      "recon_ships_log": 0.0004227203392803262
+    },
+    "elapsed_s": 296.63,
+    "val_mean_loss": 0.030509904027749647,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.001055158496442128,
+        "acc": 0.9999817276506326
+      },
+      "target_relationship": {
+        "loss": 0.0008036784924027973,
+        "acc": 0.9999817276506326
+      },
+      "ships_log_bucket": {
+        "loss": 0.04589954808556545,
+        "acc": 0.9909095061897584
+      },
+      "is_long_haul": {
+        "loss": 0.012227317803436763,
+        "acc": 0.9969667900050249
+      },
+      "eta_bucket": {
+        "loss": 0.07722966031787286,
+        "acc": 0.9819469188250879
+      },
+      "heading_sector": {
+        "loss": 0.05331119849102335,
+        "acc": 0.9844136859896762
+      },
+      "quadrant": {
+        "loss": 0.03465764845257826,
+        "acc": 0.9907085103467178
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.16298158413952937,
+        "acc": 0.9356996025764013
+      },
+      "recon_x_norm": {
+        "loss": 0.0026325702471195287
+      },
+      "recon_y_norm": {
+        "loss": 0.002173792677120393
+      },
+      "recon_vx_norm": {
+        "loss": 0.0017011829566336949
+      },
+      "recon_vy_norm": {
+        "loss": 0.0015684377476773796
+      },
+      "recon_ships_log": {
+        "loss": 0.00038697445334340887
+      }
+    }
+  },
+  {
+    "epoch": 26,
+    "train_total": 0.3803091432367052,
+    "train_per_head": {
+      "mission_type_coarse": 0.0008139614365063608,
+      "target_relationship": 0.0006188575301648063,
+      "ships_log_bucket": 0.04295961533774849,
+      "is_long_haul": 0.013063479387083975,
+      "eta_bucket": 0.07862355641457212,
+      "heading_sector": 0.0511982545820104,
+      "quadrant": 0.03391549806697529,
+      "distance_to_sun_bucket": 0.15047090143716635,
+      "recon_x_norm": 0.002294020985542726,
+      "recon_y_norm": 0.00225824088018638,
+      "recon_vx_norm": 0.0018589416276193968,
+      "recon_vy_norm": 0.001714366759142267,
+      "recon_ships_log": 0.000519449487054611
+    },
+    "elapsed_s": 308.27,
+    "val_mean_loss": 0.028747325149502862,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0009243059602684888,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.0006859124264990034,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.04529100379492518,
+        "acc": 0.992718468777123
+      },
+      "is_long_haul": {
+        "loss": 0.012322670806456786,
+        "acc": 0.9962267598556485
+      },
+      "eta_bucket": {
+        "loss": 0.07600038701045628,
+        "acc": 0.9777899593440227
+      },
+      "heading_sector": {
+        "loss": 0.056786740434474174,
+        "acc": 0.9814718377415376
+      },
+      "quadrant": {
+        "loss": 0.035117919428374354,
+        "acc": 0.9893654926682198
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.1377869803845259,
+        "acc": 0.9542917180576492
+      },
+      "recon_x_norm": {
+        "loss": 0.0031649794248985474
+      },
+      "recon_y_norm": {
+        "loss": 0.0021839355443308227
+      },
+      "recon_vx_norm": {
+        "loss": 0.0013853900870738397
+      },
+      "recon_vy_norm": {
+        "loss": 0.0013696340551590245
+      },
+      "recon_ships_log": {
+        "loss": 0.0006953675860948263
+      }
+    }
+  },
+  {
+    "epoch": 27,
+    "train_total": 0.35662294561121644,
+    "train_per_head": {
+      "mission_type_coarse": 0.0007684502047251816,
+      "target_relationship": 0.0005838682186817203,
+      "ships_log_bucket": 0.040534623092463036,
+      "is_long_haul": 0.012621824973959382,
+      "eta_bucket": 0.0746531897232312,
+      "heading_sector": 0.04931729878572857,
+      "quadrant": 0.0327791438884094,
+      "distance_to_sun_bucket": 0.13716263824901662,
+      "recon_x_norm": 0.0023888360323509623,
+      "recon_y_norm": 0.002118447992144575,
+      "recon_vx_norm": 0.001634164366033711,
+      "recon_vy_norm": 0.0016335375340921538,
+      "recon_ships_log": 0.00042692474906426707
+    },
+    "elapsed_s": 319.91,
+    "val_mean_loss": 0.04617710289116168,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0007955437944651053,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.0005768552583848938,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.04480518429762133,
+        "acc": 0.9927550134758577
+      },
+      "is_long_haul": {
+        "loss": 0.011398955499329197,
+        "acc": 0.9976428669316157
+      },
+      "eta_bucket": {
+        "loss": 0.08540608163542344,
+        "acc": 0.9677949842400987
+      },
+      "heading_sector": {
+        "loss": 0.051600745881896025,
+        "acc": 0.9838198346352383
+      },
+      "quadrant": {
+        "loss": 0.032592302241967304,
+        "acc": 0.991859668356859
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.36585700664299825,
+        "acc": 0.8265771321547668
+      },
+      "recon_x_norm": {
+        "loss": 0.0022413415409126645
+      },
+      "recon_y_norm": {
+        "loss": 0.0019679293789993625
+      },
+      "recon_vx_norm": {
+        "loss": 0.001403173799790535
+      },
+      "recon_vy_norm": {
+        "loss": 0.0013827211647404862
+      },
+      "recon_ships_log": {
+        "loss": 0.00027449644857313127
+      }
+    }
+  },
+  {
+    "epoch": 28,
+    "train_total": 0.3660117961278483,
+    "train_per_head": {
+      "mission_type_coarse": 0.0006977550381160647,
+      "target_relationship": 0.0005234330366737358,
+      "ships_log_bucket": 0.03904050031379491,
+      "is_long_haul": 0.01229203335095604,
+      "eta_bucket": 0.0733053185233549,
+      "heading_sector": 0.04758021085202193,
+      "quadrant": 0.03200008970599215,
+      "distance_to_sun_bucket": 0.15222540817090444,
+      "recon_x_norm": 0.002393862171912519,
+      "recon_y_norm": 0.0021165575716691485,
+      "recon_vx_norm": 0.0016657272079849943,
+      "recon_vy_norm": 0.0017433295421646674,
+      "recon_ships_log": 0.00042756965766394775
+    },
+    "elapsed_s": 331.61,
+    "val_mean_loss": 0.0272800617813044,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0008468020888604709,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.000607591486528266,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.042552014738137516,
+        "acc": 0.9905349230277283
+      },
+      "is_long_haul": {
+        "loss": 0.01096225299567718,
+        "acc": 0.9975240966607282
+      },
+      "eta_bucket": {
+        "loss": 0.07445276493969767,
+        "acc": 0.9759170435338723
+      },
+      "heading_sector": {
+        "loss": 0.05076641458988212,
+        "acc": 0.9826412681010461
+      },
+      "quadrant": {
+        "loss": 0.03285889679787338,
+        "acc": 0.9900689781188616
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.13356903565490313,
+        "acc": 0.9546845735690467
+      },
+      "recon_x_norm": {
+        "loss": 0.002399085450317277
+      },
+      "recon_y_norm": {
+        "loss": 0.0021872228911967357
+      },
+      "recon_vx_norm": {
+        "loss": 0.0016470083720523624
+      },
+      "recon_vy_norm": {
+        "loss": 0.001483831065399531
+      },
+      "recon_ships_log": {
+        "loss": 0.00030788208643159733
+      }
+    }
+  },
+  {
+    "epoch": 29,
+    "train_total": 0.3370124479802717,
+    "train_per_head": {
+      "mission_type_coarse": 0.0006698158598004081,
+      "target_relationship": 0.0004985329989508233,
+      "ships_log_bucket": 0.037003299644013415,
+      "is_long_haul": 0.012031259249989726,
+      "eta_bucket": 0.06993243120172445,
+      "heading_sector": 0.04649683545116617,
+      "quadrant": 0.03183156120426515,
+      "distance_to_sun_bucket": 0.13069160764708238,
+      "recon_x_norm": 0.0021633368676152675,
+      "recon_y_norm": 0.002017704482354662,
+      "recon_vx_norm": 0.0016400008687373845,
+      "recon_vy_norm": 0.0016411515696271627,
+      "recon_ships_log": 0.0003949130535323345
+    },
+    "elapsed_s": 343.54,
+    "val_mean_loss": 0.0278172332094934,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0007349224939216055,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.0005366980101038346,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.041521462744615725,
+        "acc": 0.9886437348682107
+      },
+      "is_long_haul": {
+        "loss": 0.012462716984566958,
+        "acc": 0.9957425425974145
+      },
+      "eta_bucket": {
+        "loss": 0.07911766051897576,
+        "acc": 0.9677767118907313
+      },
+      "heading_sector": {
+        "loss": 0.05235347105659414,
+        "acc": 0.9832259832808004
+      },
+      "quadrant": {
+        "loss": 0.03114028651153103,
+        "acc": 0.9918231236581243
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.13643886626629878,
+        "acc": 0.9477867616828833
+      },
+      "recon_x_norm": {
+        "loss": 0.0020883072561248615
+      },
+      "recon_y_norm": {
+        "loss": 0.0021070482176396067
+      },
+      "recon_vx_norm": {
+        "loss": 0.0014545213985037964
+      },
+      "recon_vy_norm": {
+        "loss": 0.0013852230818894285
+      },
+      "recon_ships_log": {
+        "loss": 0.00028284718264865165
+      }
+    }
+  },
+  {
+    "epoch": 30,
+    "train_total": 0.3411340996497819,
+    "train_per_head": {
+      "mission_type_coarse": 0.000625643103399134,
+      "target_relationship": 0.00046338267553942044,
+      "ships_log_bucket": 0.03557101378859091,
+      "is_long_haul": 0.011849689266073103,
+      "eta_bucket": 0.06861960840951495,
+      "heading_sector": 0.04524095810386313,
+      "quadrant": 0.030505886442270598,
+      "distance_to_sun_bucket": 0.1398068915019516,
+      "recon_x_norm": 0.002343788941609947,
+      "recon_y_norm": 0.0020488531068515252,
+      "recon_vx_norm": 0.0018317359568112914,
+      "recon_vy_norm": 0.0018104850412385555,
+      "recon_ships_log": 0.00041616756012643677
+    },
+    "elapsed_s": 355.39,
+    "val_mean_loss": 0.026738811733252835,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0006680016127517489,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.00048759555561797037,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.037749461509938444,
+        "acc": 0.9933397286556119
+      },
+      "is_long_haul": {
+        "loss": 0.010652123126632511,
+        "acc": 0.9973505093417386
+      },
+      "eta_bucket": {
+        "loss": 0.06555895971558125,
+        "acc": 0.9837924261111872
+      },
+      "heading_sector": {
+        "loss": 0.048930217876576344,
+        "acc": 0.9838381069846055
+      },
+      "quadrant": {
+        "loss": 0.029855957351886012,
+        "acc": 0.9925357452834498
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.1457170916259286,
+        "acc": 0.9371522543511032
+      },
+      "recon_x_norm": {
+        "loss": 0.0024002795450096346
+      },
+      "recon_y_norm": {
+        "loss": 0.00208840397406145
+      },
+      "recon_vx_norm": {
+        "loss": 0.0017440657057815948
+      },
+      "recon_vy_norm": {
+        "loss": 0.0013668171131269431
+      },
+      "recon_ships_log": {
+        "loss": 0.00038557781939432253
+      }
+    }
+  },
+  {
+    "epoch": 31,
+    "train_total": 0.3425290895109417,
+    "train_per_head": {
+      "mission_type_coarse": 0.0005664248354517768,
+      "target_relationship": 0.00041917918916173407,
+      "ships_log_bucket": 0.03447143243578803,
+      "is_long_haul": 0.011339186925534941,
+      "eta_bucket": 0.06578571086420733,
+      "heading_sector": 0.0444647652574447,
+      "quadrant": 0.029545932476009642,
+      "distance_to_sun_bucket": 0.14760824405596035,
+      "recon_x_norm": 0.00229952041404087,
+      "recon_y_norm": 0.002091106487156338,
+      "recon_vx_norm": 0.0016539453082725782,
+      "recon_vy_norm": 0.0017918706852003555,
+      "recon_ships_log": 0.000491771537017179
+    },
+    "elapsed_s": 367.09,
+    "val_mean_loss": 0.029997635829948983,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0006450057263884254,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.0004595976091281814,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.03787961345315551,
+        "acc": 0.9938239459138458
+      },
+      "is_long_haul": {
+        "loss": 0.01197800146842372,
+        "acc": 0.9952035082910785
+      },
+      "eta_bucket": {
+        "loss": 0.06612747929148609,
+        "acc": 0.9798181901237951
+      },
+      "heading_sector": {
+        "loss": 0.04888674311833702,
+        "acc": 0.9842492348453702
+      },
+      "quadrant": {
+        "loss": 0.02994783915639561,
+        "acc": 0.9911744552555845
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.18708701356561344,
+        "acc": 0.9073043716595861
+      },
+      "recon_x_norm": {
+        "loss": 0.0020036276596492437
+      },
+      "recon_y_norm": {
+        "loss": 0.001880920875949763
+      },
+      "recon_vx_norm": {
+        "loss": 0.0013568644405778157
+      },
+      "recon_vy_norm": {
+        "loss": 0.001430375463513512
+      },
+      "recon_ships_log": {
+        "loss": 0.0002861839607184401
+      }
+    }
+  },
+  {
+    "epoch": 32,
+    "train_total": 0.31457055641823456,
+    "train_per_head": {
+      "mission_type_coarse": 0.0005496435976262447,
+      "target_relationship": 0.00040559883561071416,
+      "ships_log_bucket": 0.03324421288586464,
+      "is_long_haul": 0.011310993678116497,
+      "eta_bucket": 0.06449875432778807,
+      "heading_sector": 0.04288658377628367,
+      "quadrant": 0.028786278979367568,
+      "distance_to_sun_bucket": 0.12520089770565515,
+      "recon_x_norm": 0.002205345418672038,
+      "recon_y_norm": 0.002005432007497787,
+      "recon_vx_norm": 0.0015761779685809958,
+      "recon_vy_norm": 0.0015952571308897698,
+      "recon_ships_log": 0.0003053835027473548
+    },
+    "elapsed_s": 378.81,
+    "val_mean_loss": 0.02352592199049616,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0005827312242728285,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.000405433217591853,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.0359650792627281,
+        "acc": 0.9936960394682747
+      },
+      "is_long_haul": {
+        "loss": 0.010384549498204082,
+        "acc": 0.9969941985290759
+      },
+      "eta_bucket": {
+        "loss": 0.061094512388795624,
+        "acc": 0.9858572015896944
+      },
+      "heading_sector": {
+        "loss": 0.043686000633509844,
+        "acc": 0.9863870997213466
+      },
+      "quadrant": {
+        "loss": 0.028065999836882703,
+        "acc": 0.993257503083459
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.11805510229705202,
+        "acc": 0.9621305559362295
+      },
+      "recon_x_norm": {
+        "loss": 0.0020986130595789894
+      },
+      "recon_y_norm": {
+        "loss": 0.0021852758943525412
+      },
+      "recon_vx_norm": {
+        "loss": 0.0016699027156912606
+      },
+      "recon_vy_norm": {
+        "loss": 0.001376609326084188
+      },
+      "recon_ships_log": {
+        "loss": 0.0002671765217060725
+      }
+    }
+  },
+  {
+    "epoch": 33,
+    "train_total": 0.31470836886838705,
+    "train_per_head": {
+      "mission_type_coarse": 0.0005131393691579647,
+      "target_relationship": 0.0003776303798198982,
+      "ships_log_bucket": 0.032225492324273124,
+      "is_long_haul": 0.011049791481815466,
+      "eta_bucket": 0.062353360208393147,
+      "heading_sector": 0.04249719821480142,
+      "quadrant": 0.028238554023394064,
+      "distance_to_sun_bucket": 0.1294540801093358,
+      "recon_x_norm": 0.0022150036260610868,
+      "recon_y_norm": 0.0019923872177434318,
+      "recon_vx_norm": 0.0016530372570229678,
+      "recon_vy_norm": 0.0017774754062983668,
+      "recon_ships_log": 0.00036122209535316885
+    },
+    "elapsed_s": 390.5,
+    "val_mean_loss": 0.024692027375155398,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0005969592529588933,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.00042034496990292903,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.03411705460055466,
+        "acc": 0.9939792608834681
+      },
+      "is_long_haul": {
+        "loss": 0.009877676221246254,
+        "acc": 0.9975058243113608
+      },
+      "eta_bucket": {
+        "loss": 0.058446038425510556,
+        "acc": 0.987291581015029
+      },
+      "heading_sector": {
+        "loss": 0.045971528152131944,
+        "acc": 0.9848248138504408
+      },
+      "quadrant": {
+        "loss": 0.02968295749383576,
+        "acc": 0.9899136631492395
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.13452358997775912,
+        "acc": 0.9465990589740075
+      },
+      "recon_x_norm": {
+        "loss": 0.0021108945602856823
+      },
+      "recon_y_norm": {
+        "loss": 0.002028528932056738
+      },
+      "recon_vx_norm": {
+        "loss": 0.0014508507129867322
+      },
+      "recon_vy_norm": {
+        "loss": 0.0014798321570808153
+      },
+      "recon_ships_log": {
+        "loss": 0.0002901004207101029
+      }
+    }
+  },
+  {
+    "epoch": 34,
+    "train_total": 0.301291262402254,
+    "train_per_head": {
+      "mission_type_coarse": 0.0004899066656694881,
+      "target_relationship": 0.0003582815003303514,
+      "ships_log_bucket": 0.03055995312996772,
+      "is_long_haul": 0.01065084631672176,
+      "eta_bucket": 0.06072102800136855,
+      "heading_sector": 0.041142674836040546,
+      "quadrant": 0.02744375407194891,
+      "distance_to_sun_bucket": 0.12270976264937584,
+      "recon_x_norm": 0.0020505008346424635,
+      "recon_y_norm": 0.001886842747907616,
+      "recon_vx_norm": 0.0014882332825360178,
+      "recon_vy_norm": 0.0014904446786410419,
+      "recon_ships_log": 0.00029903547637782864
+    },
+    "elapsed_s": 402.3,
+    "val_mean_loss": 0.02330871464027948,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0005393961975526682,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.00037298530992303444,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.03442346733978147,
+        "acc": 0.9931935498606733
+      },
+      "is_long_haul": {
+        "loss": 0.009559677038288156,
+        "acc": 0.9979534968708602
+      },
+      "eta_bucket": {
+        "loss": 0.056792608561443275,
+        "acc": 0.9884975560732722
+      },
+      "heading_sector": {
+        "loss": 0.04497257096918486,
+        "acc": 0.9849527202960121
+      },
+      "quadrant": {
+        "loss": 0.026821857452566836,
+        "acc": 0.9932757754328263
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.12166311647320104,
+        "acc": 0.9550957014298114
+      },
+      "recon_x_norm": {
+        "loss": 0.0026976604948722996
+      },
+      "recon_y_norm": {
+        "loss": 0.0019540848561438924
+      },
+      "recon_vx_norm": {
+        "loss": 0.0013510808661096108
+      },
+      "recon_vy_norm": {
+        "loss": 0.0015247046029898265
+      },
+      "recon_ships_log": {
+        "loss": 0.000340080161576273
+      }
+    }
+  },
+  {
+    "epoch": 35,
+    "train_total": 0.30254378814657196,
+    "train_per_head": {
+      "mission_type_coarse": 0.0004566071282078301,
+      "target_relationship": 0.0003314366676167687,
+      "ships_log_bucket": 0.029763054666148515,
+      "is_long_haul": 0.010448643382043899,
+      "eta_bucket": 0.0587038253160084,
+      "heading_sector": 0.041280033332960944,
+      "quadrant": 0.027046900993886114,
+      "distance_to_sun_bucket": 0.12701787317500396,
+      "recon_x_norm": 0.002054788561600472,
+      "recon_y_norm": 0.001862850777820504,
+      "recon_vx_norm": 0.001674140405355945,
+      "recon_vy_norm": 0.0015961397742508213,
+      "recon_ships_log": 0.0003074967968101543
+    },
+    "elapsed_s": 414.29,
+    "val_mean_loss": 0.022448663548046272,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0005181419376174462,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.00035852970481654037,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.03304694291907205,
+        "acc": 0.9933305924809283
+      },
+      "is_long_haul": {
+        "loss": 0.010559140373063738,
+        "acc": 0.9964917089214745
+      },
+      "eta_bucket": {
+        "loss": 0.057448253167192355,
+        "acc": 0.985464346078297
+      },
+      "heading_sector": {
+        "loss": 0.04359170736736576,
+        "acc": 0.9849161755972774
+      },
+      "quadrant": {
+        "loss": 0.025861164901752217,
+        "acc": 0.9944177972682837
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.11309227549813565,
+        "acc": 0.9624503220501576
+      },
+      "recon_x_norm": {
+        "loss": 0.0020050617260013925
+      },
+      "recon_y_norm": {
+        "loss": 0.0019506348257094007
+      },
+      "recon_vx_norm": {
+        "loss": 0.0017010922092359155
+      },
+      "recon_vy_norm": {
+        "loss": 0.001417642541280437
+      },
+      "recon_ships_log": {
+        "loss": 0.0002820389533586377
+      }
+    }
+  },
+  {
+    "epoch": 36,
+    "train_total": 0.30687276981457945,
+    "train_per_head": {
+      "mission_type_coarse": 0.0004310732237317701,
+      "target_relationship": 0.00031254585184736035,
+      "ships_log_bucket": 0.029289124423966688,
+      "is_long_haul": 0.010310139017915275,
+      "eta_bucket": 0.05812703198244592,
+      "heading_sector": 0.03951959111610381,
+      "quadrant": 0.02620198288071556,
+      "distance_to_sun_bucket": 0.13543677010706492,
+      "recon_x_norm": 0.00199721593061509,
+      "recon_y_norm": 0.0018046506115102343,
+      "recon_vx_norm": 0.001555630429491338,
+      "recon_vy_norm": 0.0015480884658016201,
+      "recon_ships_log": 0.00033892605107907643
+    },
+    "elapsed_s": 426.09,
+    "val_mean_loss": 0.02161487051754022,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.00045573284461441517,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.00031602126063972057,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.033497918883376776,
+        "acc": 0.9935955415467543
+      },
+      "is_long_haul": {
+        "loss": 0.00977319889313437,
+        "acc": 0.99682974738477
+      },
+      "eta_bucket": {
+        "loss": 0.05456671501969274,
+        "acc": 0.9873098533643964
+      },
+      "heading_sector": {
+        "loss": 0.04290453002199195,
+        "acc": 0.98592115481248
+      },
+      "quadrant": {
+        "loss": 0.025062834760726797,
+        "acc": 0.9945182951898041
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.10697401145296226,
+        "acc": 0.968809099629985
+      },
+      "recon_x_norm": {
+        "loss": 0.002408142428776927
+      },
+      "recon_y_norm": {
+        "loss": 0.0019341716824734087
+      },
+      "recon_vx_norm": {
+        "loss": 0.0014094426999940088
+      },
+      "recon_vy_norm": {
+        "loss": 0.0013380732598831228
+      },
+      "recon_ships_log": {
+        "loss": 0.0003525235197563811
+      }
+    }
+  },
+  {
+    "epoch": 37,
+    "train_total": 0.2827832876634197,
+    "train_per_head": {
+      "mission_type_coarse": 0.00040575454036994766,
+      "target_relationship": 0.0002952744268876806,
+      "ships_log_bucket": 0.028066020051972205,
+      "is_long_haul": 0.010141564149628668,
+      "eta_bucket": 0.05627332668469733,
+      "heading_sector": 0.03874078020453453,
+      "quadrant": 0.02556084390698361,
+      "distance_to_sun_bucket": 0.11616911307102491,
+      "recon_x_norm": 0.0019762342063976185,
+      "recon_y_norm": 0.0018428843380382458,
+      "recon_vx_norm": 0.0014864201510732039,
+      "recon_vy_norm": 0.0015026473434360213,
+      "recon_ships_log": 0.0003224263139393869
+    },
+    "elapsed_s": 437.82,
+    "val_mean_loss": 0.02158386161838468,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0004638623512764355,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.0003160340691989437,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.031811787038639905,
+        "acc": 0.9918231236581243
+      },
+      "is_long_haul": {
+        "loss": 0.009000986350262826,
+        "acc": 0.9979900415695948
+      },
+      "eta_bucket": {
+        "loss": 0.05391632006192435,
+        "acc": 0.9862409209264081
+      },
+      "heading_sector": {
+        "loss": 0.042499823385319414,
+        "acc": 0.9861404230048878
+      },
+      "quadrant": {
+        "loss": 0.02491249013723623,
+        "acc": 0.9944543419670184
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.11077985721292069,
+        "acc": 0.9615184322324243
+      },
+      "recon_x_norm": {
+        "loss": 0.0019151344201731532
+      },
+      "recon_y_norm": {
+        "loss": 0.001969930195643954
+      },
+      "recon_vx_norm": {
+        "loss": 0.0013601985410537222
+      },
+      "recon_vy_norm": {
+        "loss": 0.0014160653366514756
+      },
+      "recon_ships_log": {
+        "loss": 0.0002277119386997182
+      }
+    }
+  },
+  {
+    "epoch": 38,
+    "train_total": 0.27650060748853605,
+    "train_per_head": {
+      "mission_type_coarse": 0.00039441361113553165,
+      "target_relationship": 0.0002835812215877212,
+      "ships_log_bucket": 0.026991685539358806,
+      "is_long_haul": 0.009893472889485229,
+      "eta_bucket": 0.0551179220132968,
+      "heading_sector": 0.037955032990259284,
+      "quadrant": 0.025590187517785225,
+      "distance_to_sun_bucket": 0.11279178003804023,
+      "recon_x_norm": 0.002016866610956793,
+      "recon_y_norm": 0.0018715560661253182,
+      "recon_vx_norm": 0.001600838961870167,
+      "recon_vy_norm": 0.0016079504432219291,
+      "recon_ships_log": 0.00038531957024966657
+    },
+    "elapsed_s": 449.89,
+    "val_mean_loss": 0.02387310645040366,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0004221037629915021,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.0002871709579275915,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.031150246912453633,
+        "acc": 0.9925996985062354
+      },
+      "is_long_haul": {
+        "loss": 0.0095618708508027,
+        "acc": 0.9971860581974328
+      },
+      "eta_bucket": {
+        "loss": 0.054185177541346545,
+        "acc": 0.9852633502352565
+      },
+      "heading_sector": {
+        "loss": 0.04859995643978529,
+        "acc": 0.9816271527111599
+      },
+      "quadrant": {
+        "loss": 0.029180549718121354,
+        "acc": 0.9891279521264447
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.12967680469784956,
+        "acc": 0.9445068749714495
+      },
+      "recon_x_norm": {
+        "loss": 0.0018843682140872943
+      },
+      "recon_y_norm": {
+        "loss": 0.001841669216385156
+      },
+      "recon_vx_norm": {
+        "loss": 0.0014870376433566404
+      },
+      "recon_vy_norm": {
+        "loss": 0.0016681824011025262
+      },
+      "recon_ships_log": {
+        "loss": 0.0004052454990378076
+      }
+    }
+  },
+  {
+    "epoch": 39,
+    "train_total": 0.2820039702062847,
+    "train_per_head": {
+      "mission_type_coarse": 0.0003650224082340181,
+      "target_relationship": 0.00026384902202833383,
+      "ships_log_bucket": 0.02650197346483459,
+      "is_long_haul": 0.00982363335005626,
+      "eta_bucket": 0.05456979381812721,
+      "heading_sector": 0.03851181148167919,
+      "quadrant": 0.025140198354585832,
+      "distance_to_sun_bucket": 0.11910575640802624,
+      "recon_x_norm": 0.0021389983917249975,
+      "recon_y_norm": 0.0017645752317655612,
+      "recon_vx_norm": 0.0015768840529431566,
+      "recon_vy_norm": 0.0018479362542999267,
+      "recon_ships_log": 0.00039353913934744834
+    },
+    "elapsed_s": 461.8,
+    "val_mean_loss": 0.02096391682577767,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.00042689258492143795,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.0002924289376525161,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.02948291111676397,
+        "acc": 0.9937782650404275
+      },
+      "is_long_haul": {
+        "loss": 0.008659656070365765,
+        "acc": 0.9981910374126354
+      },
+      "eta_bucket": {
+        "loss": 0.05153778370320566,
+        "acc": 0.9869992234251519
+      },
+      "heading_sector": {
+        "loss": 0.03958429273204813,
+        "acc": 0.9878123429719976
+      },
+      "quadrant": {
+        "loss": 0.0248271024666601,
+        "acc": 0.9927550134758577
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.10978899518316602,
+        "acc": 0.959563290850121
+      },
+      "recon_x_norm": {
+        "loss": 0.0023593901280950353
+      },
+      "recon_y_norm": {
+        "loss": 0.0019947254534130594
+      },
+      "recon_vx_norm": {
+        "loss": 0.0012629965704228322
+      },
+      "recon_vy_norm": {
+        "loss": 0.0016926876749641022
+      },
+      "recon_ships_log": {
+        "loss": 0.0006210561134310846
+      }
+    }
+  },
+  {
+    "epoch": 40,
+    "train_total": 0.275289819896722,
+    "train_per_head": {
+      "mission_type_coarse": 0.0003535773606575681,
+      "target_relationship": 0.0002537183516156007,
+      "ships_log_bucket": 0.026084193662435067,
+      "is_long_haul": 0.009741117211230913,
+      "eta_bucket": 0.054197744724630306,
+      "heading_sector": 0.036613416302354394,
+      "quadrant": 0.024632852227121842,
+      "distance_to_sun_bucket": 0.11603694434175972,
+      "recon_x_norm": 0.002075061429010219,
+      "recon_y_norm": 0.0018231510429275262,
+      "recon_vx_norm": 0.001560134644925344,
+      "recon_vy_norm": 0.0015399574171047377,
+      "recon_ships_log": 0.00037795069486591497
+    },
+    "elapsed_s": 473.6,
+    "val_mean_loss": 0.02205950602890265,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0003798109231176625,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.000255995174186389,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.03399182492549311,
+        "acc": 0.986487597642867
+      },
+      "is_long_haul": {
+        "loss": 0.011422209556495597,
+        "acc": 0.9948563336530994
+      },
+      "eta_bucket": {
+        "loss": 0.057812894103482525,
+        "acc": 0.9787766662098579
+      },
+      "heading_sector": {
+        "loss": 0.042186843184096955,
+        "acc": 0.9847243159289205
+      },
+      "quadrant": {
+        "loss": 0.02402011062254733,
+        "acc": 0.9935772691973871
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.10799123171471367,
+        "acc": 0.9615184322324243
+      },
+      "recon_x_norm": {
+        "loss": 0.0036365484724114067
+      },
+      "recon_y_norm": {
+        "loss": 0.001999745785653643
+      },
+      "recon_vx_norm": {
+        "loss": 0.0013412987993653438
+      },
+      "recon_vy_norm": {
+        "loss": 0.0013186470543361834
+      },
+      "recon_ships_log": {
+        "loss": 0.0004164180598346755
+      }
+    }
+  },
+  {
+    "epoch": 41,
+    "train_total": 0.2680434028641516,
+    "train_per_head": {
+      "mission_type_coarse": 0.0003303772198308275,
+      "target_relationship": 0.00023896712418489094,
+      "ships_log_bucket": 0.02517945325675131,
+      "is_long_haul": 0.00946947917764803,
+      "eta_bucket": 0.052300268737207944,
+      "heading_sector": 0.03665492315815777,
+      "quadrant": 0.024626793668550605,
+      "distance_to_sun_bucket": 0.11184584449569718,
+      "recon_x_norm": 0.0021609175273319,
+      "recon_y_norm": 0.0017484836632526723,
+      "recon_vx_norm": 0.0015034014280854153,
+      "recon_vy_norm": 0.0016329493569288433,
+      "recon_ships_log": 0.00035154509557188025
+    },
+    "elapsed_s": 485.26,
+    "val_mean_loss": 0.0252532446374963,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0003757120817892897,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.0002551854391922702,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.030392396318804138,
+        "acc": 0.9923256132657257
+      },
+      "is_long_haul": {
+        "loss": 0.00858981145707421,
+        "acc": 0.9975880498835138
+      },
+      "eta_bucket": {
+        "loss": 0.05020646840275399,
+        "acc": 0.9864601891188159
+      },
+      "heading_sector": {
+        "loss": 0.04090594113551053,
+        "acc": 0.9864236444200813
+      },
+      "quadrant": {
+        "loss": 0.022936122441737258,
+        "acc": 0.9946096569366406
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.16711262786629635,
+        "acc": 0.917810972545795
+      },
+      "recon_x_norm": {
+        "loss": 0.001958634685530124
+      },
+      "recon_y_norm": {
+        "loss": 0.001989741258070994
+      },
+      "recon_vx_norm": {
+        "loss": 0.0013978972658702168
+      },
+      "recon_vy_norm": {
+        "loss": 0.0015070358487394477
+      },
+      "recon_ships_log": {
+        "loss": 0.0006646060860830632
+      }
+    }
+  },
+  {
+    "epoch": 42,
+    "train_total": 0.27427483907266825,
+    "train_per_head": {
+      "mission_type_coarse": 0.0003165834017896226,
+      "target_relationship": 0.00022859481640723572,
+      "ships_log_bucket": 0.024462955213394484,
+      "is_long_haul": 0.009423198534504455,
+      "eta_bucket": 0.052367514484569805,
+      "heading_sector": 0.036120434706451515,
+      "quadrant": 0.023758274667403278,
+      "distance_to_sun_bucket": 0.1204725776274665,
+      "recon_x_norm": 0.0020114155789492886,
+      "recon_y_norm": 0.0017814286162748055,
+      "recon_vx_norm": 0.0015314086643634598,
+      "recon_vy_norm": 0.0014434134442860088,
+      "recon_ships_log": 0.0003570404194516498
+    },
+    "elapsed_s": 497.01,
+    "val_mean_loss": 0.019469872916150648,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0003429848243502874,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.00023236445955641822,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.026781096547089173,
+        "acc": 0.995459321182221
+      },
+      "is_long_haul": {
+        "loss": 0.007991805008420404,
+        "acc": 0.9982915353341556
+      },
+      "eta_bucket": {
+        "loss": 0.04938220647562961,
+        "acc": 0.9862043762276734
+      },
+      "heading_sector": {
+        "loss": 0.04064860849936814,
+        "acc": 0.9848704947238591
+      },
+      "quadrant": {
+        "loss": 0.02317973966329717,
+        "acc": 0.993604677721438
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.09739844693506321,
+        "acc": 0.970499291946462
+      },
+      "recon_x_norm": {
+        "loss": 0.0019535023180129655
+      },
+      "recon_y_norm": {
+        "loss": 0.0019409295743796145
+      },
+      "recon_vx_norm": {
+        "loss": 0.0013571017439012187
+      },
+      "recon_vy_norm": {
+        "loss": 0.0016857848259558723
+      },
+      "recon_ships_log": {
+        "loss": 0.00021377703493430296
+      }
+    }
+  },
+  {
+    "epoch": 43,
+    "train_total": 0.25938278248831004,
+    "train_per_head": {
+      "mission_type_coarse": 0.00029729177809453437,
+      "target_relationship": 0.0002138571969738246,
+      "ships_log_bucket": 0.023544932676463567,
+      "is_long_haul": 0.00893785645637442,
+      "eta_bucket": 0.049030268768302535,
+      "heading_sector": 0.03512899540051693,
+      "quadrant": 0.023074469959535517,
+      "distance_to_sun_bucket": 0.1121668633417923,
+      "recon_x_norm": 0.0019467703307423146,
+      "recon_y_norm": 0.0016710772208415536,
+      "recon_vx_norm": 0.001483329662763584,
+      "recon_vy_norm": 0.001573914267756671,
+      "recon_ships_log": 0.00031315634785779604
+    },
+    "elapsed_s": 508.68,
+    "val_mean_loss": 0.021509152127805686,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0003662467547427099,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.00024874474659108086,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.025607057149443682,
+        "acc": 0.9956329085012106
+      },
+      "is_long_haul": {
+        "loss": 0.009368133126700987,
+        "acc": 0.9964368918733726
+      },
+      "eta_bucket": {
+        "loss": 0.049211832905342805,
+        "acc": 0.9856196610479192
+      },
+      "heading_sector": {
+        "loss": 0.03925168451845311,
+        "acc": 0.9849435841213284
+      },
+      "quadrant": {
+        "loss": 0.02286813359650245,
+        "acc": 0.9940980311543557
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.12399493574655038,
+        "acc": 0.9438582065689096
+      },
+      "recon_x_norm": {
+        "loss": 0.0019130569950462906
+      },
+      "recon_y_norm": {
+        "loss": 0.002186862136473483
+      },
+      "recon_vx_norm": {
+        "loss": 0.0012649168120214271
+      },
+      "recon_vy_norm": {
+        "loss": 0.003052809690308437
+      },
+      "recon_ships_log": {
+        "loss": 0.00028456348329707607
+      }
+    }
+  },
+  {
+    "epoch": 44,
+    "train_total": 0.25310318647813396,
+    "train_per_head": {
+      "mission_type_coarse": 0.00028602860267802356,
+      "target_relationship": 0.0002055837752731877,
+      "ships_log_bucket": 0.02284043618798757,
+      "is_long_haul": 0.008820678318748955,
+      "eta_bucket": 0.04844212500738496,
+      "heading_sector": 0.035411147322474405,
+      "quadrant": 0.023058587622617473,
+      "distance_to_sun_bucket": 0.10702366006224096,
+      "recon_x_norm": 0.001961835598408738,
+      "recon_y_norm": 0.0017059554850698269,
+      "recon_vx_norm": 0.001508926320234079,
+      "recon_vy_norm": 0.0015053359190972538,
+      "recon_ships_log": 0.0003328858209507806
+    },
+    "elapsed_s": 520.32,
+    "val_mean_loss": 0.019580555083008287,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.00033057003043893867,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.00022138240136865405,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.025880658996311583,
+        "acc": 0.9951760997670276
+      },
+      "is_long_haul": {
+        "loss": 0.008273056855911173,
+        "acc": 0.9976337307569321
+      },
+      "eta_bucket": {
+        "loss": 0.046005326882225965,
+        "acc": 0.9890091818555571
+      },
+      "heading_sector": {
+        "loss": 0.041370064204489895,
+        "acc": 0.9822484125896487
+      },
+      "quadrant": {
+        "loss": 0.022278507911055147,
+        "acc": 0.9942990269973961
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.10339521112102648,
+        "acc": 0.962276734731168
+      },
+      "recon_x_norm": {
+        "loss": 0.0022969718805199582
+      },
+      "recon_y_norm": {
+        "loss": 0.0017888319823976182
+      },
+      "recon_vx_norm": {
+        "loss": 0.0012639136046687157
+      },
+      "recon_vy_norm": {
+        "loss": 0.0011843435696025115
+      },
+      "recon_ships_log": {
+        "loss": 0.0002583766390911261
+      }
+    }
+  },
+  {
+    "epoch": 45,
+    "train_total": 0.2572814780874413,
+    "train_per_head": {
+      "mission_type_coarse": 0.0002712215323337675,
+      "target_relationship": 0.00019501209439525867,
+      "ships_log_bucket": 0.02266545023988275,
+      "is_long_haul": 0.008859538735367921,
+      "eta_bucket": 0.048336029334479017,
+      "heading_sector": 0.034290097810390614,
+      "quadrant": 0.02302457204385966,
+      "distance_to_sun_bucket": 0.11254681828392654,
+      "recon_x_norm": 0.0020278773520987074,
+      "recon_y_norm": 0.0017521502772940933,
+      "recon_vx_norm": 0.0015257906243048545,
+      "recon_vy_norm": 0.0014319581433567179,
+      "recon_ships_log": 0.00035495981889553836
+    },
+    "elapsed_s": 532.43,
+    "val_mean_loss": 0.020697027546504352,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.0003143113411271737,
+        "acc": 0.9999908638253163
+      },
+      "target_relationship": {
+        "loss": 0.00021027788342197122,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.028709591682611477,
+        "acc": 0.9906811018226669
+      },
+      "is_long_haul": {
+        "loss": 0.00865195653670659,
+        "acc": 0.9968206112100864
+      },
+      "eta_bucket": {
+        "loss": 0.05348300084326714,
+        "acc": 0.9795441048832854
+      },
+      "heading_sector": {
+        "loss": 0.03983056677149624,
+        "acc": 0.9835366132200448
+      },
+      "quadrant": {
+        "loss": 0.021907644823815027,
+        "acc": 0.9941985290758759
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.10843640972602896,
+        "acc": 0.9555433739893107
+      },
+      "recon_x_norm": {
+        "loss": 0.0021868661705624556
+      },
+      "recon_y_norm": {
+        "loss": 0.0018799893455580302
+      },
+      "recon_vx_norm": {
+        "loss": 0.0012902824250598914
+      },
+      "recon_vy_norm": {
+        "loss": 0.0019375838290658855
+      },
+      "recon_ships_log": {
+        "loss": 0.00022287672583571434
+      }
+    }
+  },
+  {
+    "epoch": 46,
+    "train_total": 0.24833032250905238,
+    "train_per_head": {
+      "mission_type_coarse": 0.00026167950547934204,
+      "target_relationship": 0.00018665706420888608,
+      "ships_log_bucket": 0.02213790508754113,
+      "is_long_haul": 0.008511051038640137,
+      "eta_bucket": 0.047261330228643254,
+      "heading_sector": 0.034604144713082235,
+      "quadrant": 0.022293178568116755,
+      "distance_to_sun_bucket": 0.10611995979517448,
+      "recon_x_norm": 0.0018978327456000848,
+      "recon_y_norm": 0.0017238169411557312,
+      "recon_vx_norm": 0.0014848414066975482,
+      "recon_vy_norm": 0.001528775366414495,
+      "recon_ships_log": 0.00031914696414825827
+    },
+    "elapsed_s": 544.29,
+    "val_mean_loss": 0.02298574720231511,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.00026294378897559023,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.00017581395313077703,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.02511988277329876,
+        "acc": 0.9941893929011922
+      },
+      "is_long_haul": {
+        "loss": 0.007897162005059558,
+        "acc": 0.9979169521721255
+      },
+      "eta_bucket": {
+        "loss": 0.046859526105994614,
+        "acc": 0.9856105248732355
+      },
+      "heading_sector": {
+        "loss": 0.04049986499969174,
+        "acc": 0.9839568772554931
+      },
+      "quadrant": {
+        "loss": 0.022360090608001273,
+        "acc": 0.9934950436252341
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.1479159980708753,
+        "acc": 0.9243342012699283
+      },
+      "recon_x_norm": {
+        "loss": 0.002352852351069423
+      },
+      "recon_y_norm": {
+        "loss": 0.0018646998303297377
+      },
+      "recon_vx_norm": {
+        "loss": 0.001784597674531829
+      },
+      "recon_vy_norm": {
+        "loss": 0.0014882561560497446
+      },
+      "recon_ships_log": {
+        "loss": 0.00023302531308806737
+      }
+    }
+  },
+  {
+    "epoch": 47,
+    "train_total": 0.24966003075868143,
+    "train_per_head": {
+      "mission_type_coarse": 0.0002465334871564718,
+      "target_relationship": 0.0001771256317601719,
+      "ships_log_bucket": 0.021698065446454938,
+      "is_long_haul": 0.00875641851678115,
+      "eta_bucket": 0.04870798570268294,
+      "heading_sector": 0.03377455814170236,
+      "quadrant": 0.022153885002021027,
+      "distance_to_sun_bucket": 0.10694101571786303,
+      "recon_x_norm": 0.0019481783261240907,
+      "recon_y_norm": 0.0017040680855230875,
+      "recon_vx_norm": 0.0015494869884980075,
+      "recon_vy_norm": 0.0016430709706697643,
+      "recon_ships_log": 0.0003596381165680061
+    },
+    "elapsed_s": 556.43,
+    "val_mean_loss": 0.018879217026551466,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.00028797533147152405,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.00019325921623819325,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.02459964329619911,
+        "acc": 0.9942076652505596
+      },
+      "is_long_haul": {
+        "loss": 0.00867506137614568,
+        "acc": 0.996884564432872
+      },
+      "eta_bucket": {
+        "loss": 0.04550889109166759,
+        "acc": 0.9868164999314787
+      },
+      "heading_sector": {
+        "loss": 0.041325456485867655,
+        "acc": 0.9820291443972409
+      },
+      "quadrant": {
+        "loss": 0.023420918517678854,
+        "acc": 0.9918962130555936
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.09364956174465962,
+        "acc": 0.9702891599287379
+      },
+      "recon_x_norm": {
+        "loss": 0.0017734812631563927
+      },
+      "recon_y_norm": {
+        "loss": 0.002107320470724114
+      },
+      "recon_vx_norm": {
+        "loss": 0.001919093599685837
+      },
+      "recon_vy_norm": {
+        "loss": 0.0015123337293508734
+      },
+      "recon_ships_log": {
+        "loss": 0.0004568252223236445
+      }
+    }
+  },
+  {
+    "epoch": 48,
+    "train_total": 0.25661558426227893,
+    "train_per_head": {
+      "mission_type_coarse": 0.0002339202065672334,
+      "target_relationship": 0.00016632092507172595,
+      "ships_log_bucket": 0.020813098756455574,
+      "is_long_haul": 0.008346108218827168,
+      "eta_bucket": 0.04536071094144292,
+      "heading_sector": 0.03290940276464494,
+      "quadrant": 0.02161914440451049,
+      "distance_to_sun_bucket": 0.12042843412701823,
+      "recon_x_norm": 0.0018696421591032828,
+      "recon_y_norm": 0.0016567773105451414,
+      "recon_vx_norm": 0.001440348626043992,
+      "recon_vy_norm": 0.0014222575382900839,
+      "recon_ships_log": 0.00034941529364524674
+    },
+    "elapsed_s": 568.36,
+    "val_mean_loss": 0.02233684950225691,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.00026731655708885603,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.00017587784481192347,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.02319596168476593,
+        "acc": 0.9962358960303321
+      },
+      "is_long_haul": {
+        "loss": 0.007545372395434629,
+        "acc": 0.9980814033164314
+      },
+      "eta_bucket": {
+        "loss": 0.04298661507192685,
+        "acc": 0.9889909095061897
+      },
+      "heading_sector": {
+        "loss": 0.0394014756963032,
+        "acc": 0.9846877712301859
+      },
+      "quadrant": {
+        "loss": 0.021703597501775935,
+        "acc": 0.9935681330227034
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.14877906239248936,
+        "acc": 0.9250650952446211
+      },
+      "recon_x_norm": {
+        "loss": 0.001799725963429946
+      },
+      "recon_y_norm": {
+        "loss": 0.0017146986053956116
+      },
+      "recon_vx_norm": {
+        "loss": 0.0012161145796864472
+      },
+      "recon_vy_norm": {
+        "loss": 0.0013245810314908785
+      },
+      "recon_ships_log": {
+        "loss": 0.00026864420474024853
+      }
+    }
+  },
+  {
+    "epoch": 49,
+    "train_total": 0.22953829407191076,
+    "train_per_head": {
+      "mission_type_coarse": 0.00022728475345838657,
+      "target_relationship": 0.0001637829387435267,
+      "ships_log_bucket": 0.020449368549244746,
+      "is_long_haul": 0.008239720271070715,
+      "eta_bucket": 0.045701355149014654,
+      "heading_sector": 0.03212321195907954,
+      "quadrant": 0.021458583500455406,
+      "distance_to_sun_bucket": 0.09454892425477004,
+      "recon_x_norm": 0.0018038861502447173,
+      "recon_y_norm": 0.0017048462387956992,
+      "recon_vx_norm": 0.0013705900353731728,
+      "recon_vy_norm": 0.0014581371513547516,
+      "recon_ships_log": 0.0002886026103769531
+    },
+    "elapsed_s": 580.24,
+    "val_mean_loss": 0.02243886236711203,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.000252086177095958,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.00016574201384118268,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.022860121547285457,
+        "acc": 0.9959709469645059
+      },
+      "is_long_haul": {
+        "loss": 0.010302296184065637,
+        "acc": 0.995029920972089
+      },
+      "eta_bucket": {
+        "loss": 0.05436204120276491,
+        "acc": 0.9754602347996894
+      },
+      "heading_sector": {
+        "loss": 0.037105486800413486,
+        "acc": 0.9860125165593167
+      },
+      "quadrant": {
+        "loss": 0.020412316151770953,
+        "acc": 0.9950116486227216
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.13997325098240643,
+        "acc": 0.9330409757434562
+      },
+      "recon_x_norm": {
+        "loss": 0.0017774255827581848
+      },
+      "recon_y_norm": {
+        "loss": 0.0017383604235703782
+      },
+      "recon_vx_norm": {
+        "loss": 0.001175667119872428
+      },
+      "recon_vy_norm": {
+        "loss": 0.0013642639138199653
+      },
+      "recon_ships_log": {
+        "loss": 0.0002161526727913819
+      }
+    }
+  },
+  {
+    "epoch": 50,
+    "train_total": 0.24399861029717101,
+    "train_per_head": {
+      "mission_type_coarse": 0.00021638500307561407,
+      "target_relationship": 0.000154287030210155,
+      "ships_log_bucket": 0.02017746227128165,
+      "is_long_haul": 0.00824440612277689,
+      "eta_bucket": 0.044695535314684155,
+      "heading_sector": 0.03195945816818906,
+      "quadrant": 0.02105054501913676,
+      "distance_to_sun_bucket": 0.11097194780321683,
+      "recon_x_norm": 0.0017595144258733808,
+      "recon_y_norm": 0.0016867666976808123,
+      "recon_vx_norm": 0.0013840351588319706,
+      "recon_vy_norm": 0.0014327703652308643,
+      "recon_ships_log": 0.0002655000806181543
+    },
+    "elapsed_s": 592.29,
+    "val_mean_loss": 0.017312303276268072,
+    "val": {
+      "mission_type_coarse": {
+        "loss": 0.000225265668072482,
+        "acc": 1.0
+      },
+      "target_relationship": {
+        "loss": 0.00015082585659683184,
+        "acc": 1.0
+      },
+      "ships_log_bucket": {
+        "loss": 0.022504783760368085,
+        "acc": 0.9957242702480471
+      },
+      "is_long_haul": {
+        "loss": 0.008719112948117547,
+        "acc": 0.996400347174638
+      },
+      "eta_bucket": {
+        "loss": 0.043368177713229754,
+        "acc": 0.988232607007446
+      },
+      "heading_sector": {
+        "loss": 0.03511065667415405,
+        "acc": 0.9883787858023846
+      },
+      "quadrant": {
+        "loss": 0.02134429435351839,
+        "acc": 0.9933854095290302
+      },
+      "distance_to_sun_bucket": {
+        "loss": 0.08656733758888142,
+        "acc": 0.9744552555844868
+      },
+      "recon_x_norm": {
+        "loss": 0.002206169917984152
+      },
+      "recon_y_norm": {
+        "loss": 0.0019866589178561315
+      },
+      "recon_vx_norm": {
+        "loss": 0.0012055477018436047
+      },
+      "recon_vy_norm": {
+        "loss": 0.0014026342926680604
+      },
+      "recon_ships_log": {
+        "loss": 0.0002684771981944413
+      }
+    }
+  }
+]
