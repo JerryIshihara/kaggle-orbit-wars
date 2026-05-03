@@ -74,22 +74,12 @@ def chunked_indices(n: int, k: int) -> list[list[int]]:
     return [c for c in chunks if c]
 
 
-def main() -> int:
-    p = argparse.ArgumentParser()
-    p.add_argument(
-        "--team", action="append", required=True,
-        help="`<teamName>:<submissionId>` (repeatable).",
-    )
-    p.add_argument("--workers", type=int, default=10)
-    args = p.parse_args()
-
+def build_team_manifests(team_specs: list[tuple[str, int]], workers: int) -> None:
     helper = _load_helper()
-
-    for spec in args.team:
-        name, sub = spec.split(":", 1)
-        manifest_path = build_manifest(name, int(sub), helper)
+    for name, submission_id in team_specs:
+        manifest_path = build_manifest(name, int(submission_id), helper)
         manifest = json.loads(manifest_path.read_text())
-        chunks = chunked_indices(len(manifest), args.workers)
+        chunks = chunked_indices(len(manifest), workers)
         out_dir = DATA_ROOT / name
         print(f"[{name}] worker assignments ({len(chunks)} chunks):")
         for i, chunk in enumerate(chunks):
@@ -101,6 +91,22 @@ def main() -> int:
                 f"--indices {indices_csv} "
                 f"--out-dir {out_dir}"
             )
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument(
+        "--team", action="append", required=True,
+        help="`<teamName>:<submissionId>` (repeatable).",
+    )
+    p.add_argument("--workers", type=int, default=10)
+    args = p.parse_args()
+
+    team_specs = []
+    for spec in args.team:
+        name, sub = spec.split(":", 1)
+        team_specs.append((name, int(sub)))
+    build_team_manifests(team_specs, args.workers)
     return 0
 
 

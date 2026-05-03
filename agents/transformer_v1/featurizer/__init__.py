@@ -30,6 +30,31 @@ from .planet_featurizer import (
     featurize_planets,
     save_episode_planet_csv,
 )
+from .entity_featurizer import (
+    ARRIVAL_HORIZONS as ENTITY_ARRIVAL_HORIZONS,
+    CROSS_ENTITY_LABEL_COLS,
+    CROSS_ENTITY_TACTICAL_HORIZONS,
+    CROSS_ENTITY_VALUE_HORIZONS,
+    ENTITY_FEATURE_COLS,
+    ENTITY_LABEL_COLS,
+    EntityFeaturizer,
+    EPISODE_STEPS as ENTITY_EPISODE_STEPS,
+    LABEL_HORIZONS as ENTITY_LABEL_HORIZONS,
+    NUM_OWNER_SLOTS as ENTITY_NUM_OWNER_SLOTS,
+    N_FRONTIER_CLASSES as ENTITY_N_FRONTIER_CLASSES,
+    N_OWNER_CLASSES as ENTITY_N_OWNER_CLASSES,
+    SECTOR_RADIUS as ENTITY_SECTOR_RADIUS,
+    STAT_NAMES as ENTITY_STAT_NAMES,
+    featurize_entity_inbound,
+    save_episode_cross_entity_csv,
+    save_episode_entity_csv,
+)
+from .action_featurizer import (
+    ACTION_IGNORE_INDEX,
+    ACTION_LABEL_COLS,
+    save_episode_action_csv,
+)
+from .inference import featurize_observation
 
 __all__ = [
     # fleet
@@ -51,4 +76,28 @@ __all__ = [
     "PlanetFeaturizer",
     "featurize_planets",
     "save_episode_planet_csv",
+    # entity (per-planet inbound-fleet summary + supervised labels)
+    "ENTITY_ARRIVAL_HORIZONS",
+    "ENTITY_EPISODE_STEPS",
+    "ENTITY_FEATURE_COLS",
+    "ENTITY_LABEL_COLS",
+    "ENTITY_LABEL_HORIZONS",
+    "ENTITY_NUM_OWNER_SLOTS",
+    "ENTITY_N_FRONTIER_CLASSES",
+    "ENTITY_N_OWNER_CLASSES",
+    "ENTITY_SECTOR_RADIUS",
+    "ENTITY_STAT_NAMES",
+    "CROSS_ENTITY_LABEL_COLS",
+    "CROSS_ENTITY_TACTICAL_HORIZONS",
+    "CROSS_ENTITY_VALUE_HORIZONS",
+    "EntityFeaturizer",
+    "featurize_entity_inbound",
+    "save_episode_cross_entity_csv",
+    "save_episode_entity_csv",
+    # action (snapshot-level expert imitation)
+    "ACTION_IGNORE_INDEX",
+    "ACTION_LABEL_COLS",
+    "save_episode_action_csv",
+    # inference (live obs → batch dict)
+    "featurize_observation",
 ]

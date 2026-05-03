@@ -53,6 +53,30 @@ from ...physics_utils import (
     fleet_speed,
 )
 
+
+def _infer_learner_slot_from_episode_path(
+    episode_path: Path,
+    *,
+    fallback: int = 0,
+) -> int:
+    """Infer learner slot from Kaggle-style replay stems ``<eid>_<n>_<slot>``.
+
+    Local self-play replays use ``local<seed>_<n>_<winner>``; for those we
+    intentionally keep the fallback because the last field is not a seat id.
+    """
+    stem = episode_path.stem.split(".")[0]
+    parts = stem.split("_")
+    if stem.startswith("local") or len(parts) < 3:
+        return fallback
+    if not (parts[-1].isdigit() and parts[-2].isdigit()):
+        return fallback
+    slot = int(parts[-1])
+    num_players = int(parts[-2])
+    if 0 <= slot < max(1, num_players):
+        return slot
+    return fallback
+
+
 # Spec constants — kept in sync with the design doc.
 NUM_OWNER_SLOTS = 4          # 1-, 2-, 3-, 4-player; relative slots
 ETA_BUCKETS = (2.0, 5.0, 10.0, 20.0, 50.0)  # right edges; "none" is its own one-hot
@@ -694,13 +718,10 @@ def featurize_fleets(
     return features, mask, raw_records
 
 
-# Default destination for encoder training data, resolved from the repo
-# root (``…/agents/transformer_v1/featurizer/fleet_featurizer.py`` →
-# ``…/data/encoders``). Kept beside ``data/replays`` so both training
-# inputs and derived encoder data are co-located.
-DEFAULT_ENCODER_DATA_DIR = (
-    Path(__file__).resolve().parents[3] / "data" / "encoders"
-)
+# Default destination for fleet encoder training data. Kept as a
+# re-export alias here for backwards compatibility with code that
+# imported it; the source of truth is ``transformer_v1.paths``.
+from ..paths import FLEET_DATASET_DIR as DEFAULT_ENCODER_DATA_DIR  # noqa: E402
 
 
 # ---------- Encoder-training CSV export ----------
@@ -708,17 +729,17 @@ def save_episode_fleet_csv(
     episode_path: str | Path,
     out_path: str | Path | None = None,
     *,
-    learner_slot: int = 0,
+    learner_slot: int | None = None,
     num_players: int | None = None,
     max_fleets: int = 1024,
 ) -> Path:
     """Featurize every fleet in every turn of one episode and write a CSV.
 
     The replay is the standard Kaggle ``.json.gz`` dump (``steps[t][i]``
-    holds player ``i``'s view at turn ``t``). We use player 0's
-    observation each turn — the env-tracked fields it exposes are
-    identical across seats; only the *relative* owner one-hot in
-    ``to_vector`` shifts, and we control that via ``learner_slot``.
+    holds player ``i``'s view at turn ``t``). By default, ``learner_slot``
+    is inferred from Kaggle-style replay stems ``<eid>_<n>_<slot>`` so
+    owner-relative one-hots line up with the seat that actually produced
+    the replay.
 
     Each emitted row = one (turn, fleet) pair, columns:
         episode_id, turn, then ``f000..f{FLEET_RAW_DIM-1}`` (model input),
@@ -747,6 +768,8 @@ def save_episode_fleet_csv(
         replay = json.load(fh)
 
     steps = replay.get("steps") or []
+    if learner_slot is None:
+        learner_slot = _infer_learner_slot_from_episode_path(episode_path)
     # Player count: prefer the configuration block; fall back to the
     # first step's seat count.
     if num_players is None:

@@ -30,6 +30,7 @@ from ..featurizer.planet_featurizer import (
     N_FUTURE_ANCHORS,
     PLANET_RAW_DIM,
     SCALAR_DIM,
+    TRAJ_CHANNELS,
 )
 
 
@@ -82,29 +83,40 @@ class PlanetTrajectoryEncoder(nn.Module):
         n_anchors: int = N_FUTURE_ANCHORS,
         d_model: int = 64,
         d_hidden: int = 32,
+        in_channels: int = TRAJ_CHANNELS,
     ):
         super().__init__()
         self.n_anchors = n_anchors
-        # Conv1d expects (N, C, T) → ``in_channels=2`` for (dx, dy).
-        self.conv1 = nn.Conv1d(2, d_hidden // 2, kernel_size=3, padding=1)
+        self.in_channels = in_channels
+        # Conv1d expects (N, C, T). ``in_channels=3`` for (dx, dy, valid)
+        # — the validity bit lets the encoder route around invalid
+        # horizons (comet path ran out, episode ended) rather than
+        # confusing them with "no motion".
+        self.conv1 = nn.Conv1d(in_channels, d_hidden // 2, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(d_hidden // 2, d_hidden, kernel_size=3, padding=1)
         self.act = nn.GELU()
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.proj = nn.Linear(d_hidden, d_model)
+        # No pool — flatten the full conv output ``(d_hidden, n_anchors)``
+        # and let a single ``Linear`` learn arbitrary per-position
+        # routing. This restores the "any input anchor → any decoder
+        # horizon" capability that the monolithic Linear had, while
+        # keeping the conv's local-pattern smoothing prior.
+        self.proj = nn.Linear(d_hidden * n_anchors, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Flatten leading dims so Conv1d sees (N, 2, n_anchors), then
+        # Flatten leading dims so Conv1d sees (N, C, n_anchors), then
         # restore the batch shape on output.
         leading = x.shape[:-2]
         # ``contiguous()`` because Conv1d needs the underlying memory
         # layout after the transpose.
         x_flat = (
-            x.reshape(-1, self.n_anchors, 2).transpose(1, 2).contiguous()
+            x.reshape(-1, self.n_anchors, self.in_channels)
+            .transpose(1, 2)
+            .contiguous()
         )
         z = self.act(self.conv1(x_flat))
-        z = self.act(self.conv2(z))
-        z = self.pool(z).squeeze(-1)         # (N, d_hidden)
-        z = self.proj(z)                      # (N, d_model)
+        z = self.act(self.conv2(z))                      # (N, d_hidden, n_anchors)
+        z = z.flatten(start_dim=1)                        # (N, d_hidden * n_anchors)
+        z = self.proj(z)                                  # (N, d_model)
         return z.reshape(*leading, -1)
 
 
@@ -132,19 +144,30 @@ class PlanetEncoder(nn.Module):
         d_model: int = 64,
         scalar_dim: int = SCALAR_DIM,
         n_anchors: int = N_FUTURE_ANCHORS,
+        traj_channels: int = TRAJ_CHANNELS,
         d_traj_hidden: int = 32,
         layer_norm: bool = True,
     ):
         super().__init__()
-        if scalar_dim + 2 * n_anchors != PLANET_RAW_DIM:
+        expected_dim = scalar_dim + traj_channels * n_anchors
+        if expected_dim != PLANET_RAW_DIM:
             raise ValueError(
-                f"scalar_dim={scalar_dim} + 2*n_anchors={n_anchors} "
+                f"scalar_dim={scalar_dim} + {traj_channels}*n_anchors={n_anchors} "
                 f"!= PLANET_RAW_DIM={PLANET_RAW_DIM}"
             )
         self.scalar_dim = scalar_dim
         self.n_anchors = n_anchors
+        self.traj_channels = traj_channels
         self.scalar = PlanetScalarEncoder(scalar_dim, d_model)
-        self.traj = PlanetTrajectoryEncoder(n_anchors, d_model, d_traj_hidden)
+        self.traj = PlanetTrajectoryEncoder(
+            n_anchors, d_model, d_traj_hidden, in_channels=traj_channels,
+        )
+        # Gated fusion: ``g = σ(W [z_s ‖ z_t])``, then
+        # ``z = LN(g ⊙ z_s + (1 - g) ⊙ z_t)``. Lets the model
+        # weight the two branches per-entity-and-per-dim — comets
+        # should lean on the trajectory branch, regular planets can
+        # mostly rely on the scalar branch's analytic orbit info.
+        self.gate = nn.Linear(2 * d_model, d_model)
         self.norm = nn.LayerNorm(d_model) if layer_norm else nn.Identity()
 
     def forward(
@@ -155,11 +178,12 @@ class PlanetEncoder(nn.Module):
         leading = features.shape[:-1]
         scalar = features[..., : self.scalar_dim]
         traj_flat = features[..., self.scalar_dim :]
-        traj = traj_flat.reshape(*leading, self.n_anchors, 2)
+        traj = traj_flat.reshape(*leading, self.n_anchors, self.traj_channels)
 
         z_s = self.scalar(scalar)
         z_t = self.traj(traj)
-        z = self.norm(z_s + z_t)
+        g = torch.sigmoid(self.gate(torch.cat([z_s, z_t], dim=-1)))
+        z = self.norm(g * z_s + (1.0 - g) * z_t)
         if mask is not None:
             z = z * mask.unsqueeze(-1)
         return z

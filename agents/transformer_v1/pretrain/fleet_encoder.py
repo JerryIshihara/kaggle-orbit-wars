@@ -10,10 +10,10 @@ position, kinematics) — see ``ENCODER_LABEL_HEADS`` for the wired heads.
 
 Run from the repo root:
 
-    python -m agents.transformer_v1.encoder.pretrain \
+    python -m agents.transformer_v1.pretrain.fleet_encoder \
         --epochs 30 --d-model 64 --batch-size 1024
 
-Outputs (under ``data/encoder_runs/<timestamp>/``):
+Outputs (under ``data/runs/fleet/<timestamp>/``):
 
 * ``fleet_encoder_best.pt`` — checkpoint at lowest val mean loss.
 * ``fleet_encoder_last.pt`` — last-epoch checkpoint.
@@ -36,12 +36,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from ..featurizer import (
-    DEFAULT_ENCODER_DATA_DIR,
     ENCODER_LABEL_HEADS,
     ENCODER_PRETRAIN_LABELS,
     FLEET_RAW_DIM,
 )
-from .fleet_encoder import FleetEncoder
+from ..paths import FLEET_DATASET_DIR, FLEET_RUNS_DIR
+from ..encoder.fleet_encoder import FleetEncoder
 
 
 # ---------- Dataset ----------
@@ -330,10 +330,10 @@ def train(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=Path, default=DEFAULT_ENCODER_DATA_DIR)
+    parser.add_argument("--data-dir", type=Path, default=FLEET_DATASET_DIR)
     parser.add_argument(
         "--out-dir", type=Path, default=None,
-        help="Default: <data-dir>/../encoder_runs/<timestamp>",
+        help="Default: data/runs/fleet/<timestamp>",
     )
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=1024)
@@ -347,9 +347,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    out_dir = args.out_dir or (
-        args.data_dir.parent / "encoder_runs" / time.strftime("%Y%m%d-%H%M%S")
-    )
+    out_dir = args.out_dir or (FLEET_RUNS_DIR / time.strftime("%Y%m%d-%H%M%S"))
     train(
         data_dir=args.data_dir,
         out_dir=out_dir,

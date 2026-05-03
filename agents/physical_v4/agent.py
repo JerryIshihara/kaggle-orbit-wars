@@ -233,6 +233,9 @@ def candidates_for_source(
     raw_fleets: list,
     raw_by_id: dict,
     player: int,
+    *,
+    comet_planet_ids: set[int] | None = None,
+    comets: list | None = None,
 ) -> list[tuple]:
     """Return [(target, eta, ships_needed, angle, score), ...] sorted by score asc."""
     out = []
@@ -260,6 +263,10 @@ def candidates_for_source(
                 src_raw, angle, ships_needed, target.id, raw_planets, player, safety,
                 eta_override=turns,
                 fleets=raw_fleets,
+                angular_velocity=angular_velocity,
+                av_signed=av_signed,
+                comet_planet_ids=comet_planet_ids,
+                comets=comets,
             )
             if not ok:
                 continue
@@ -285,6 +292,9 @@ def find_coalition(
     raw_fleets: list,
     raw_by_id: dict,
     player: int,
+    *,
+    comet_planet_ids: set[int] | None = None,
+    comets: list | None = None,
 ):
     """Try to assemble 2–4 of our planets to swarm `target` within eta_tolerance.
 
@@ -345,6 +355,10 @@ def find_coalition(
                     src_raw, angle, ships, target.id, raw_planets, player, safety,
                     eta_override=eta,
                     fleets=raw_fleets,
+                    angular_velocity=angular_velocity,
+                    av_signed=av_signed,
+                    comet_planet_ids=comet_planet_ids,
+                    comets=comets,
                 )
                 if ok:
                     validated.append((src, ships, angle, eta))
@@ -369,6 +383,8 @@ def physical_v4_agent(obs):
     angular_velocity = abs(float(get("angular_velocity") or 0.0))
     initial_planets = get("initial_planets") or []
     step = int(get("step") or 0)
+    comet_planet_ids = set(get("comet_planet_ids") or [])
+    comets = get("comets") or []
 
     phase = phase_of(step)
     neutral_bonus, defense_buffer, min_launch, safety, frontier_w, eta_tol = PHASE_TABLE[phase]
@@ -422,6 +438,8 @@ def physical_v4_agent(obs):
             raw_fleets,
             raw_by_id,
             player,
+            comet_planet_ids=comet_planet_ids,
+            comets=comets,
         )
         if coalition is None:
             continue
@@ -448,6 +466,8 @@ def physical_v4_agent(obs):
             raw_fleets,
             raw_by_id,
             player,
+            comet_planet_ids=comet_planet_ids,
+            comets=comets,
         )
         if not cands:
             continue

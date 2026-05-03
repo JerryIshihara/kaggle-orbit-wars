@@ -39,10 +39,24 @@ episodes/
 data/replays/**/*.json
 !data/replays/**/_manifest.json
 
-# derived encoder-pretrain CSVs (~600MB) — regenerable via
-# scripts/build_encoder_dataset.py and the planet-equivalent flow.
-data/encoders/*.csv
-data/encoders_planet/*.csv
+# derived pretrain CSVs (multi-GB total) — regenerable via
+# scripts/build_encoder_dataset.py + planet/entity/cross_entity/action featurizers.
+data/datasets/fleet/*.csv
+data/datasets/planet/*.csv
+data/datasets/entity/*.csv
+data/datasets/cross_entity/*.csv
+data/datasets/action/*.csv
+# manifests are rewritten on every build_encoder_dataset.py run
+data/datasets/*/manifest.json
+# materialized snapshot tensor cache (multi-GB, regenerable on first load)
+data/datasets/**/_snapshot_cache/
+
+# training run outputs (model ckpts, logs) — share via GCS instead of git.
+# Regenerable via the pretrain scripts under agents/transformer_v1/pretrain/.
+data/runs/
+
+# stray scratch files (jupyter "Untitled", etc.)
+Untitled
 
 # claude code session files
 .claude/

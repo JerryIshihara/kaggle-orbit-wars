@@ -47,11 +47,12 @@ from ...physics_utils import (
     SUN_CX,
     SUN_CY,
 )
+from ..paths import PLANET_DATASET_DIR
 from .fleet_featurizer import (
     BOARD,
-    DEFAULT_ENCODER_DATA_DIR,
     MAX_SPEED,
     SHIPS_LOG_MAX,
+    _infer_learner_slot_from_episode_path,
     signed_log1p,
 )
 
@@ -96,11 +97,19 @@ N_SPEED_BUCKETS = len(SPEED_BUCKET_EDGES) + 1
 N_OWNER_DELTA_OUTCOMES = 3                     # stayed / lost / gained (signed change)
 
 
+# Number of channels per trajectory anchor: dx, dy, valid_bit. The
+# validity channel matters most for comets — without it, a "path ran
+# out" anchor (value 0,0) is indistinguishable from "actually no
+# motion" (value 0,0). The bit lets the encoder route around invalid
+# horizons explicitly, which is the difference between a static planet
+# and a dying comet.
+TRAJ_CHANNELS = 3
+
 # Scalar block dim — everything in ``to_vector`` *before* the trajectory
 # anchors. The encoder splits the raw vector at this index: dims
 # ``[0, SCALAR_DIM)`` are static/kinematic state; dims
-# ``[SCALAR_DIM, PLANET_RAW_DIM)`` are reshaped to ``(N_FUTURE_ANCHORS, 2)``
-# for the 1D-conv trajectory branch.
+# ``[SCALAR_DIM, PLANET_RAW_DIM)`` are reshaped to
+# ``(N_FUTURE_ANCHORS, TRAJ_CHANNELS)`` for the 1D-conv trajectory branch.
 SCALAR_DIM = (
     1                                  # is_comet
     + N_OWNER_PLUS_NEUTRAL             # owner one-hot relative (5)
@@ -116,7 +125,7 @@ SCALAR_DIM = (
 )
 
 # Total raw feature dim — must equal what ``to_vector`` packs.
-PLANET_RAW_DIM = SCALAR_DIM + 2 * N_FUTURE_ANCHORS
+PLANET_RAW_DIM = SCALAR_DIM + TRAJ_CHANNELS * N_FUTURE_ANCHORS
 
 
 # ---------- Records ----------
@@ -149,7 +158,12 @@ class PlanetFeaturizer:
     tangential_velocity: float                 # signed along orbital direction
     orbital_angle: float                       # atan2(y-50, x-50), radians
     angular_velocity: float                    # env-wide scalar (0 for comets)
-    future_dxy: list[tuple[float, float]]      # length N_FUTURE_ANCHORS
+    # length N_FUTURE_ANCHORS, each (dx, dy, valid). ``valid`` is 0 when
+    # the underlying entity has no defined position at horizon h
+    # (comet path runs out, episode ends, etc.); 1 otherwise. dx/dy are
+    # 0 in invalid entries — the bit is what tells the encoder to
+    # ignore them.
+    future_dxy: list[tuple[float, float, float]]
 
     def to_vector(self, learner_slot: int, num_players: int) -> list[float]:
         """Pack the model-input subset into a flat list of length
@@ -190,10 +204,13 @@ class PlanetFeaturizer:
         out.append(math.cos(self.orbital_angle))
         out.append(self.angular_velocity / ANGVEL_NORM)
 
-        # future anchors (dx, dy at +3, +6, +12 turns), normalized
-        for dx, dy in self.future_dxy:
+        # future anchors: (dx, dy, valid) at every horizon, normalized.
+        # ``valid`` is left as 0/1 — the encoder's Conv1d treats it as
+        # a third channel.
+        for dx, dy, valid in self.future_dxy:
             out.append(dx / ANCHOR_DXY_NORM)
             out.append(dy / ANCHOR_DXY_NORM)
+            out.append(valid)
 
         assert len(out) == PLANET_RAW_DIM, (
             f"PLANET_RAW_DIM mismatch: got {len(out)}, expected {PLANET_RAW_DIM}"
@@ -364,17 +381,19 @@ def featurize_planets(
             tangential_velocity = 0.0
             orbital_angle = 0.0
 
-        # Future trajectory anchors (relative dx/dy from current pos).
-        anchors: list[tuple[float, float]] = []
+        # Future trajectory anchors: (dx, dy, valid) per horizon. The
+        # validity bit is what lets the encoder distinguish "this comet
+        # will be gone by then" from "this static planet doesn't move."
+        anchors: list[tuple[float, float, float]] = []
         for h in FUTURE_HORIZONS:
             if is_comet and pid in comet_by_pid:
                 fut = _comet_future_xy(comet_by_pid[pid], h)
             else:
                 fut = _planet_future_xy(x, y, radius, angular_velocity, h)
             if fut is None:
-                anchors.append((0.0, 0.0))
+                anchors.append((0.0, 0.0, 0.0))
             else:
-                anchors.append((fut[0] - x, fut[1] - y))
+                anchors.append((fut[0] - x, fut[1] - y, 1.0))
 
         records.append(PlanetFeaturizer(
             planet_id=pid,
@@ -515,7 +534,7 @@ def save_episode_planet_csv(
     episode_path: str | Path,
     out_path: str | Path | None = None,
     *,
-    learner_slot: int = 0,
+    learner_slot: int | None = None,
     num_players: int | None = None,
     max_entities: int = 64,
     lookahead: int = LOOKAHEAD,
@@ -537,10 +556,7 @@ def save_episode_planet_csv(
 
     episode_path = Path(episode_path)
     if out_path is None:
-        out_path = (
-            DEFAULT_ENCODER_DATA_DIR.parent / "encoders_planet"
-            / f"planet_{episode_path.stem.split('.')[0]}.csv"
-        )
+        out_path = PLANET_DATASET_DIR / f"planet_{episode_path.stem.split('.')[0]}.csv"
     else:
         out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -548,6 +564,8 @@ def save_episode_planet_csv(
     with gzip.open(episode_path, "rb") as fh:
         replay = json.load(fh)
     steps = replay.get("steps") or []
+    if learner_slot is None:
+        learner_slot = _infer_learner_slot_from_episode_path(episode_path)
     if num_players is None:
         num_players = len(steps[0]) if steps else 4
     episode_id = replay.get("id") or episode_path.stem

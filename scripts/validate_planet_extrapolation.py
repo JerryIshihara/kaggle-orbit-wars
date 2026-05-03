@@ -41,7 +41,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from agents.transformer_v1.encoder.planet_encoder import PlanetEncoder  # noqa: E402
-from agents.transformer_v1.encoder.pretrain_planet import (  # noqa: E402
+from agents.transformer_v1.pretrain.planet_encoder import (  # noqa: E402
+    StratifiedTrajectoryDecoder,
     TrajectoryDecoder,
 )
 from agents.transformer_v1.featurizer import featurize_planets  # noqa: E402
@@ -66,7 +67,21 @@ def _load(run_dir: Path) -> tuple[PlanetEncoder, TrajectoryDecoder, dict]:
         strict=True,
     )
     enc.eval()
-    dec = TrajectoryDecoder(d_model=d_model, n_horizons=N_EXTRAP_HORIZONS)
+    # Detect decoder kind from the state-dict prefix layout. Vanilla =
+    # ``heads.extrap_trajectory.net.*``; stratified =
+    # ``heads.extrap_trajectory.heads.*`` (a ModuleList of sub-MLPs).
+    dec_keys = [
+        k.removeprefix("heads.extrap_trajectory.")
+        for k in ckpt["model"].keys()
+        if k.startswith("heads.extrap_trajectory.")
+    ]
+    is_stratified = any(k.startswith("heads.") for k in dec_keys)
+    if is_stratified:
+        dec: torch.nn.Module = StratifiedTrajectoryDecoder(
+            d_model=d_model, n_horizons=N_EXTRAP_HORIZONS,
+        )
+    else:
+        dec = TrajectoryDecoder(d_model=d_model, n_horizons=N_EXTRAP_HORIZONS)
     dec.load_state_dict(
         {k.removeprefix("heads.extrap_trajectory."): v
          for k, v in ckpt["model"].items()

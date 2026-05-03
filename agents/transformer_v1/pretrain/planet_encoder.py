@@ -4,15 +4,16 @@ Loads CSVs produced by ``planet_featurizer.save_episode_planet_csv``
 and trains :class:`PlanetEncoder` + per-label heads against the
 ``ENCODER_PRETRAIN_LABELS`` multi-task objective.
 
-Symmetric with ``pretrain.py`` (fleet) — same dataset / model /
-training-loop scaffolding, just different feature dim and label set.
+Symmetric with ``fleet_encoder`` (the fleet pretrain in this same
+package) — same dataset / model / training-loop scaffolding, just
+different feature dim and label set.
 
 Run from the repo root:
 
-    python -m agents.transformer_v1.encoder.pretrain_planet \
+    python -m agents.transformer_v1.pretrain.planet_encoder \
         --epochs 30 --d-model 64 --batch-size 4096
 
-Outputs (under ``data/encoder_runs_planet/<timestamp>/``):
+Outputs (under ``data/runs/planet/<timestamp>/``):
 
 * ``planet_encoder_best.pt`` — checkpoint at lowest val mean loss
 * ``planet_encoder_last.pt`` — last-epoch checkpoint
@@ -34,7 +35,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from ..featurizer.fleet_featurizer import DEFAULT_ENCODER_DATA_DIR
+from ..paths import PLANET_DATASET_DIR, PLANET_RUNS_DIR
 from ..featurizer.planet_featurizer import (
     ENCODER_LABEL_HEADS,
     ENCODER_PRETRAIN_LABELS,
@@ -43,7 +44,7 @@ from ..featurizer.planet_featurizer import (
     N_EXTRAP_HORIZONS,
     PLANET_RAW_DIM,
 )
-from .planet_encoder import PlanetEncoder
+from ..encoder.planet_encoder import PlanetEncoder
 
 
 # ---------- Dataset ----------
@@ -128,8 +129,52 @@ class TrajectoryDecoder(nn.Module):
         return self.net(z)
 
 
+class StratifiedTrajectoryDecoder(nn.Module):
+    """Three sub-decoders, each specialized to a horizon range.
+
+    Hypothesis from the comet-extrapolation experiments: a single decoder
+    is forced to balance close-range precision (h=1) against long-range
+    drift (h=10), and the multi-task pressure plus information bottleneck
+    means it can't be sharp at both extremes simultaneously. Splitting
+    into three sub-heads (short/mid/long) lets each one specialize on
+    its slice of the horizon spectrum without competing for parameters.
+
+    Defaults assume ``n_horizons=10``: short=h1..h3, mid=h4..h6, long=h7..h10.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 64,
+        n_horizons: int = 10,
+        hidden: int | None = None,
+        splits: tuple[int, ...] = (3, 3, 4),
+    ):
+        super().__init__()
+        if sum(splits) != n_horizons:
+            raise ValueError(
+                f"splits {splits} sum to {sum(splits)} but n_horizons={n_horizons}"
+            )
+        self.n_horizons = n_horizons
+        self.splits = splits
+        h = hidden or d_model
+        # One sub-MLP per slice; each emits ``2 * slice_len`` outputs.
+        self.heads = nn.ModuleList(
+            nn.Sequential(
+                nn.Linear(d_model, h),
+                nn.GELU(),
+                nn.Linear(h, 2 * s),
+            )
+            for s in splits
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # Concat sub-head outputs in horizon order so the downstream
+        # reshape (B, n_horizons, 2) lines up with EXTRAP_HORIZONS.
+        return torch.cat([head(z) for head in self.heads], dim=-1)
+
+
 class PlanetEncoderPretrainModel(nn.Module):
-    def __init__(self, d_model: int = 64):
+    def __init__(self, d_model: int = 64, decoder: str = "vanilla"):
         super().__init__()
         self.encoder = PlanetEncoder(d_model=d_model)
         self.heads = nn.ModuleDict()
@@ -144,9 +189,16 @@ class PlanetEncoderPretrainModel(nn.Module):
             elif spec["type"] == "masked_regression":
                 # Trajectory decoder. Output is flat (B, 2*H); loss
                 # / eval reshapes to (B, H, 2) and applies the mask.
-                self.heads[name] = TrajectoryDecoder(
-                    d_model=d_model, n_horizons=spec["n_horizons"],
-                )
+                if decoder == "stratified":
+                    self.heads[name] = StratifiedTrajectoryDecoder(
+                        d_model=d_model, n_horizons=spec["n_horizons"],
+                    )
+                elif decoder == "vanilla":
+                    self.heads[name] = TrajectoryDecoder(
+                        d_model=d_model, n_horizons=spec["n_horizons"],
+                    )
+                else:
+                    raise ValueError(f"unknown decoder kind: {decoder!r}")
             else:
                 raise ValueError(f"unknown head type: {spec['type']!r}")
 
@@ -158,6 +210,15 @@ class PlanetEncoderPretrainModel(nn.Module):
 
 
 # ---------- Loss / metrics ----------
+# Per-horizon training weight for the trajectory MSE loss. Set to a
+# non-uniform schedule (e.g., (2,1,...,1,2)) to push the optimizer to
+# fit endpoints more aggressively — typically the boundary horizons
+# (h=1 close-precision, h=N long-range drift) are the hardest cells
+# for a multi-task encoder. Eval still computes unweighted MSE for
+# fair comparison.
+HORIZON_LOSS_WEIGHTS: tuple[float, ...] = (1.0,) * 10
+
+
 def _masked_traj_mse(
     pred_flat: torch.Tensor,         # (B, 2H)
     target_flat: torch.Tensor,       # (B, 2H)
@@ -165,6 +226,7 @@ def _masked_traj_mse(
     n_horizons: int,
     *,
     reduction: str = "mean",
+    horizon_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-step masked MSE over a packed (B, 2H) trajectory.
 
@@ -172,17 +234,29 @@ def _masked_traj_mse(
     (B, H) mask over the xy axis, and averages only over valid
     elements. ``reduction='sum'`` returns the un-normalized squared-
     error sum (useful for accumulating across batches in eval).
+
+    If ``horizon_weights`` is given (shape ``(H,)``), each horizon's
+    squared-error contribution is scaled by its weight and the
+    denominator is also weighted, so the "mean" reduction stays a
+    weighted average rather than a re-scaled sum. Eval should pass
+    ``horizon_weights=None`` so reported MSE is unweighted.
     """
     B = pred_flat.shape[0]
     pred = pred_flat.view(B, n_horizons, 2)
     target = target_flat.view(B, n_horizons, 2)
     m = mask.unsqueeze(-1)                     # (B, H, 1)
-    sq = (pred - target).pow(2) * m
+    sq = (pred - target).pow(2) * m            # (B, H, 2)
+
+    if horizon_weights is not None:
+        w = horizon_weights.to(sq.device).view(1, n_horizons, 1)   # (1, H, 1)
+        sq = sq * w
+        denom = (m * w).sum() * 2.0
+    else:
+        denom = m.sum() * 2.0                  # 2 = xy dims per step
+
     if reduction == "sum":
         return sq.sum()
-    # Mean over valid (mask=1) entries; guard against an all-masked batch.
-    n_valid = m.sum() * 2.0                    # 2 = xy dims per step
-    return sq.sum() / n_valid.clamp(min=1.0)
+    return sq.sum() / denom.clamp(min=1.0)
 
 
 def _per_head_loss(name: str, logit: torch.Tensor, targets: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -195,7 +269,13 @@ def _per_head_loss(name: str, logit: torch.Tensor, targets: dict[str, torch.Tens
         return F.mse_loss(logit.squeeze(-1), targets[name])
     if spec["type"] == "masked_regression":
         mask = targets[spec["mask_field"]]
-        return _masked_traj_mse(logit, targets[name], mask, spec["n_horizons"])
+        # Apply per-horizon weighting only at training time; eval calls
+        # ``_masked_traj_mse`` directly with ``horizon_weights=None``.
+        weights = torch.as_tensor(HORIZON_LOSS_WEIGHTS, dtype=logit.dtype)
+        return _masked_traj_mse(
+            logit, targets[name], mask, spec["n_horizons"],
+            horizon_weights=weights,
+        )
     raise ValueError(f"unknown head type: {spec['type']!r}")
 
 
@@ -301,6 +381,7 @@ def train(
     device: str | None = None,
     num_workers: int = 0,
     seed: int = 0,
+    decoder: str = "vanilla",
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     if device is None:
@@ -320,7 +401,7 @@ def train(
     val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=num_workers)
     test_loader = DataLoader(test_ds, batch_size=batch_size, num_workers=num_workers)
 
-    model = PlanetEncoderPretrainModel(d_model=d_model).to(device)
+    model = PlanetEncoderPretrainModel(d_model=d_model, decoder=decoder).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     log: list[dict[str, Any]] = []
@@ -392,10 +473,7 @@ def train(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--data-dir", type=Path,
-        default=DEFAULT_ENCODER_DATA_DIR.parent / "encoders_planet",
-    )
+    parser.add_argument("--data-dir", type=Path, default=PLANET_DATASET_DIR)
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=4096)
@@ -407,11 +485,15 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--decoder", type=str, default="vanilla",
+        choices=("vanilla", "stratified"),
+        help="Trajectory decoder architecture: vanilla = single 2-layer "
+             "MLP; stratified = three sub-MLPs over h1..3 / h4..6 / h7..10.",
+    )
     args = parser.parse_args()
 
-    out_dir = args.out_dir or (
-        args.data_dir.parent / "encoder_runs_planet" / time.strftime("%Y%m%d-%H%M%S")
-    )
+    out_dir = args.out_dir or (PLANET_RUNS_DIR / time.strftime("%Y%m%d-%H%M%S"))
     train(
         data_dir=args.data_dir,
         out_dir=out_dir,
@@ -425,6 +507,7 @@ def main() -> None:
         num_workers=args.num_workers,
         device=args.device,
         seed=args.seed,
+        decoder=args.decoder,
     )
 
 

@@ -7,7 +7,14 @@ from . import physical_v3  # noqa: F401
 from . import physical_v4  # noqa: F401
 from . import random_v1  # noqa: F401
 from . import sniper_v1  # noqa: F401
+from . import sniper_v2  # noqa: F401
 from . import hybrid_v1  # noqa: F401
+
+try:
+    from . import transformer_v1  # noqa: F401
+except ImportError as e:
+    import warnings
+    warnings.warn(f"transformer_v1 unavailable (missing deps): {e}")
 
 try:
     from . import cnn_v1  # noqa: F401
