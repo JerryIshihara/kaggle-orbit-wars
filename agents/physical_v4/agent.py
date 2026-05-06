@@ -70,6 +70,13 @@ PHASE_TABLE = {
 SWARM_MAX_SOURCES = 4
 SWARM_EXTRA_MARGIN = 4   # ships beyond defended_total to confirm a coalition wins
 
+# ---------- Launch log ----------
+# Every committed launch is appended as
+# (step, src_pid, intended_target_pid, ships, angle, eta).
+# External tools (scripts/measure_physical_v4_miss_rate.py) consume this to
+# verify the trajectory landed on the planet the agent meant to hit.
+LAUNCH_LOG: list[tuple[int, int, int, int, float, float]] = []
+
 
 def phase_of(step: int) -> str:
     remaining = EPISODE_STEPS - step
@@ -448,10 +455,13 @@ def physical_v4_agent(obs):
         )
         if coalition is None:
             continue
-        _, per_source = coalition
-        for src, ships, angle, _eta in per_source:
+        coalition_target, per_source = coalition
+        for src, ships, angle, eta in per_source:
             moves.append([src.id, angle, ships])
             used_sources.add(src.id)
+            LAUNCH_LOG.append(
+                (step, src.id, coalition_target.id, ships, angle, eta)
+            )
 
     # ----- STAGE 2: independent per-source picks for unused sources -----
     for source, surplus in sources_with_surplus:
@@ -477,7 +487,10 @@ def physical_v4_agent(obs):
         )
         if not cands:
             continue
-        _target, _eta, ships_needed, angle, _score = cands[0]
+        target, eta, ships_needed, angle, _score = cands[0]
         moves.append([source.id, angle, ships_needed])
+        LAUNCH_LOG.append(
+            (step, source.id, target.id, ships_needed, angle, eta)
+        )
 
     return moves

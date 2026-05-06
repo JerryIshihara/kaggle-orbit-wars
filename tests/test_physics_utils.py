@@ -21,7 +21,7 @@ pu = _load_physics_utils()
 
 
 class PhysicsUtilsCollisionOrderTest(unittest.TestCase):
-    def test_static_collision_checks_planet_before_sun(self) -> None:
+    def test_static_collision_checks_sun_before_planet(self) -> None:
         source = [0, 0, 50.0, 39.0, 1.0, 100, 0]
         target = [1, -1, 50.0, 44.0, 1.0, 0, 0]
         hit = pu.find_first_collision(
@@ -36,8 +36,24 @@ class PhysicsUtilsCollisionOrderTest(unittest.TestCase):
         )
 
         self.assertIsNotNone(hit)
-        self.assertEqual(hit["kind"], "planet")
-        self.assertEqual(hit["planet"][pu.P_ID], target[pu.P_ID])
+        self.assertEqual(hit["kind"], "sun")
+
+    def test_static_collision_checks_boundary_before_planet(self) -> None:
+        source = [0, 0, 96.0, 50.0, 1.0, 100, 0]
+        target = [1, -1, 99.0, 50.0, 3.0, 0, 0]
+        hit = pu.find_first_collision(
+            source[pu.P_X],
+            source[pu.P_Y],
+            source[pu.P_RADIUS],
+            source[pu.P_ID],
+            0.0,
+            1000,
+            [source, target],
+            max_distance=20.0,
+        )
+
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["kind"], "boundary")
 
     def test_dynamic_collision_checks_sun_before_moving_planet_sweep(self) -> None:
         source = [0, 0, 50.0, 36.0, 1.0, 100, 0]
@@ -60,6 +76,58 @@ class PhysicsUtilsCollisionOrderTest(unittest.TestCase):
 
         self.assertIsNotNone(hit)
         self.assertEqual(hit["kind"], "sun")
+
+    def test_validate_launch_rejects_endpoint_boundary_before_planet_hit(self) -> None:
+        source = [0, 0, 96.0, 50.0, 1.0, 100, 0]
+        target = [1, -1, 99.0, 50.0, 3.0, 0, 0]
+
+        ok, reason = pu.validate_launch(
+            source,
+            0.0,
+            1000,
+            target[pu.P_ID],
+            [source, target],
+            player=0,
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "boundary")
+
+    def test_validate_launch_rejects_wrong_first_hit_even_if_friendly(self) -> None:
+        source = [0, 0, 10.0, 80.0, 1.0, 100, 0]
+        blocker = [1, 0, 50.0, 80.0, 3.0, 10, 0]
+        target = [2, -1, 90.0, 80.0, 3.0, 1, 0]
+
+        ok, reason = pu.validate_launch(
+            source,
+            0.0,
+            20,
+            target[pu.P_ID],
+            [source, blocker, target],
+            player=0,
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "wrong_planet_1")
+
+    def test_plan_launch_rejects_wrong_first_hit_even_if_friendly(self) -> None:
+        source = [0, 0, 10.0, 80.0, 1.0, 100, 0]
+        blocker = [1, 0, 50.0, 80.0, 3.0, 10, 0]
+        target = [2, -1, 90.0, 80.0, 3.0, 1, 0]
+
+        launch = pu.plan_launch(
+            source,
+            target,
+            planets=[source, blocker, target],
+            fleets=[],
+            player=0,
+            angular_velocity=0.0,
+            fleet_ships=20,
+        )
+
+        self.assertFalse(launch.ok)
+        self.assertEqual(launch.reason, "wrong_planet_1")
+        self.assertEqual(launch.actual_hit_id, blocker[pu.P_ID])
 
 
 if __name__ == "__main__":
