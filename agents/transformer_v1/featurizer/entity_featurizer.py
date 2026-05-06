@@ -379,6 +379,11 @@ def _cross_entity_label_columns() -> list[str]:
         cols.append(f"score_advantage_t_plus_{h}_log")
         cols.append(f"is_ahead_t_plus_{h}")
         cols.append(f"valid_global_t_plus_{h}")
+    # Tier-3b neutral game-level (player-perspective-independent)
+    cols.append("total_ships_in_play_log")
+    cols.append("ship_distribution_entropy")
+    cols.append("n_neutral_planets")
+    cols.append("game_phase")
     for h in CROSS_ENTITY_TACTICAL_HORIZONS:
         cols.append(f"can_friendly_reinforce_within_{h}")
         cols.append(f"enemy_can_capture_within_{h}")
@@ -434,6 +439,86 @@ def _snapshot_totals(obs: dict[str, Any] | None, *, num_players: int) -> list[in
         if 0 <= owner < num_players:
             totals[owner] += int(f[F_SHIPS])
     return totals
+
+
+# ---------- Player-perspective-independent (neutral) global labels ----------
+# These quantities are computed without reference to ``learner_slot`` so the
+# CLS token can learn a perspective-invariant game-state summary alongside
+# the learner-relative labels.
+GAME_PHASE_N_CLASSES: int = 3   # early / mid / late
+
+
+def _compute_neutral_global_labels(
+    obs: dict[str, Any] | None,
+    *,
+    num_players: int,
+    turn: int,
+) -> dict[str, float]:
+    """Per-snapshot, perspective-invariant summary of the board.
+
+    Quantities here are the same regardless of which seat is the
+    ``learner_slot``: total ships in play, how concentrated those ships
+    are across players, free-real-estate count, and a coarse game-phase
+    bucket. Use them as auxiliary supervision for the CLS token to keep
+    the global representation from collapsing into "am I winning."
+
+    All values are floats (game_phase encoded as float for CSV uniformity;
+    consumer casts back to long for the categorical head).
+    """
+    if not obs:
+        return {
+            "total_ships_in_play_log": 0.0,
+            "ship_distribution_entropy": 0.0,
+            "n_neutral_planets": 0.0,
+            "game_phase": 0.0,
+        }
+    planets = obs.get("planets") or []
+
+    player_ships = [0] * num_players
+    n_neutral = 0
+    for p in planets:
+        owner = int(p[P_OWNER])
+        ships = int(p[P_SHIPS])
+        if 0 <= owner < num_players:
+            player_ships[owner] += ships
+        else:
+            n_neutral += 1
+    # Add inflight fleets to the per-player ship totals.
+    for f in obs.get("fleets") or []:
+        owner = int(f[F_OWNER])
+        if 0 <= owner < num_players:
+            player_ships[owner] += int(f[F_SHIPS])
+
+    total = sum(player_ships)
+    total_log = math.log1p(total)
+
+    # Shannon entropy over player ship distribution (nats). Uniform 4-way
+    # split → log(4) ≈ 1.386; one player owns everything → 0.
+    if total > 0:
+        entropy = 0.0
+        for s in player_ships:
+            if s > 0:
+                p = s / total
+                entropy -= p * math.log(p)
+    else:
+        entropy = 0.0
+
+    # Coarse game-phase bucket from current turn (independent of t_until_end
+    # so it stays defined even on truncated episodes).
+    progress = turn / max(1, EPISODE_STEPS - 1)
+    if progress < 1.0 / 3.0:
+        phase = 0
+    elif progress < 2.0 / 3.0:
+        phase = 1
+    else:
+        phase = 2
+
+    return {
+        "total_ships_in_play_log": float(total_log),
+        "ship_distribution_entropy": float(entropy),
+        "n_neutral_planets": float(n_neutral),
+        "game_phase": float(phase),
+    }
 
 
 def _winner_class_from_totals(
@@ -1007,6 +1092,9 @@ def save_episode_cross_entity_csv(
                 learner_slot=learner_slot,
                 num_players=num_players,
             )
+            neutral_global = _compute_neutral_global_labels(
+                obs, num_players=num_players, turn=t,
+            )
 
             # Iterate the planet list in env order, capped at
             # max_entities to mirror the entity CSV's truncation.
@@ -1039,6 +1127,10 @@ def save_episode_cross_entity_csv(
                             f"valid_global_t_plus_{h}",
                         )
                     ],
+                    neutral_global["total_ships_in_play_log"],
+                    neutral_global["ship_distribution_entropy"],
+                    neutral_global["n_neutral_planets"],
+                    neutral_global["game_phase"],
                     *[
                         tactical[name]
                         for h in CROSS_ENTITY_TACTICAL_HORIZONS

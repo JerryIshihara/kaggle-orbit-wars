@@ -96,6 +96,17 @@ def cmd_train(args: argparse.Namespace) -> int:
             opponents=args.ppo_opponents,
             resume_from=None,  # uses the saved weights path by default
         )
+    if "transformer-ppo" in stages:
+        from agents.transformer_v1.ppo import train_ppo as train_transformer_ppo
+        print(f"training transformer_v1 PPO: {args.ppo_iters} iters x {args.ppo_episodes} eps")
+        ckpt = train_transformer_ppo(
+            resume_action_pt=args.transformer_ppo_ckpt,
+            iterations=args.ppo_iters,
+            episodes_per_iter=args.ppo_episodes,
+            seed_start=args.seed or 0,
+        )
+        print(f"transformer_v1 PPO checkpoint: {ckpt}")
+
     if "eval" in stages:
         print(f"evaluating cnn_v1 vs {args.eval_opponents} ({args.eval_games} games each)")
         evaluate_agent("cnn_v1", opponents=args.eval_opponents, games_per=args.eval_games)
@@ -142,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--stages",
         nargs="+",
-        choices=["collect", "bc", "ppo", "eval"],
+        choices=["collect", "bc", "ppo", "eval", "transformer-ppo"],
         help="training stages to run (default: collect bc eval)",
     )
     p.add_argument("--teacher", default="sniper_v1", help="BC teacher agent")
@@ -165,6 +176,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=["random_v1", "sniper_v1", "physical_v2"],
     )
     p.add_argument("--eval-games", type=int, default=10)
+    p.add_argument(
+        "--transformer-ppo-ckpt", default=None,
+        help="Transformer BC checkpoint to resume from for transformer-ppo stage",
+    )
     return p
 
 

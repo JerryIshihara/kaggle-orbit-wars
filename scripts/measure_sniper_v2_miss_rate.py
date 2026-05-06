@@ -1,12 +1,12 @@
 """Run sniper_v2 against opponents locally and report miss rate.
 
-A "miss" is any committed launch whose trajectory's first-hit (per
-``physics_utils.find_first_collision`` against the launch-time obs)
-isn't the planet sniper_v2 declared as the intended target. By
-construction this should be zero — ``sniper`` already validates the
-trajectory before sniper_v2 emits the move — so a non-zero miss rate
-is a real bug to investigate (or a case of env physics drifting from
-our predictions).
+A "miss" is any committed launch whose trajectory's first-hit (per the
+same env-order collision sweep used by ``physics_utils.sniper`` against
+the launch-time obs) isn't the planet sniper_v2 declared as the intended
+target. By construction this should be zero — ``sniper`` already
+validates the trajectory before sniper_v2 emits the move — so a non-zero
+miss rate is a real bug to investigate (or a case of env physics drifting
+from our predictions).
 
 Run:
     python scripts/measure_sniper_v2_miss_rate.py \\
@@ -30,6 +30,9 @@ sys.path.insert(0, str(REPO))
 import agents  # noqa: E402  — registers all agent ids
 from agents.physics_utils import (  # noqa: E402
     P_ID, P_RADIUS, P_X, P_Y,
+    _build_comet_lookup,
+    _find_first_collision_dynamic,
+    _infer_rotation_sign_raw,
     find_first_collision,
 )
 from agents.sniper_v2.agent import LAUNCH_LOG  # noqa: E402
@@ -65,10 +68,23 @@ def _verify_launch(
     src = next((p for p in planets if int(p[P_ID]) == src_pid), None)
     if src is None:
         return False, "src_missing"
-    hit = find_first_collision(
-        float(src[P_X]), float(src[P_Y]), float(src[P_RADIUS]),
-        int(src[P_ID]), float(angle), int(ships), planets,
-    )
+    angular_velocity = abs(float(obs.get("angular_velocity") or 0.0))
+    comet_lookup = _build_comet_lookup(obs.get("comets") or [])
+    if angular_velocity > 0.0 or comet_lookup:
+        av_sign = _infer_rotation_sign_raw(planets, obs.get("initial_planets") or [])
+        hit = _find_first_collision_dynamic(
+            float(src[P_X]), float(src[P_Y]), float(src[P_RADIUS]),
+            int(src[P_ID]), float(angle), int(ships), planets,
+            angular_velocity=angular_velocity,
+            av_signed=angular_velocity * av_sign,
+            comet_lookup=comet_lookup,
+            current_step=int(obs.get("step", 0) or 0),
+        )
+    else:
+        hit = find_first_collision(
+            float(src[P_X]), float(src[P_Y]), float(src[P_RADIUS]),
+            int(src[P_ID]), float(angle), int(ships), planets,
+        )
     if hit is None:
         return False, "no_collision"
     if hit["kind"] != "planet":
