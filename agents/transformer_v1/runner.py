@@ -40,6 +40,11 @@ from ..physical_v4.agent import (
     infer_rotation_sign,
     phase_of,
 )
+from ..physics_utils import (
+    P_ID, P_OWNER, P_X, P_Y, P_RADIUS,
+    shoot_static, shoot_orbit, shoot_comet,
+    _is_orbiting_xy, _infer_rotation_sign_raw,
+)
 from ..registry import register
 from .featurizer import FleetTracker, featurize_observation
 from .paths import ACTION_RUNS_DIR
@@ -73,6 +78,50 @@ def _default_ckpt() -> Path:
             f"no action_*.pt under {ACTION_RUNS_DIR}/*/."
         )
     return candidates[-1]
+
+
+def _learner_aim(
+    *,
+    source_raw,
+    target_raw,
+    ships: int,
+    obs,
+    planets: list,
+    initial_planets: list,
+    angular_velocity: float,
+    comet_ids: set[int],
+    fallback_angle: float,
+) -> float:
+    """Pick a launch angle for the learner's (source, target, ships) using
+    the motion-class-aware shoot helpers from ``physics_utils``.
+
+    Returns ``fallback_angle`` (naive ``atan2`` of straight-line aim) on
+    any error — guarantees PPO rollouts never crash on a bad shoot call,
+    just like before this integration.
+    """
+    if source_raw is None or target_raw is None:
+        return fallback_angle
+    try:
+        tid = int(target_raw[P_ID])
+        if tid in (comet_ids or set()):
+            angle, _eta, _n = shoot_comet(source_raw, target_raw, int(ships), obs)
+        elif angular_velocity > 0.0 and _is_orbiting_xy(
+            float(target_raw[P_X]),
+            float(target_raw[P_Y]),
+            float(target_raw[P_RADIUS]),
+            float(angular_velocity),
+        ):
+            av_sign = _infer_rotation_sign_raw(planets, initial_planets)
+            angle, _eta, _n = shoot_orbit(
+                source_raw, target_raw, int(ships), obs, av_sign=av_sign,
+            )
+        else:
+            angle, _eta, _n = shoot_static(source_raw, target_raw, int(ships))
+        return float(angle)
+    except Exception:
+        # Any failure (numerical, missing field, etc.) — fall back so
+        # rollout integrity is preserved.
+        return fallback_angle
 
 
 class TransformerAgent:
@@ -370,7 +419,20 @@ class TransformerAgent:
             )
             if ships < min_launch:
                 return []
-            angle = math.atan2(target.y - source.y, target.x - source.x)
+            # Motion-class-aware aim. Falls back to the prior naive aim
+            # if the shoot_* dispatch raises — keeping rollout stable
+            # under any unexpected env state.
+            angle = _learner_aim(
+                source_raw=raw_by_id.get(source.id),
+                target_raw=raw_by_id.get(target.id),
+                ships=ships,
+                obs=obs,
+                planets=raw_planets,
+                initial_planets=initial_planets,
+                angular_velocity=angular_velocity,
+                comet_ids=comet_planet_ids,
+                fallback_angle=math.atan2(target.y - source.y, target.x - source.x),
+            )
             return [[source.id, angle, ships]]
         if surplus < min_launch:
             return []
