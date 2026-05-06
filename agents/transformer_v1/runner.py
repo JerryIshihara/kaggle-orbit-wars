@@ -295,6 +295,11 @@ class TransformerAgent:
                 "src_legal_mask": src_legal.cpu(),
                 "tgt_legal_mask": tgt_legal.cpu(),
                 "batch": batch,
+                # Bernoulli logit + p_acted on the *raw* policy. Used to
+                # count exploration-driven launches: when acted_int=1 but
+                # p_acted<0.5, the sample beat the argmax (entropy bonus
+                # / stochasticity, not the policy's own preference).
+                "acted_logit": acted_logit_val,
             }
             return rollout
 

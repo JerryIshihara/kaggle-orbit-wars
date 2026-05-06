@@ -195,6 +195,7 @@ class TransformerRolloutCollector:
                 "src_legal_mask": rollout["src_legal_mask"].clone(),
                 "tgt_legal_mask": rollout["tgt_legal_mask"].clone(),
                 "pid_to_idx": copy.deepcopy(rollout["pid_to_idx"]),
+                "acted_logit": float(rollout.get("acted_logit", 0.0)),
             })
 
         return moves
@@ -216,6 +217,97 @@ def _as_kaggle_fn(callable_obj):
     def _fn(obs):
         return callable_obj(obs)
     return _fn
+
+
+def _episode_telemetry(env, learner_slot: int, trajectory: list[dict] | None = None) -> dict:
+    """Per-episode behaviour counters for the learner.
+
+    Walks ``env.steps``:
+
+    * fleets_launched — count of new own-fleet IDs first appearing in flight.
+    * fleets_disappeared — count of own-fleet IDs that left the in-flight
+      set between consecutive steps. Includes useful arrivals
+      (capture / reinforce) AND env-side destruction (sun collision,
+      out-of-bounds, planet sweep, repelled in combat). The env's
+      ``orbit_wars.py`` removes fleets via ``fleets_to_remove`` for
+      these causes; the obs only shows the post-removal set, so the
+      cause cannot be disambiguated from observation alone.
+    * fleets_in_flight_at_end — own fleets still un-resolved at the
+      terminal step (definitionally useless: never arrived).
+    * fleet_ships_in_flight_at_end — total ships locked in those.
+    * captures — planet-ownership transitions to ``learner_slot``.
+    * lost — planet-ownership transitions away from ``learner_slot``.
+    * final_planets_owned — owned planets at the terminal step.
+    * final_ships — planet+fleet ships for learner at terminal.
+    * episode_length — len(env.steps).
+
+    If ``trajectory`` is provided, also computes:
+    * fleets_due_to_exploration — count of acted=1 trajectory steps
+      where ``sigmoid(acted_logit) < 0.5`` (the Bernoulli sample beat
+      the argmax — i.e., the launch happened because of stochastic
+      exploration, not because the policy's own preference said launch).
+    """
+    fleet_ids_prev: set = set()
+    owners_prev: list[int] | None = None
+    fleets_launched = 0
+    fleets_disappeared = 0
+    captures = 0
+    lost = 0
+
+    for step in env.steps:
+        obs = step[0].observation
+        planets = list(getattr(obs, "planets", []) or [])
+        fleets = list(getattr(obs, "fleets", []) or [])
+
+        my_fleet_ids = {f[0] for f in fleets if len(f) >= 2 and f[1] == learner_slot}
+        fleets_launched += len(my_fleet_ids - fleet_ids_prev)
+        fleets_disappeared += len(fleet_ids_prev - my_fleet_ids)
+        fleet_ids_prev = my_fleet_ids
+
+        cur_owners = [p[1] if len(p) >= 2 else -1 for p in planets]
+        if owners_prev is not None and len(owners_prev) == len(cur_owners):
+            for prev, cur in zip(owners_prev, cur_owners):
+                if prev == cur:
+                    continue
+                if cur == learner_slot:
+                    captures += 1
+                elif prev == learner_slot:
+                    lost += 1
+        owners_prev = cur_owners
+
+    final = env.steps[-1][0].observation
+    fp = list(getattr(final, "planets", []) or [])
+    ff = list(getattr(final, "fleets", []) or [])
+    planets_owned = sum(1 for p in fp if len(p) >= 2 and p[1] == learner_slot)
+    ships_planet = sum(p[5] for p in fp if len(p) >= 6 and p[1] == learner_slot)
+    own_in_flight = [f for f in ff if len(f) >= 7 and f[1] == learner_slot]
+    fleets_in_flight_at_end = len(own_in_flight)
+    ships_fleet = sum(f[6] for f in own_in_flight)
+
+    # Exploration-driven launches (need trajectory to compute).
+    fleets_due_to_exploration = 0
+    if trajectory:
+        import math
+        for t in trajectory:
+            if int(t.get("acted", 0)) != 1:
+                continue
+            logit = float(t.get("acted_logit", 0.0))
+            # sigmoid(logit) < 0.5  <=>  logit < 0
+            if logit < 0.0:
+                fleets_due_to_exploration += 1
+
+    return {
+        "fleets_launched": int(fleets_launched),
+        "fleets_disappeared": int(fleets_disappeared),
+        "fleets_in_flight_at_end": int(fleets_in_flight_at_end),
+        "fleet_ships_in_flight_at_end": int(ships_fleet),
+        "fleets_due_to_exploration": int(fleets_due_to_exploration),
+        "captures": int(captures),
+        "lost": int(lost),
+        "final_planets_owned": int(planets_owned),
+        "final_ships": int(ships_planet + ships_fleet),
+        "episode_length": int(len(env.steps)),
+    }
 
 
 def _play_episode(
@@ -252,7 +344,8 @@ def _play_episode(
             f"statuses={statuses} infos={infos}",
             flush=True,
         )
-    return learner.trajectory, final_reward, env, all_rewards
+    telemetry = _episode_telemetry(env, learner_slot, trajectory=learner.trajectory)
+    return learner.trajectory, final_reward, env, all_rewards, telemetry
 
 
 # ── GAE ────────────────────────────────────────────────────────────
@@ -1379,6 +1472,7 @@ def train_ppo(
             phi_start_hist: list[float] = []
             phi_end_hist: list[float] = []
             ep_lens_hist: list[int] = []      # episode lengths (steps), for episodes_short_pct
+            telem_hist: list[dict] = []       # per-episode behaviour counters from _episode_telemetry
             ep_types = {"self": 0, "baseline": 0}
 
             for ep in range(episodes_per_iter):
@@ -1400,11 +1494,12 @@ def train_ppo(
                     opp_kind = "baseline"
 
                 slot = ep % 2
-                traj, reward, env, all_rewards = _play_episode(
+                traj, reward, env, all_rewards, telem = _play_episode(
                     learner, opp_fn, learner_slot=slot,
                     seed=seed_start + it * 1000 + ep,
                 )
                 rewards_hist.append(reward)
+                telem_hist.append(telem)
                 # orbit_wars is always 2-player; learner_slot ∈ {0,1}, opp is the other.
                 opp_slot = 1 - slot
                 opp_reward = all_rewards[opp_slot] if opp_slot < len(all_rewards) else 0
@@ -1579,6 +1674,33 @@ def train_ppo(
             else:
                 episodes_short_pct = None
 
+            # Per-episode behaviour aggregates (means across all eps in iter)
+            if telem_hist:
+                def _mean(key: str) -> float:
+                    return sum(t[key] for t in telem_hist) / len(telem_hist)
+                game_metrics = {
+                    "mean_fleets_launched": round(_mean("fleets_launched"), 2),
+                    "mean_fleets_disappeared": round(_mean("fleets_disappeared"), 2),
+                    "mean_fleets_in_flight_at_end": round(_mean("fleets_in_flight_at_end"), 2),
+                    "mean_fleet_ships_in_flight_at_end": round(_mean("fleet_ships_in_flight_at_end"), 1),
+                    "mean_fleets_due_to_exploration": round(_mean("fleets_due_to_exploration"), 2),
+                    "mean_captures": round(_mean("captures"), 2),
+                    "mean_lost": round(_mean("lost"), 2),
+                    "mean_final_planets_owned": round(_mean("final_planets_owned"), 2),
+                    "mean_final_ships": round(_mean("final_ships"), 1),
+                    "mean_episode_length": round(_mean("episode_length"), 1),
+                }
+            else:
+                game_metrics = {
+                    "mean_fleets_launched": None, "mean_fleets_disappeared": None,
+                    "mean_fleets_in_flight_at_end": None,
+                    "mean_fleet_ships_in_flight_at_end": None,
+                    "mean_fleets_due_to_exploration": None,
+                    "mean_captures": None, "mean_lost": None,
+                    "mean_final_planets_owned": None, "mean_final_ships": None,
+                    "mean_episode_length": None,
+                }
+
             metrics = {
                 "iter": it + 1,
                 "phase": phase,
@@ -1614,6 +1736,7 @@ def train_ppo(
                     )
                     for k in CROSS_ENTITY_VALUE_HORIZONS
                 },
+                **game_metrics,
             }
 
             # --- Per-iter ASCII stdout summary line ---
@@ -1640,6 +1763,8 @@ def train_ppo(
                 _fv(explained_variance_h.get(k), ".2f")
                 for k in CROSS_ENTITY_VALUE_HORIZONS
             )
+            # --- Per-iter categorized stdout block ---
+            # Single legacy line kept first for grep-friendliness; detail blocks follow.
             print(
                 f"[ppo it={it+1:4d}/{run_iterations:<4d} "
                 f"phase={phase:<12s} "
@@ -1659,6 +1784,62 @@ def train_ppo(
                 f"eps_short={_fv(episodes_short_pct, '.1f')}% "
                 f"dt={iter_time:5.0f}s "
                 f"ETA={_eta_str(eta_seconds_remaining)}]",
+                flush=True,
+            )
+            print(
+                "  [game]   "
+                f"wld={wins}/{losses}/{draws} "
+                f"wr={_fv(_last_eval_wr, '.2f')} "
+                f"fleets_launched={_fv(game_metrics.get('mean_fleets_launched'), '.1f')} "
+                f"in_flight_end={_fv(game_metrics.get('mean_fleets_in_flight_at_end'), '.1f')} "
+                f"explo_launches={_fv(game_metrics.get('mean_fleets_due_to_exploration'), '.1f')} "
+                f"captured={_fv(game_metrics.get('mean_captures'), '.1f')} "
+                f"lost={_fv(game_metrics.get('mean_lost'), '.1f')} "
+                f"planets_end={_fv(game_metrics.get('mean_final_planets_owned'), '.2f')} "
+                f"ships_end={_fv(game_metrics.get('mean_final_ships'), '.0f')} "
+                f"len={_fv(game_metrics.get('mean_episode_length'), '.0f')} "
+                f"eps_short={_fv(episodes_short_pct, '.1f')}%",
+                flush=True,
+            )
+            print(
+                "  [reward] "
+                f"rew={_fv(mean_r, '+.3f')} "
+                f"shape_r={_fv(shaped_reward_mean, '+.4f')} "
+                f"shp_coef={_fv(shaping_coef_eff, '.2f')} "
+                f"phi={_fv(phi_start_mean, '+.3f')}->{_fv(phi_end_mean, '+.3f')} "
+                f"ret_std={_fv(return_norm.std, '.3f')}",
+                flush=True,
+            )
+            print(
+                "  [policy] "
+                f"kl={_fv(stats['approx_kl'], '.4f')}{'*' if stats['early_stopped'] else ''} "
+                f"|log_ratio|={_fv(log_ratio_abs_mean, '.2e')} "
+                f"clip={_fv(stats['clip_frac'], '.3f')} "
+                f"ent={_fv(stats['entropy'], '.2f')} "
+                f"pi_loss={_fv(stats['policy_loss'], '+.3f')} "
+                f"bc_kl={_fv(stats['bc_kl_mean'], '.3f')}",
+                flush=True,
+            )
+            print(
+                "  [value]  "
+                f"ev={_fv(explained_variance, '.2f')} "
+                f"evh={_evh_str} "
+                f"v_loss={_fv(stats['value_loss'], '.3f')}",
+                flush=True,
+            )
+            print(
+                "  [frac]   "
+                f"log_std={_fv(frac_log_std_val, '.3f')} "
+                f"sigma_eff={_fv(min(max(frac_log_std_exp, FRAC_STD_MIN), FRAC_STD_MAX), '.3f')} "
+                f"sample_mean={_fv(frac_sample_mean, '.3f')} "
+                f"sample_std={_fv(frac_sample_std, '.3f')}",
+                flush=True,
+            )
+            print(
+                "  [time]   "
+                f"dt={iter_time:.0f}s elapsed={total_elapsed:.0f}s ETA={_eta_str(eta_seconds_remaining)} "
+                f"samples={int(batch['old_log_prob'].size(0))} "
+                f"opp_mix={dict(ep_types)}",
                 flush=True,
             )
 
@@ -1703,6 +1884,7 @@ def train_ppo(
                 "episodes_short_pct": episodes_short_pct,
                 "shaping_coef_eff": round(shaping_coef_eff, 6),
                 "eta_seconds_remaining": round(eta_seconds_remaining, 1),
+                **game_metrics,
             }
             for k in CROSS_ENTITY_VALUE_HORIZONS:
                 row[f"value_h{k}_loss"] = round(stats[f"value_h{k}_loss"], 6)
@@ -1854,7 +2036,7 @@ def _ratio_sanity_check(
     torch_device = torch.device(device)
     stack = load_for_inference(ckpt_path or _default_action_ckpt(), device=torch_device)
     learner = TransformerRolloutCollector(stack, device=device, record=True)
-    traj, reward, _env, _all_rewards = _play_episode(
+    traj, reward, _env, _all_rewards, _telem = _play_episode(
         learner, random_valid_agent, learner_slot=0, seed=17,
     )
     packed = _pack_trajectory(
