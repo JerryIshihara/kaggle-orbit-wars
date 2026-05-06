@@ -74,26 +74,18 @@ class Launch:
 
       "capture"               — will capture target (success)
       "reinforcement"         — first hit IS intended target, target is ours
-      "intercept"             — first hit is a *different* planet but the
-                                launch still lands cleanly (friendly or
-                                weak garrison). ``ok=True`` because ships
-                                aren't lost, but the planned target is NOT
-                                reached. ``actual_hit_id`` carries the
-                                planet that was actually hit. Sniper-style
-                                callers should reject this.
       "no_surplus"            — sized fleet exceeds available surplus
       "sun"                   — trajectory crosses the sun (within
                                 ``SUN_RADIUS + SUN_MARGIN`` of the center)
       "boundary"              — trajectory exits the 100×100 board
       "no_collision"          — trajectory hits nothing within max distance
-      "wrong_planet_<id>_garrison_<g>"
-                              — first hit is a different planet with too much garrison
+      "wrong_planet_<id>"     — first hit is a different planet
       "insufficient_garrison_<g>_vs_ships_<n>"
                               — target garrison-at-arrival ≥ our fleet
       "comet_expired_at_arrival"
                               — intended target is a comet whose path
                                 exhausts before our fleet arrives
-      "target_unreachable"    — target path / motion could not be intercepted
+      "target_unreachable"    — target path / motion could not be aimed at
     """
 
     from_id: int
@@ -105,9 +97,8 @@ class Launch:
     reason: str
     # Planet id the trajectory's collision sweep actually hits first.
     # ``None`` for non-planet outcomes (sun, boundary, no_collision).
-    # Sniper-style callers compare this to ``target_id`` to reject
-    # incidental wrong-planet intercepts (the trajectory stops at a
-    # *different* planet before reaching the intended target).
+    # Successful launches must have ``actual_hit_id == target_id``. On
+    # wrong-planet failures this carries the first-hit planet id for debugging.
     actual_hit_id: int | None = None
 
 
@@ -281,17 +272,16 @@ def find_first_collision(
 
     Mirrors the env's fleet-movement order for static snapshots:
       1. move the fleet by one turn of speed
-      2. check planets in observation order
-      3. check boundary (env-exact: |coord| > board)
-      4. check sun crossing (with SUN_MARGIN as a safety buffer — the
+      2. check boundary (env-exact: |coord| > board)
+      3. check sun crossing (with SUN_MARGIN as a safety buffer — the
          env's hard cut is ``SUN_RADIUS`` but we drop launches that
          would pass within ``SUN_RADIUS + SUN_MARGIN`` of the sun
          center, mirroring :func:`crosses_sun`)
+      4. check planets in observation order
 
-    The env checks planet collisions before boundary/sun and breaks on the
-    first planet in list order. Matching that order matters for fast fleets
-    whose one-turn segment both intersects a planet and crosses the sun or
-    board edge.
+    Matching boundary/sun before planets matters for fast fleets whose
+    one-turn segment intersects a planet but whose endpoint already left the
+    board or crossed the sun. The env removes those fleets before combat.
     """
     speed = fleet_speed(fleet_ships)
     if speed <= 0:
@@ -310,21 +300,6 @@ def find_first_collision(
         old_y = fleet_y
         fleet_x += speed * ch
         fleet_y += speed * sh
-
-        for p in planets:
-            pid = p[P_ID]
-            px, py, pr = p[P_X], p[P_Y], p[P_RADIUS]
-            if pid == src_id and math.hypot(old_x - src_x, old_y - src_y) < src_radius + 1.0:
-                continue
-            t = _stationary_disc_segment_entry(old_x, old_y, fleet_x, fleet_y, px, py, pr)
-            if t is None:
-                continue
-            return {
-                "kind": "planet",
-                "planet": p,
-                "step": step,
-                "eta": (step - 1) + t,
-            }
 
         if (
             fleet_x < BOARD_MIN
@@ -346,6 +321,21 @@ def find_first_collision(
                 "x": old_x + t_sun * (fleet_x - old_x),
                 "y": old_y + t_sun * (fleet_y - old_y),
                 "eta": (step - 1) + t_sun,
+            }
+
+        for p in planets:
+            pid = p[P_ID]
+            px, py, pr = p[P_X], p[P_Y], p[P_RADIUS]
+            if pid == src_id and math.hypot(old_x - src_x, old_y - src_y) < src_radius + 1.0:
+                continue
+            t = _stationary_disc_segment_entry(old_x, old_y, fleet_x, fleet_y, px, py, pr)
+            if t is None:
+                continue
+            return {
+                "kind": "planet",
+                "planet": p,
+                "step": step,
+                "eta": (step - 1) + t,
             }
 
     return None
@@ -541,19 +531,11 @@ def validate_launch(
     # annihilated mid-flight by an unforeseen orbital crawl).
     eta_for_growth = max(eta, eta_override) if eta_override is not None else eta
     if pid != intended_target_id:
-        # Hit a planet we didn't aim at. If it's mine, that's fine (reinforcement-ish).
-        # If it's enemy/neutral with garrison >= fleet, we'd waste ships.
-        if powner != player:
-            if fleets is not None:
-                garrison = predict_garrison_at_arrival(p, eta_for_growth, player, fleets)
-            else:
-                garrison = pships if powner == -1 else pships + int(pprod * eta_for_growth)
-            if garrison >= fleet_ships:
-                return (
-                    False,
-                    f"hits_wrong_planet_{pid}_garrison_{garrison}",
-                )
-        return (True, "ok")
+        # Source-to-target must be exact. Any wrong first-hit planet — even
+        # one of our own (would-be reinforcement) or a soft enemy/neutral
+        # we'd capture as a bonus — is rejected. Lets the agent re-pick a
+        # target whose trajectory actually clears intervening bodies.
+        return (False, f"wrong_planet_{pid}")
     # Hit intended target.
     if powner == player:
         return (True, "ok")
@@ -744,10 +726,9 @@ def _find_first_collision_dynamic(
 
     The env does not move planets simultaneously with fleets. Each turn:
 
-      1. Fleet moves and checks its segment against current planet positions
-         in observation order.
-      2. If no planet was hit, the fleet endpoint is checked for boundary,
-         then the segment is checked against the sun.
+      1. Fleet moves and checks endpoint boundary, then sun crossing.
+      2. Surviving fleets check their segment against current planet
+         positions in observation order.
       3. Surviving fleets can then be swept by orbiting planets / comets as
          those bodies move.
 
@@ -796,28 +777,6 @@ def _find_first_collision_dynamic(
         fleet_x += speed * ch
         fleet_y += speed * sh
 
-        # Fleet movement phase: current planet positions are checked before
-        # boundary/sun, and the env breaks on the first planet in list order.
-        for p in planets:
-            pid = int(p[P_ID])
-            if pid in dead_comets or pid not in planet_pos:
-                continue
-            old_pos = planet_pos[pid]
-            if pid == src_id and math.hypot(old_fx - src_x, old_fy - src_y) < src_radius + 1.0:
-                continue
-            t = _stationary_disc_segment_entry(
-                old_fx, old_fy, fleet_x, fleet_y,
-                old_pos[0], old_pos[1],
-                float(p[P_RADIUS]),
-            )
-            if t is not None:
-                return {
-                    "kind": "planet",
-                    "planet": p,
-                    "step": step,
-                    "eta": (step - 1) + t,
-                }
-
         if (
             fleet_x < BOARD_MIN
             or fleet_x > BOARD_MAX
@@ -839,6 +798,28 @@ def _find_first_collision_dynamic(
                 "y": old_fy + t_sun * (fleet_y - old_fy),
                 "eta": (step - 1) + t_sun,
             }
+
+        # Fleet movement phase: after boundary/sun, current planet positions
+        # are checked in list order and the env breaks on the first hit.
+        for p in planets:
+            pid = int(p[P_ID])
+            if pid in dead_comets or pid not in planet_pos:
+                continue
+            old_pos = planet_pos[pid]
+            if pid == src_id and math.hypot(old_fx - src_x, old_fy - src_y) < src_radius + 1.0:
+                continue
+            t = _stationary_disc_segment_entry(
+                old_fx, old_fy, fleet_x, fleet_y,
+                old_pos[0], old_pos[1],
+                float(p[P_RADIUS]),
+            )
+            if t is not None:
+                return {
+                    "kind": "planet",
+                    "planet": p,
+                    "step": step,
+                    "eta": (step - 1) + t,
+                }
 
         # Planet movement phase: surviving fleets can be swept by a moving
         # planet/comet if the fleet endpoint lies inside that movement segment.
@@ -1051,28 +1032,9 @@ def _finalize_launch(
                 actual_hit_id=hit_pid,
             )
     if hit_pid != tid:
-        h_owner = int(hit_planet[P_OWNER])
-        if h_owner != player:
-            h_garrison = predict_garrison_at_arrival(hit_planet, hit_eta, player, fleets)
-            if h_garrison >= ships:
-                return Launch(
-                    src_id,
-                    tid,
-                    angle,
-                    eta,
-                    ships,
-                    ok=False,
-                    reason=f"wrong_planet_{hit_pid}_garrison_{h_garrison}",
-                    actual_hit_id=hit_pid,
-                )
-        # The trajectory's first hit isn't the intended target — distinguish
-        # this from a real reinforcement so callers (e.g. sniper) can
-        # reject incidental wrong-planet intercepts. ``ok`` stays True
-        # because the launch still does *something* useful (lands on a
-        # friendly / weak planet); it's just not the planned outcome.
         return Launch(
             src_id, tid, angle, eta, ships,
-            ok=True, reason="intercept", actual_hit_id=hit_pid,
+            ok=False, reason=f"wrong_planet_{hit_pid}", actual_hit_id=hit_pid,
         )
 
     if towner == player:
@@ -1397,6 +1359,157 @@ def plan_launch(
     )
 
 
+# ---------- Per-motion-class public shooters ----------
+# Pure mechanics: each ``shoot_*`` produces a launch tuple
+# ``(angle, eta, num_ships)`` for the requested motion class. They never
+# refuse a call — sun crossings, wrong-planet intercepts, boundary
+# escapes, and combat outcomes are STRATEGY decisions left entirely to
+# the agent. After ``shoot_*`` the agent typically runs ``find_collision``
+# (and optionally ``predict_garrison_at_arrival``) and decides whether
+# to commit the move.
+def shoot_static(
+    from_planet: tuple,
+    to_planet: tuple,
+    num_ships: int,
+    obs: Any | None = None,  # noqa: ARG001 — kept for API symmetry
+) -> tuple[float, float, int]:
+    """Aim ``num_ships`` at a stationary target. Returns
+    ``(angle, eta, num_ships)``; ``eta = distance / fleet_speed``.
+
+    Pure geometry — no obstacle, motion-kind, or garrison checks. Agents
+    are responsible for verifying the trajectory clears the sun and
+    other planets via :func:`find_collision`.
+    """
+    sx = float(from_planet[P_X])
+    sy = float(from_planet[P_Y])
+    tx = float(to_planet[P_X])
+    ty = float(to_planet[P_Y])
+    px, py, eta = _lead_aim_static(sx, sy, tx, ty, int(num_ships))
+    angle = math.atan2(py - sy, px - sx)
+    return angle, eta, int(num_ships)
+
+
+def shoot_orbit(
+    from_planet: tuple,
+    to_planet: tuple,
+    num_ships: int,
+    obs: Any,
+    *,
+    av_sign: int | None = None,
+) -> tuple[float, float, int]:
+    """Lead-aim ``num_ships`` at an orbiting target. Returns
+    ``(angle, eta, num_ships)`` where ``angle`` points at the predicted
+    intercept and ``eta`` is the converged turns-to-arrival.
+
+    Reads ``angular_velocity`` and ``initial_planets`` from ``obs`` to
+    compute the signed orbital rate. Always emits a launch, even if the
+    target is actually static or a comet — the caller chose the motion
+    class. Agents validate the trajectory via :func:`find_collision`.
+    """
+    get = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
+    planets = list(get("planets") or [])
+    initial_planets = list(get("initial_planets") or [])
+    angular_velocity = abs(float(get("angular_velocity") or 0.0))
+    current_step = int(get("step", 0) or 0)
+    if av_sign is None:
+        av_sign = _infer_rotation_sign_raw(planets, initial_planets)
+    av_signed = angular_velocity * (1 if av_sign >= 0 else -1)
+
+    sx = float(from_planet[P_X])
+    sy = float(from_planet[P_Y])
+    tx = float(to_planet[P_X])
+    ty = float(to_planet[P_Y])
+    px, py, eta = _lead_aim_orbital(
+        sx, sy, tx, ty, int(num_ships), av_signed,
+        current_step=current_step,
+    )
+    angle = math.atan2(py - sy, px - sx)
+    return angle, eta, int(num_ships)
+
+
+def shoot_comet(
+    from_planet: tuple,
+    to_planet: tuple,
+    num_ships: int,
+    obs: Any,
+) -> tuple[float, float, int]:
+    """Lead-aim ``num_ships`` at a comet target. Returns
+    ``(angle, eta, num_ships)``.
+
+    Walks the comet's pre-computed path (read from ``obs["comets"]``)
+    to find the predicted intercept point. If the path is too short to
+    converge the agent's iterative ETA, falls back to the comet's
+    current obs position so the function still emits a valid aim — the
+    caller's :func:`find_collision` will reject any unreachable launch.
+    """
+    get = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
+    comet_lookup = _build_comet_lookup(list(get("comets") or []))
+
+    sx = float(from_planet[P_X])
+    sy = float(from_planet[P_Y])
+    tx = float(to_planet[P_X])
+    ty = float(to_planet[P_Y])
+
+    result = _lead_aim_comet(sx, sy, to_planet, int(num_ships), comet_lookup)
+    if result is None:
+        # Path too short or zero-speed fleet — fall back to current
+        # target position so we still emit a launch tuple.
+        speed = fleet_speed(int(num_ships))
+        eta = math.hypot(tx - sx, ty - sy) / max(speed, 1e-6)
+        angle = math.atan2(ty - sy, tx - sx)
+        return angle, eta, int(num_ships)
+    px, py, eta = result
+    angle = math.atan2(py - sy, px - sx)
+    return angle, eta, int(num_ships)
+
+
+def find_collision(
+    from_planet: tuple,
+    angle: float,
+    num_ships: int,
+    obs: Any,
+) -> dict | None:
+    """First entity a fleet would hit, using the env's exact movement
+    sweep. Agents use this after ``shoot_*`` to decide whether the
+    trajectory is safe to commit.
+
+    Returns ``None`` if nothing is hit within the trace, otherwise a
+    dict with ``"kind"`` ∈ ``{"planet", "sun", "boundary"}``. Planet
+    hits include the matching env-tuple under ``"planet"`` and an
+    ``"eta"`` key for the collision time.
+
+    Dispatches to the static-only or motion-aware sweep based on
+    whether the obs has a non-zero ``angular_velocity`` or any active
+    comets.
+    """
+    get = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
+    planets = list(get("planets") or [])
+    initial_planets = list(get("initial_planets") or [])
+    angular_velocity = abs(float(get("angular_velocity") or 0.0))
+    current_step = int(get("step", 0) or 0)
+    comet_lookup = _build_comet_lookup(list(get("comets") or []))
+
+    sx = float(from_planet[P_X])
+    sy = float(from_planet[P_Y])
+    sr = float(from_planet[P_RADIUS])
+    src_id = int(from_planet[P_ID])
+
+    if angular_velocity > 0.0 or comet_lookup:
+        av_sign = _infer_rotation_sign_raw(planets, initial_planets)
+        return _find_first_collision_dynamic(
+            sx, sy, sr, src_id,
+            float(angle), int(num_ships), planets,
+            angular_velocity=angular_velocity,
+            av_signed=angular_velocity * av_sign,
+            comet_lookup=comet_lookup,
+            current_step=current_step,
+        )
+    return find_first_collision(
+        sx, sy, sr, src_id,
+        float(angle), int(num_ships), planets,
+    )
+
+
 # ---------- Trajectory extrapolation ----------
 def extrapolate_trajectory(
     planet_id: int,
@@ -1542,14 +1655,8 @@ def sniper(
     if not launch.ok:
         return 0, 0.0, 0.0
 
-    # Sniper precision: the trajectory's actual first-hit planet MUST
-    # equal the intended target. ``plan_launch`` exposes the swept-disc
-    # collision result via ``actual_hit_id``, so we don't have to parse
-    # reason strings or special-case the friendly-target branch (the
-    # previous version only rejected wrong-planet intercepts when the
-    # intended target was an enemy, missing the case where the intended
-    # target itself was friendly and the trajectory landed on a
-    # *different* friendly planet first).
+    # Defensive exact-target check: plan_launch should only return ok=True
+    # when the trajectory's first-hit planet is the intended target.
     intended_pid = int(to_planet[P_ID])
     if launch.actual_hit_id is None or launch.actual_hit_id != intended_pid:
         return 0, 0.0, 0.0
