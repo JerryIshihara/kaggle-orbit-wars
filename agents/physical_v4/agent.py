@@ -233,6 +233,7 @@ def candidates_for_source(
     raw_fleets: list,
     raw_by_id: dict,
     player: int,
+    current_step: int,
     *,
     comet_planet_ids: set[int] | None = None,
     comets: list | None = None,
@@ -267,6 +268,7 @@ def candidates_for_source(
                 av_signed=av_signed,
                 comet_planet_ids=comet_planet_ids,
                 comets=comets,
+                current_step=current_step,
             )
             if not ok:
                 continue
@@ -292,6 +294,7 @@ def find_coalition(
     raw_fleets: list,
     raw_by_id: dict,
     player: int,
+    current_step: int,
     *,
     comet_planet_ids: set[int] | None = None,
     comets: list | None = None,
@@ -359,6 +362,7 @@ def find_coalition(
                     av_signed=av_signed,
                     comet_planet_ids=comet_planet_ids,
                     comets=comets,
+                    current_step=current_step,
                 )
                 if ok:
                     validated.append((src, ships, angle, eta))
@@ -438,6 +442,7 @@ def physical_v4_agent(obs):
             raw_fleets,
             raw_by_id,
             player,
+            step,
             comet_planet_ids=comet_planet_ids,
             comets=comets,
         )
@@ -466,6 +471,7 @@ def physical_v4_agent(obs):
             raw_fleets,
             raw_by_id,
             player,
+            step,
             comet_planet_ids=comet_planet_ids,
             comets=comets,
         )

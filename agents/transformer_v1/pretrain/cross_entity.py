@@ -267,6 +267,12 @@ class CrossEntitySnapshotDataset(EntitySnapshotDataset):
             h: torch.tensor(0.0, dtype=torch.float32)
             for h in CROSS_ENTITY_VALUE_HORIZONS
         }
+        # Neutral (player-perspective-independent) global labels — default to
+        # zeros for the no-rows case. These are scalars per snapshot.
+        total_ships_log = 0.0
+        ship_dist_entropy = 0.0
+        n_neutral_planets = 0.0
+        game_phase = 0
         if rows:
             head = rows[0]
             winner = int(head["winner_seat"])
@@ -289,6 +295,12 @@ class CrossEntitySnapshotDataset(EntitySnapshotDataset):
                     float(head[f"valid_global_t_plus_{h}"]),
                     dtype=torch.float32,
                 )
+            # New neutral global labels — guard with .get() so a freshly-cloned
+            # but not-yet-regenerated CSV (without these columns) still loads.
+            total_ships_log = float(head.get("total_ships_in_play_log", 0.0) or 0.0)
+            ship_dist_entropy = float(head.get("ship_distribution_entropy", 0.0) or 0.0)
+            n_neutral_planets = float(head.get("n_neutral_planets", 0.0) or 0.0)
+            game_phase = int(float(head.get("game_phase", 0.0) or 0.0))
 
         # Vectorize per-planet cross-entity label scatter (same trick as
         # EntitySnapshotDataset._build_snapshot — gather lists first,
@@ -363,6 +375,11 @@ class CrossEntitySnapshotDataset(EntitySnapshotDataset):
             snapshot[f"can_friendly_reinforce_within_{h}"] = tactical[h]["can_friendly_reinforce_within"]
             snapshot[f"enemy_can_capture_within_{h}"] = tactical[h]["enemy_can_capture_within"]
             snapshot[f"best_local_support_margin_within_{h}_log"] = tactical[h]["best_local_support_margin_within_log"]
+        # Neutral (player-perspective-independent) global labels.
+        snapshot["total_ships_in_play_log"] = torch.tensor(total_ships_log, dtype=torch.float32)
+        snapshot["ship_distribution_entropy"] = torch.tensor(ship_dist_entropy, dtype=torch.float32)
+        snapshot["n_neutral_planets"] = torch.tensor(n_neutral_planets, dtype=torch.float32)
+        snapshot["game_phase"] = torch.tensor(game_phase, dtype=torch.long)
         return snapshot
 
 

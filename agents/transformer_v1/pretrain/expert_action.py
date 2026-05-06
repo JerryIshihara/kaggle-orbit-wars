@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -54,13 +55,19 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Bernoulli, Categorical, Normal
 from torch.utils.data import DataLoader
 
 from ..aggregator import CrossEntityAttention
 from ..encoder.entity_encoder import PlanetEntityEncoder
 from ..encoder.fleet_encoder import FleetEncoder
 from ..encoder.planet_encoder import PlanetEncoder
-from ..featurizer import ACTION_IGNORE_INDEX
+from ..featurizer import (
+    ACTION_IGNORE_INDEX,
+    CROSS_ENTITY_VALUE_HORIZONS,
+    ENTITY_N_OWNER_CLASSES,
+)
+from ..featurizer.entity_featurizer import GAME_PHASE_N_CLASSES
 from ..paths import (
     ACTION_DATASET_DIR,
     ACTION_RUNS_DIR,
@@ -81,6 +88,16 @@ from .cross_entity import (
     _load_frozen_encoders,
     _resolve_attr,
 )
+
+# ---------------------------------------------------------------------------
+# Truncation constant for lower-truncated Normal frac sampling
+# ---------------------------------------------------------------------------
+# frac_z is sampled in logit-space.  The env clamps small-frac actions to
+# min_launch ships, which effectively creates a lower bound on the logit.
+# We use a conservative constant floor:  logit(0.05) ≈ -2.94, corresponding
+# to ~5% of source ships.  This avoids per-state plumbing (option b).
+# Single source of truth: imported by runner.py and ppo.py.
+FRAC_Z_MIN: float = -2.94  # logit(0.05) — frac samples truncated to >= 5%
 
 
 # ---------- Dataset ----------
@@ -236,6 +253,21 @@ class ActionDecoder(nn.Module):
         self.head_source = nn.Linear(d_model, 1)
         self.head_target = nn.Linear(d_model, 1)
         self.head_acted = nn.Linear(d_model, 1)
+        # PPO heads
+        self.head_value  = nn.Linear(2 * d_model, 1)   # reads [CLS, mean_pool(planets)]
+        self.head_frac   = nn.Linear(d_model, 1)       # per-planet sigmoid → ship frac
+        # Multi-horizon auxiliary value heads — predict n-step returns at
+        # k ∈ CROSS_ENTITY_VALUE_HORIZONS. Trained against retrospective
+        # targets in PPO; consumed only for auxiliary CLS regularisation.
+        self.head_value_h = nn.ModuleDict({
+            f"h{k}": nn.Linear(2 * d_model, 1)
+            for k in CROSS_ENTITY_VALUE_HORIZONS
+        })
+        for h in (self.head_value, self.head_frac, *self.head_value_h.values()):
+            nn.init.zeros_(h.bias)
+            nn.init.normal_(h.weight, std=1e-3)
+        self.frac_log_std = nn.Parameter(torch.tensor(math.log(0.2)))
+        self.value_bn = nn.LayerNorm(1)
 
     def forward(
         self,
@@ -246,13 +278,247 @@ class ActionDecoder(nn.Module):
         src = self.head_source(ctx_now).squeeze(-1)            # (B, P)
         tgt = self.head_target(ctx_now).squeeze(-1)            # (B, P)
         neg_inf = torch.finfo(src.dtype).min
-        src = src.masked_fill(~mask_now, neg_inf)
-        tgt = tgt.masked_fill(~mask_now, neg_inf)
-        return {
+        # Guard: if a row has *all* planets masked (no real planets), fall back to
+        # logit 0 at index 0 so downstream Categorical doesn't see all-(-inf) → NaN.
+        any_valid = mask_now.any(dim=-1, keepdim=True)               # (B, 1)
+        src = torch.where(any_valid, src.masked_fill(~mask_now, neg_inf),
+                          src.masked_fill(~mask_now, 0.0))
+        tgt = torch.where(any_valid, tgt.masked_fill(~mask_now, neg_inf),
+                          tgt.masked_fill(~mask_now, 0.0))
+        # For the batch-pool: if all-masked, falling back to index 0's data is
+        # harmless — the mask validity is checked upstream anyway.
+        mean_pool = (
+            ctx_now.masked_fill(~mask_now.unsqueeze(-1), 0).sum(dim=1)
+            / mask_now.sum(dim=1, keepdim=True).clamp(min=1)
+        )
+        value_input = torch.cat([glob, mean_pool], dim=-1)
+        value = self.head_value(value_input).squeeze(-1)
+        frac_logits = self.head_frac(ctx_now).squeeze(-1)      # (B, P)
+        out = {
             "source_planet_logits": src,
             "target_planet_logits": tgt,
             "expert_acted_logit": self.head_acted(glob).squeeze(-1),
+            "value": value,
+            "frac_logits": frac_logits,
         }
+        for k in CROSS_ENTITY_VALUE_HORIZONS:
+            out[f"value_h{k}"] = self.head_value_h[f"h{k}"](value_input).squeeze(-1)
+        return out
+
+
+class ContextualActionDecoder(nn.Module):
+    """Per-planet action heads conditioned on the CLS global token.
+
+    Drop-in replacement for :class:`ActionDecoder`. Each per-planet head
+    reads ``[glob || ctx_planet_i]`` (shape ``2 * d_model``) instead of
+    just ``ctx_planet_i``, so source / target / frac decisions can use
+    the game-state summary the CLS encodes (winner, is_ahead, game_phase,
+    ship balance, etc.).
+
+    Output dict keys are identical to :class:`ActionDecoder` so
+    :func:`compute_loss`, :func:`compute_action_log_prob`,
+    :func:`evaluate`, ``runner.py`` and ``ppo.py`` all work unchanged.
+    """
+
+    def __init__(self, d_model: int = 64, hidden: int | None = None):
+        super().__init__()
+        in_dim = 2 * d_model
+        h = hidden if hidden is not None else d_model
+
+        def _mk_head() -> nn.Sequential:
+            # 2-layer MLP — non-linear mix of glob (game-state) and
+            # ctx (planet-state) before the per-planet 1-D logit.
+            return nn.Sequential(
+                nn.Linear(in_dim, h),
+                nn.GELU(),
+                nn.Linear(h, 1),
+            )
+
+        self.head_source = _mk_head()
+        self.head_target = _mk_head()
+        self.head_frac   = _mk_head()
+        # CLS-only heads — same as ActionDecoder so PPO machinery is identical.
+        self.head_acted = nn.Linear(d_model, 1)
+        self.head_value = nn.Linear(2 * d_model, 1)
+        # Multi-horizon auxiliary value heads. See ActionDecoder for the
+        # rationale; output dict keys must stay parity with ActionDecoder
+        # so PPO/runner code does not have to branch on decoder class.
+        self.head_value_h = nn.ModuleDict({
+            f"h{k}": nn.Linear(2 * d_model, 1)
+            for k in CROSS_ENTITY_VALUE_HORIZONS
+        })
+        # Match ActionDecoder's small-init for value/frac so PPO bring-up
+        # doesn't diverge.
+        nn.init.zeros_(self.head_value.bias)
+        nn.init.normal_(self.head_value.weight, std=1e-3)
+        nn.init.zeros_(self.head_frac[-1].bias)
+        nn.init.normal_(self.head_frac[-1].weight, std=1e-3)
+        for h in self.head_value_h.values():
+            nn.init.zeros_(h.bias)
+            nn.init.normal_(h.weight, std=1e-3)
+        self.frac_log_std = nn.Parameter(torch.tensor(math.log(0.2)))
+        self.value_bn = nn.LayerNorm(1)
+
+    def forward(
+        self,
+        ctx_now: torch.Tensor,    # (B, P, d_model)
+        mask_now: torch.Tensor,    # (B, P) bool — True = real planet
+        glob: torch.Tensor,        # (B, d_model)
+    ) -> dict[str, torch.Tensor]:
+        B, P, d = ctx_now.shape
+        # Broadcast glob across the planet dim, then concat per-planet.
+        glob_b = glob.unsqueeze(1).expand(B, P, d)             # (B, P, d)
+        joint  = torch.cat([glob_b, ctx_now], dim=-1)          # (B, P, 2d)
+
+        src = self.head_source(joint).squeeze(-1)              # (B, P)
+        tgt = self.head_target(joint).squeeze(-1)              # (B, P)
+        frac_logits = self.head_frac(joint).squeeze(-1)        # (B, P)
+
+        # Same -inf masking + all-masked guard as ActionDecoder so
+        # downstream Categorical never sees all-(-inf) → NaN.
+        neg_inf = torch.finfo(src.dtype).min
+        any_valid = mask_now.any(dim=-1, keepdim=True)
+        src = torch.where(any_valid, src.masked_fill(~mask_now, neg_inf),
+                          src.masked_fill(~mask_now, 0.0))
+        tgt = torch.where(any_valid, tgt.masked_fill(~mask_now, neg_inf),
+                          tgt.masked_fill(~mask_now, 0.0))
+
+        # Same value head as ActionDecoder: [glob, mean_pool(ctx)].
+        mean_pool = (
+            ctx_now.masked_fill(~mask_now.unsqueeze(-1), 0).sum(dim=1)
+            / mask_now.sum(dim=1, keepdim=True).clamp(min=1)
+        )
+        value_input = torch.cat([glob, mean_pool], dim=-1)
+        value = self.head_value(value_input).squeeze(-1)
+
+        out = {
+            "source_planet_logits": src,
+            "target_planet_logits": tgt,
+            "expert_acted_logit": self.head_acted(glob).squeeze(-1),
+            "value": value,
+            "frac_logits": frac_logits,
+        }
+        for k in CROSS_ENTITY_VALUE_HORIZONS:
+            out[f"value_h{k}"] = self.head_value_h[f"h{k}"](value_input).squeeze(-1)
+        return out
+
+
+def _build_action_decoder(d_model: int, *, contextual: bool) -> nn.Module:
+    """Factory returning the requested action decoder flavor."""
+    if contextual:
+        return ContextualActionDecoder(d_model=d_model)
+    return ActionDecoder(d_model=d_model)
+
+
+class GlobalStateDecoder(nn.Module):
+    """Auxiliary heads on the CLS global_token that maintain game-state
+    supervision during action fine-tuning.
+
+    All heads are direct ``nn.Linear`` (matching the existing per-head
+    pattern). Outputs are prefixed ``"gd_"`` so they cannot collide with
+    :class:`ActionDecoder` keys.
+
+    Labels used (all already present in
+    :class:`ActionSnapshotDataset` via the cross-entity CSV):
+
+    * ``winner_seat``              — 4-way CE (who wins)
+    * ``score_advantage_at_end_log`` — Huber regression
+    * ``turns_until_episode_end``  — MSE regression (sigmoid-bounded)
+    * ``is_ahead_t_plus_{k}``      — binary BCE per horizon, validity-masked
+    * ``leader_seat_t_plus_{k}``   — 4-way CE per horizon, validity-masked
+    """
+
+    def __init__(self, d_model: int = 64):
+        super().__init__()
+        # Player-relative heads (current set).
+        self.head_winner     = nn.Linear(d_model, ENTITY_N_OWNER_CLASSES)
+        self.head_score_end  = nn.Linear(d_model, 1)
+        self.head_turns_left = nn.Linear(d_model, 1)
+        self.head_is_ahead_k = nn.ModuleDict({
+            f"k{k}": nn.Linear(d_model, 1)
+            for k in CROSS_ENTITY_VALUE_HORIZONS
+        })
+        self.head_leader_k = nn.ModuleDict({
+            f"k{k}": nn.Linear(d_model, ENTITY_N_OWNER_CLASSES)
+            for k in CROSS_ENTITY_VALUE_HORIZONS
+        })
+        # Neutral (perspective-independent) heads — regularize the CLS
+        # toward a true game-state representation, not just "am I winning".
+        self.head_total_ships     = nn.Linear(d_model, 1)   # log(total ships)
+        self.head_ship_entropy    = nn.Linear(d_model, 1)   # H(ship dist) in nats
+        self.head_n_neutral       = nn.Linear(d_model, 1)   # neutral planet count
+        self.head_game_phase      = nn.Linear(d_model, GAME_PHASE_N_CLASSES)
+
+    def forward(self, glob: torch.Tensor) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {
+            "gd_winner_seat":  self.head_winner(glob),
+            "gd_score_end":    self.head_score_end(glob).squeeze(-1),
+            "gd_turns_left":   torch.sigmoid(self.head_turns_left(glob).squeeze(-1)),
+            "gd_total_ships_log":      self.head_total_ships(glob).squeeze(-1),
+            "gd_ship_entropy":         self.head_ship_entropy(glob).squeeze(-1),
+            "gd_n_neutral_planets":    self.head_n_neutral(glob).squeeze(-1),
+            "gd_game_phase":           self.head_game_phase(glob),
+        }
+        for k in CROSS_ENTITY_VALUE_HORIZONS:
+            out[f"gd_is_ahead_{k}"] = self.head_is_ahead_k[f"k{k}"](glob).squeeze(-1)
+            out[f"gd_leader_{k}"]   = self.head_leader_k[f"k{k}"](glob)
+        return out
+
+
+def compute_action_log_prob(
+    acted_logit: torch.Tensor,
+    src_logits: torch.Tensor,
+    tgt_logits: torch.Tensor,
+    frac_logits: torch.Tensor,
+    frac_log_std: torch.Tensor,
+    acted: int,
+    src_idx: int,
+    tgt_idx: int,
+    frac_z: float,
+) -> torch.Tensor:
+    """Joint log-prob of the factored action distribution.
+
+    `frac_z` is the pre-sigmoid Normal sample stored in the rollout
+    (see :class:`TransformerAgent._predict`). Used directly as the
+    Normal observation; no `logit()` reconstruction needed.
+    """
+    acted_dist = Bernoulli(logits=acted_logit.unsqueeze(0))
+    src_dist = Categorical(logits=src_logits.unsqueeze(0))
+    tgt_dist = Categorical(logits=tgt_logits.unsqueeze(0))
+    frac_std = torch.clamp(frac_log_std.exp(), min=0.30, max=1.0).to(
+        device=frac_logits.device,
+        dtype=frac_logits.dtype,
+    )
+    frac_dist = Normal(loc=frac_logits[src_idx].unsqueeze(0).unsqueeze(0), scale=frac_std)
+
+    log_prob = acted_dist.log_prob(
+        torch.tensor([float(acted)], device=acted_logit.device, dtype=acted_logit.dtype)
+    )
+    if acted:
+        log_prob = log_prob + src_dist.log_prob(
+            torch.tensor([src_idx], device=src_logits.device, dtype=torch.long)
+        )
+        log_prob = log_prob + tgt_dist.log_prob(
+            torch.tensor([tgt_idx], device=tgt_logits.device, dtype=torch.long)
+        )
+        # `frac_z` is the pre-sigmoid Normal sample. Use directly so
+        # the rollout-stored old log-prob matches the PPO-update
+        # recomputation when the model is unchanged.
+        frac_z_t = torch.tensor(
+            [frac_z], device=frac_logits.device, dtype=frac_logits.dtype,
+        )
+        # Lower-truncated Normal correction: subtract log(1 - cdf(z_min))
+        # so that log_p_frac matches the truncated distribution used at
+        # rollout time (see FRAC_Z_MIN and runner.py _predict).
+        z_min_t = torch.tensor(
+            [FRAC_Z_MIN], device=frac_logits.device, dtype=frac_logits.dtype,
+        )
+        p_lo = frac_dist.cdf(z_min_t.unsqueeze(0))
+        p_lo = torch.clamp(p_lo, max=1.0 - 1e-6)
+        log_norm = torch.log1p(-p_lo)  # log(1 - p_lo) computed safely
+        log_prob = log_prob + frac_dist.log_prob(frac_z_t.unsqueeze(0)) - log_norm
+
+    return log_prob.squeeze(0)
 
 
 class ActionTrainStack(nn.Module):
@@ -272,6 +538,7 @@ class ActionTrainStack(nn.Module):
         entity_encoder: PlanetEntityEncoder,
         cross_attention: CrossEntityAttention,
         action_decoder: ActionDecoder,
+        global_decoder: GlobalStateDecoder | None = None,
     ):
         super().__init__()
         self.fleet_encoder = fleet_encoder
@@ -279,6 +546,9 @@ class ActionTrainStack(nn.Module):
         self.entity_encoder = entity_encoder
         self.cross = cross_attention
         self.action_decoder = action_decoder
+        self.global_decoder = global_decoder or GlobalStateDecoder(
+            d_model=cross_attention.d_model,
+        )
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         entity_tokens, entity_mask = _entity_tokens_per_step(
@@ -293,13 +563,110 @@ class ActionTrainStack(nn.Module):
             mask_now = entity_mask[:, -1]                         # (B, P)
         else:
             mask_now = entity_mask
-        return self.action_decoder(ctx_now, mask_now, glob)
+        action_out = self.action_decoder(ctx_now, mask_now, glob)
+        global_out = self.global_decoder(glob)
+        return {**action_out, **global_out}
 
 
 # ---------- Loss ----------
+def compute_global_loss(
+    preds: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    aux_coef: float = 0.2,
+) -> tuple[torch.Tensor, dict[str, tuple[float, int]]]:
+    """Auxiliary losses for :class:`GlobalStateDecoder` heads.
+
+    Mirrors the loss structure of ``CrossEntityPretrainModel`` (tier-3
+    global labels) so the CLS token retains game-state supervision after
+    the action decoder is added on top.  Each term is multiplied by
+    ``aux_coef`` so global losses cannot dominate the action losses.
+
+    Returns ``(scaled_total, per_head)`` where ``per_head[name] =
+    (raw_loss_value, n_valid)`` — the raw (unscaled) value lets callers
+    report readable magnitudes regardless of ``aux_coef``.
+    """
+    n_horizons = max(len(CROSS_ENTITY_VALUE_HORIZONS), 1)
+    losses: dict[str, tuple[float, int]] = {}
+    raw_total: torch.Tensor | None = None
+
+    def add(name: str, term: torch.Tensor, n_valid: int) -> None:
+        nonlocal raw_total
+        raw_total = term if raw_total is None else raw_total + term
+        losses[name] = (float(term.detach()), n_valid)
+
+    B = preds["gd_winner_seat"].shape[0]
+
+    add(
+        "gd_winner_seat",
+        F.cross_entropy(preds["gd_winner_seat"], targets["winner_seat"]) * 0.3,
+        B,
+    )
+    add(
+        "gd_score_end",
+        F.huber_loss(preds["gd_score_end"], targets["score_advantage_at_end_log"], delta=1.0) * 0.1,
+        B,
+    )
+    add(
+        "gd_turns_left",
+        F.mse_loss(preds["gd_turns_left"], targets["turns_until_episode_end"]) * 0.1,
+        B,
+    )
+
+    # Neutral (perspective-independent) auxiliary losses. Smaller weights —
+    # these are regularizers, not the primary objective.
+    add(
+        "gd_total_ships_log",
+        F.huber_loss(preds["gd_total_ships_log"], targets["total_ships_in_play_log"], delta=1.0) * 0.1,
+        B,
+    )
+    add(
+        "gd_ship_entropy",
+        F.mse_loss(preds["gd_ship_entropy"], targets["ship_distribution_entropy"]) * 0.1,
+        B,
+    )
+    add(
+        "gd_n_neutral_planets",
+        F.huber_loss(preds["gd_n_neutral_planets"], targets["n_neutral_planets"], delta=1.0) * 0.05,
+        B,
+    )
+    add(
+        "gd_game_phase",
+        F.cross_entropy(preds["gd_game_phase"], targets["game_phase"]) * 0.15,
+        B,
+    )
+
+    per_k_weight = 0.2 / n_horizons
+    for k in CROSS_ENTITY_VALUE_HORIZONS:
+        valid = targets[f"valid_global_t_plus_{k}"]
+        n_valid = int(valid.sum())
+        if n_valid == 0:
+            losses[f"gd_is_ahead_{k}"] = (0.0, 0)
+            losses[f"gd_leader_{k}"] = (0.0, 0)
+            continue
+        bce = F.binary_cross_entropy_with_logits(
+            preds[f"gd_is_ahead_{k}"],
+            targets[f"is_ahead_t_plus_{k}"],
+            reduction="none",
+        )
+        add(f"gd_is_ahead_{k}", (bce * valid).sum() / valid.sum().clamp(min=1) * per_k_weight, n_valid)
+
+        ce = F.cross_entropy(
+            preds[f"gd_leader_{k}"],
+            targets[f"leader_seat_t_plus_{k}"],
+            reduction="none",
+        )
+        add(f"gd_leader_{k}", (ce * valid).sum() / valid.sum().clamp(min=1) * (per_k_weight * 0.5), n_valid)
+
+    assert raw_total is not None
+    return raw_total * aux_coef, losses
+
+
 def compute_loss(
     preds: dict[str, torch.Tensor],
     targets: dict[str, torch.Tensor],
+    aux_coef: float = 0.2,
+    decoder_only: bool = False,
+    action_only: bool = False,
 ) -> tuple[torch.Tensor, dict[str, tuple[float, int]]]:
     """Return ``(total_loss, per_head)`` where ``per_head[name] =
     (loss_value, n_valid)``. Caller weights training averages by
@@ -330,20 +697,37 @@ def compute_loss(
         total = term if total is None else total + term
         losses[name] = (float(term.detach()), int(n_valid))
 
-    src_term, src_n = masked_cross_entropy(
-        preds["source_planet_logits"], targets["source_planet_idx"],
-    )
-    add("source_planet", src_term, src_n)
+    if not decoder_only:
+        # Action heads — source/target/expert_acted. Skipped when training
+        # the global decoder in isolation.
+        src_term, src_n = masked_cross_entropy(
+            preds["source_planet_logits"], targets["source_planet_idx"],
+        )
+        add("source_planet", src_term, src_n)
 
-    tgt_term, tgt_n = masked_cross_entropy(
-        preds["target_planet_logits"], targets["target_planet_idx"],
-    )
-    add("target_planet", tgt_term, tgt_n)
+        tgt_term, tgt_n = masked_cross_entropy(
+            preds["target_planet_logits"], targets["target_planet_idx"],
+        )
+        add("target_planet", tgt_term, tgt_n)
 
-    bce = F.binary_cross_entropy_with_logits(
-        preds["expert_acted_logit"], targets["expert_acted"],
-    )
-    add("expert_acted", bce, int(targets["expert_acted"].numel()))
+        bce = F.binary_cross_entropy_with_logits(
+            preds["expert_acted_logit"], targets["expert_acted"],
+        )
+        add("expert_acted", bce, int(targets["expert_acted"].numel()))
+
+    # Global-state losses from GlobalStateDecoder.
+    # In decoder-only mode the global terms are the WHOLE objective, so
+    # use aux_coef=1.0 to avoid down-weighting the only signal we have.
+    # In action-only mode, skip the global losses entirely — the action
+    # heads are the whole objective.
+    if not action_only:
+        g_coef = 1.0 if decoder_only else aux_coef
+        g_total, g_per_head = compute_global_loss(preds, targets, g_coef)
+        if total is None:
+            total = g_total
+        else:
+            total = total + g_total
+        losses.update(g_per_head)
 
     assert total is not None
     return total, losses
@@ -401,15 +785,109 @@ def evaluate(
         tgt_bin = acted_target > 0.5
         correct_top1["expert_acted"] += int((pred_bin == tgt_bin).sum())
 
+        # Global decoder heads.
+        B = preds["gd_winner_seat"].shape[0]
+        sums["gd_winner_seat"] += float(
+            F.cross_entropy(preds["gd_winner_seat"], batch["winner_seat"], reduction="sum")
+        )
+        counts["gd_winner_seat"] += B
+        correct_top1["gd_winner_seat"] += int(
+            (preds["gd_winner_seat"].argmax(-1) == batch["winner_seat"]).sum()
+        )
+
+        # Neutral (perspective-independent) global heads.
+        sums["gd_total_ships_log"] += float(
+            F.huber_loss(
+                preds["gd_total_ships_log"], batch["total_ships_in_play_log"],
+                delta=1.0, reduction="sum",
+            )
+        )
+        counts["gd_total_ships_log"] += B
+        sums["gd_ship_entropy"] += float(
+            ((preds["gd_ship_entropy"] - batch["ship_distribution_entropy"]) ** 2).sum()
+        )
+        counts["gd_ship_entropy"] += B
+        sums["gd_n_neutral_planets"] += float(
+            F.huber_loss(
+                preds["gd_n_neutral_planets"], batch["n_neutral_planets"],
+                delta=1.0, reduction="sum",
+            )
+        )
+        counts["gd_n_neutral_planets"] += B
+        sums["gd_game_phase"] += float(
+            F.cross_entropy(preds["gd_game_phase"], batch["game_phase"], reduction="sum")
+        )
+        counts["gd_game_phase"] += B
+        correct_top1["gd_game_phase"] += int(
+            (preds["gd_game_phase"].argmax(-1) == batch["game_phase"]).sum()
+        )
+
+        for k in CROSS_ENTITY_VALUE_HORIZONS:
+            valid = batch[f"valid_global_t_plus_{k}"]
+            n_valid = int(valid.sum())
+            if n_valid == 0:
+                continue
+            name_ah = f"gd_is_ahead_{k}"
+            bce = F.binary_cross_entropy_with_logits(
+                preds[name_ah],
+                batch[f"is_ahead_t_plus_{k}"],
+                reduction="none",
+            )
+            sums[name_ah] += float((bce * valid).sum())
+            counts[name_ah] += n_valid
+            pred_bin_ah = preds[name_ah] >= 0.0
+            tgt_bin_ah = batch[f"is_ahead_t_plus_{k}"] > 0.5
+            correct_top1[name_ah] += int(((pred_bin_ah == tgt_bin_ah) & valid.bool()).sum())
+
     summary: dict[str, dict[str, float]] = {}
     for name, total in sums.items():
         n = max(1, counts[name])
-        entry: dict[str, float] = {"loss": total / n, "acc": correct_top1[name] / n}
+        entry: dict[str, float] = {"loss": total / n}
+        # Only report accuracy for heads that actually incremented
+        # ``correct_top1`` (i.e. the categorical / binary heads). Regression
+        # heads (gd_total_ships_log, gd_ship_entropy, gd_n_neutral_planets,
+        # gd_score_end, gd_turns_left) leave ``correct_top1`` at 0 by
+        # default, which previously printed a misleading "acc=0.000".
+        if name in correct_top1:
+            entry["acc"] = correct_top1[name] / n
         if name in correct_top3 and n > 0:
             entry["acc_top3"] = correct_top3[name] / n
         summary[name] = entry
     stack.train()
     return summary
+
+
+ACTION_HEAD_NAMES: tuple[str, ...] = (
+    "source_planet", "target_planet", "expert_acted",
+)
+
+
+def _val_mean(
+    val: dict[str, dict[str, float]],
+    *,
+    decoder_only: bool = False,
+    action_only: bool = False,
+) -> float:
+    """Average val loss across the heads being actively trained.
+
+    Best-checkpoint selection should track what's actually being optimized.
+    If we average over all heads (including frozen ones whose CLS input is
+    drifting), best-ckpt picks may be dominated by drift in heads that
+    have no gradient — see the action_only training run where
+    `gd_total_ships_log` and `gd_ship_entropy` degraded as cross adapted
+    to action loss, dragging val_mean even though the action heads were
+    improving.
+    """
+    if action_only:
+        names = [n for n in ACTION_HEAD_NAMES if n in val]
+    elif decoder_only:
+        names = [n for n in val if n.startswith("gd_")]
+    else:
+        names = list(val)
+    if not names:
+        # Fallback to all heads if no match (e.g. a head was renamed).
+        names = list(val)
+    return sum(val[n]["loss"] for n in names) / max(1, len(names))
 
 
 def _format_summary(summary: dict[str, dict[str, float]]) -> str:
@@ -434,6 +912,7 @@ def _resolve_action_modules(stack: ActionTrainStack, path: str) -> list[nn.Modul
         "entity_encoder": stack.entity_encoder,
         "cross": stack.cross,
         "action_decoder": stack.action_decoder,
+        "global_decoder": stack.global_decoder,
     }
     if path in aliases:
         return [aliases[path]]
@@ -509,19 +988,23 @@ def _build_schedule(stage_epochs: list[int]) -> list[dict[str, Any]]:
         {
             "index": 1,
             "name": "cross-unfreeze",
-            "trainable_paths": ["cross", "action_decoder"],
+            "trainable_paths": ["cross", "action_decoder", "global_decoder"],
+            "aux_coef": 0.15,
             "lr_table": {
                 "cross": 1e-4,
                 "action_decoder": 1e-3,
+                "global_decoder": 1e-3,
             },
         },
         {
             "index": 2,
             "name": "entity-unfreeze",
-            "trainable_paths": ["cross", "action_decoder", "entity_encoder"],
+            "trainable_paths": ["cross", "action_decoder", "global_decoder", "entity_encoder"],
+            "aux_coef": 0.15,
             "lr_table": {
                 "cross": 1e-4,
                 "action_decoder": 1e-3,
+                "global_decoder": 1e-3,
                 "entity_encoder": 1e-4,
             },
         },
@@ -529,14 +1012,16 @@ def _build_schedule(stage_epochs: list[int]) -> list[dict[str, Any]]:
             "index": 3,
             "name": "top-half-unfreeze",
             "trainable_paths": [
-                "cross", "action_decoder", "entity_encoder",
+                "cross", "action_decoder", "global_decoder", "entity_encoder",
                 "fleet_encoder.fc2", "fleet_encoder.norm",
                 "planet_encoder.scalar.fc2", "planet_encoder.traj.proj",
                 "planet_encoder.gate", "planet_encoder.norm",
             ],
+            "aux_coef": 0.10,
             "lr_table": {
                 "cross": 1e-4,
                 "action_decoder": 1e-3,
+                "global_decoder": 1e-3,
                 "entity_encoder": 1e-4,
                 "fleet_encoder.fc2": 1e-5,
                 "fleet_encoder.norm": 1e-5,
@@ -550,12 +1035,14 @@ def _build_schedule(stage_epochs: list[int]) -> list[dict[str, Any]]:
             "index": 4,
             "name": "full-unfreeze",
             "trainable_paths": [
-                "cross", "action_decoder", "entity_encoder",
+                "cross", "action_decoder", "global_decoder", "entity_encoder",
                 "fleet_encoder", "planet_encoder",
             ],
+            "aux_coef": 0.10,
             "lr_table": {
                 "cross": 1e-4,
                 "action_decoder": 1e-3,
+                "global_decoder": 1e-3,
                 "entity_encoder": 1e-4,
                 "fleet_encoder.fc2": 1e-5,
                 "fleet_encoder.norm": 1e-5,
@@ -641,7 +1128,7 @@ def _load_action_checkpoint(
     *,
     d_model: int,
     device: str,
-) -> tuple[CrossEntityAttention, ActionDecoder, dict[str, Any]]:
+) -> tuple[CrossEntityAttention, nn.Module, GlobalStateDecoder, dict[str, Any]]:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     if "cross" not in ckpt or "action_decoder" not in ckpt:
         raise KeyError(
@@ -650,9 +1137,52 @@ def _load_action_checkpoint(
         )
     cross = CrossEntityAttention(d_model=d_model, n_heads=4, n_layers=3)
     cross.load_state_dict(ckpt["cross"])
-    decoder = ActionDecoder(d_model=d_model)
-    decoder.load_state_dict(ckpt["action_decoder"])
-    return cross, decoder, ckpt
+    # Pick the decoder flavor that was saved with this ckpt; default to the
+    # flat ActionDecoder for backward compatibility with pre-flag ckpts.
+    contextual = bool(
+        ckpt.get("config", {}).get("contextual_action_decoder", False)
+    )
+    decoder = _build_action_decoder(d_model, contextual=contextual)
+    missing, unexpected = decoder.load_state_dict(
+        ckpt["action_decoder"], strict=False,
+    )
+    ppo_heads = {
+        "head_value", "head_frac", "frac_log_std", "value_bn",
+        "head_value_h",
+    }
+    missing_ppo = [m for m in missing if any(m.startswith(p) for p in ppo_heads)]
+    if missing_ppo:
+        print(
+            f"[expert_action] PPO heads not in ckpt {ckpt_path.name}: "
+            f"{missing_ppo} (initialized from scratch)",
+            flush=True,
+        )
+    # Architecture-mismatch warning: if a non-trivial number of head_*
+    # weights were skipped, the saved ckpt almost certainly used the OTHER
+    # decoder class. Surface that loud-and-clear so the user can decide.
+    head_misses = [
+        m for m in missing
+        if m.startswith(("head_source", "head_target", "head_frac"))
+        and not any(m.startswith(p) for p in ppo_heads)
+    ]
+    if head_misses:
+        print(
+            f"[expert_action] {ckpt_path.name}: action-head keys missing "
+            f"({head_misses[:3]}{'...' if len(head_misses) > 3 else ''}) — "
+            f"likely a decoder-class mismatch (loaded contextual={contextual}). "
+            "These heads will train from scratch.",
+            flush=True,
+        )
+    global_dec = GlobalStateDecoder(d_model=d_model)
+    if "global_decoder" in ckpt:
+        global_dec.load_state_dict(ckpt["global_decoder"])
+    else:
+        print(
+            f"[expert_action] global_decoder not in ckpt {ckpt_path.name} "
+            "(initialized from scratch)",
+            flush=True,
+        )
+    return cross, decoder, global_dec, ckpt
 
 
 def load_for_inference(
@@ -673,7 +1203,7 @@ def load_for_inference(
     fallback.
     """
     ckpt_path = Path(ckpt_path)
-    cross, decoder, ckpt = _load_action_checkpoint(
+    cross, decoder, global_dec, ckpt = _load_action_checkpoint(
         ckpt_path, d_model=d_model, device=device,
     )
 
@@ -699,6 +1229,7 @@ def load_for_inference(
         entity_encoder=entity_encoder,
         cross_attention=cross,
         action_decoder=decoder,
+        global_decoder=global_dec,
     ).to(device).eval()
     for p in stack.parameters():
         p.requires_grad_(False)
@@ -713,21 +1244,23 @@ def _save_checkpoint(
     stage_index: int | None,
     stage_name: str | None,
     config: dict[str, Any],
+    extra: dict[str, Any] | None = None,
 ) -> None:
-    torch.save(
-        {
-            "cross": stack.cross.state_dict(),
-            "action_decoder": stack.action_decoder.state_dict(),
-            "fleet_encoder": stack.fleet_encoder.state_dict(),
-            "planet_encoder": stack.planet_encoder.state_dict(),
-            "entity_encoder": stack.entity_encoder.state_dict(),
-            "epoch": epoch,
-            "stage": stage_index,
-            "stage_name": stage_name,
-            "config": config,
-        },
-        path,
-    )
+    payload = {
+        "cross": stack.cross.state_dict(),
+        "action_decoder": stack.action_decoder.state_dict(),
+        "global_decoder": stack.global_decoder.state_dict(),
+        "fleet_encoder": stack.fleet_encoder.state_dict(),
+        "planet_encoder": stack.planet_encoder.state_dict(),
+        "entity_encoder": stack.entity_encoder.state_dict(),
+        "epoch": epoch,
+        "stage": stage_index,
+        "stage_name": stage_name,
+        "config": config,
+    }
+    if extra:
+        payload.update(extra)
+    torch.save(payload, path)
 
 
 # ---------- Dataset construction ----------
@@ -924,6 +1457,11 @@ def train_frozen(
     num_workers: int = 0,
     device: str | None = None,
     seed: int = 0,
+    decoder_only: bool = False,
+    action_only: bool = False,
+    unfreeze_cross: bool = False,
+    contextual_action_decoder: bool = False,
+    early_stop_patience: int | None = None,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -941,28 +1479,62 @@ def train_frozen(
         resume_cross_pt, d_model=d_model, device=device,
     )
     cross.to(device)
-    decoder = ActionDecoder(d_model=d_model).to(device)
+    decoder = _build_action_decoder(
+        d_model, contextual=contextual_action_decoder,
+    ).to(device)
+    global_dec = GlobalStateDecoder(d_model=d_model).to(device)
     stack = ActionTrainStack(
         fleet_encoder=fenc, planet_encoder=penc, entity_encoder=eenc,
         cross_attention=cross, action_decoder=decoder,
+        global_decoder=global_dec,
     ).to(device)
+    if decoder_only and action_only:
+        raise ValueError(
+            "--decoder-only and --action-only are mutually exclusive"
+        )
+
     _freeze_all(stack)
-    set_trainable(stack, freeze=[], unfreeze=["action_decoder"])
+    if decoder_only:
+        unfreeze_paths = ["global_decoder"]
+    elif action_only:
+        unfreeze_paths = ["action_decoder"]
+    else:
+        unfreeze_paths = ["action_decoder", "global_decoder"]
+    if unfreeze_cross:
+        unfreeze_paths.append("cross")
+    set_trainable(stack, freeze=[], unfreeze=unfreeze_paths)
+    aux_coef = 0.2
+    lr_table: dict[str, float] = {}
+    if not action_only:
+        lr_table["global_decoder"] = lr
+    if not decoder_only:
+        lr_table["action_decoder"] = lr
+    if unfreeze_cross:
+        # Cross-attention LR is one decade lower — typical pattern when
+        # thawing a layer below the trainable head (see gradual-unfreeze
+        # schedule).
+        lr_table["cross"] = lr * 0.1
     opt = torch.optim.AdamW(
-        build_param_groups(stack, {"action_decoder": lr}),
+        build_param_groups(stack, lr_table),
         weight_decay=weight_decay,
     )
     print(
-        f"[action-frozen] decoder params: "
-        f"{sum(p.numel() for p in decoder.parameters()):,}  "
-        f"trainable groups: {len(opt.param_groups)}",
+        f"[action-frozen] decoder_only={decoder_only}  action_only={action_only}  "
+        f"unfreeze_cross={unfreeze_cross}  "
+        f"action_decoder params: {sum(p.numel() for p in decoder.parameters()):,}  "
+        f"global_decoder params: {sum(p.numel() for p in global_dec.parameters()):,}  "
+        f"unfreeze: {unfreeze_paths}  trainable groups: {len(opt.param_groups)}",
         flush=True,
     )
 
     config = {
         "train_mode": "frozen",
+        "decoder_only": decoder_only,
+        "action_only": action_only,
+        "unfreeze_cross": unfreeze_cross,
+        "contextual_action_decoder": contextual_action_decoder,
         "d_model": d_model, "lr": lr, "weight_decay": weight_decay,
-        "batch_size": batch_size, "epochs": epochs,
+        "batch_size": batch_size, "epochs": epochs, "aux_coef": aux_coef,
         "fleet_run_dir": str(fleet_run_dir),
         "planet_run_dir": str(planet_run_dir),
         "entity_run_dir": str(entity_run_dir),
@@ -971,6 +1543,7 @@ def train_frozen(
 
     log: list[dict[str, Any]] = []
     best_val = float("inf")
+    epochs_since_improvement = 0
     best_path = out_dir / "action_best.pt"
     last_path = out_dir / "action_last.pt"
 
@@ -1014,7 +1587,10 @@ def train_frozen(
         for batch in train_loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             preds = stack(batch)
-            total_loss, per_head = compute_loss(preds, batch)
+            total_loss, per_head = compute_loss(
+                preds, batch, aux_coef,
+                decoder_only=decoder_only, action_only=action_only,
+            )
             opt.zero_grad()
             total_loss.backward()
             opt.step()
@@ -1043,7 +1619,9 @@ def train_frozen(
 
         if epoch % eval_every == 0 or epoch == epochs:
             val = evaluate(stack, val_loader, device)
-            mean = sum(m["loss"] for m in val.values()) / max(1, len(val))
+            mean = _val_mean(
+                val, decoder_only=decoder_only, action_only=action_only,
+            )
             entry["val_mean_loss"] = mean
             entry["val"] = val
             print(
@@ -1052,10 +1630,13 @@ def train_frozen(
             )
             if mean < best_val:
                 best_val = mean
+                epochs_since_improvement = 0
                 _save_checkpoint(
                     best_path, stack=stack, epoch=epoch,
                     stage_index=0, stage_name="frozen", config=config,
                 )
+            else:
+                epochs_since_improvement += 1
 
         log.append(entry)
         _save_checkpoint(
@@ -1064,12 +1645,25 @@ def train_frozen(
         )
         (out_dir / "log.json").write_text(json.dumps(log, indent=2))
 
+        if (
+            early_stop_patience is not None
+            and epochs_since_improvement >= early_stop_patience
+        ):
+            print(
+                f"[action-frozen] early stop at epoch {epoch}: "
+                f"val hasn't improved in {early_stop_patience} epochs "
+                f"(best_val={best_val:.4f})",
+                flush=True,
+            )
+            break
+
     print("\n[action-frozen] evaluating best on test ...")
-    cross_b, decoder_b, _ = _load_action_checkpoint(
+    cross_b, decoder_b, global_dec_b, _ = _load_action_checkpoint(
         best_path, d_model=d_model, device=device,
     )
     stack.cross.load_state_dict(cross_b.state_dict())
     stack.action_decoder.load_state_dict(decoder_b.state_dict())
+    stack.global_decoder.load_state_dict(global_dec_b.state_dict())
     test = evaluate(stack, test_loader, device)
     print(_format_summary(test))
     (out_dir / "test_summary.json").write_text(json.dumps(test, indent=2))
@@ -1097,6 +1691,8 @@ def train_gradual_unfreeze(
     device: str | None = None,
     seed: int = 0,
     stage_epochs: list[int] | None = None,
+    action_only: bool = False,
+    early_stop_patience: int | None = None,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -1114,11 +1710,12 @@ def train_gradual_unfreeze(
         fleet_run_dir, planet_run_dir, entity_run_dir, device=device,
     )
     print(f"[action-gradual] loading action ckpt {resume_action_pt}", flush=True)
-    cross, decoder, resume_ckpt = _load_action_checkpoint(
+    cross, decoder, global_dec, resume_ckpt = _load_action_checkpoint(
         resume_action_pt, d_model=d_model, device=device,
     )
     cross.to(device)
     decoder.to(device)
+    global_dec.to(device)
 
     # If the resumed action ckpt has fine-tuned encoder weights, load them.
     # Otherwise the upstream encoder ckpts stay as-is.
@@ -1132,10 +1729,15 @@ def train_gradual_unfreeze(
     stack = ActionTrainStack(
         fleet_encoder=fenc, planet_encoder=penc, entity_encoder=eenc,
         cross_attention=cross, action_decoder=decoder,
+        global_decoder=global_dec,
     ).to(device)
 
     config = {
         "train_mode": "gradual-unfreeze",
+        # Persist the decoder flavor so future loads instantiate the right
+        # class. Inferred from the type of `decoder` since gradual-unfreeze
+        # always inherits the choice from the resumed action ckpt.
+        "contextual_action_decoder": isinstance(decoder, ContextualActionDecoder),
         "d_model": d_model, "weight_decay": weight_decay,
         "batch_size": batch_size,
         "fleet_run_dir": str(fleet_run_dir),
@@ -1198,22 +1800,32 @@ def train_gradual_unfreeze(
     )
 
     t0 = time.time()
+    epochs_since_improvement = 0
+    early_stopped_at: int | None = None
     for epoch in range(1, total_epochs + 1):
         stage = _stage_for_epoch(schedule, epoch)
         if stage["index"] != current_stage_idx:
+            # In action-only mode the global decoder stays frozen — strip
+            # it from this stage's trainable_paths and lr_table.
+            stage_trainable = list(stage["trainable_paths"])
+            stage_lr_table = dict(stage["lr_table"])
+            if action_only:
+                stage_trainable = [p for p in stage_trainable if p != "global_decoder"]
+                stage_lr_table.pop("global_decoder", None)
             _freeze_all(stack)
             set_trainable(
-                stack, freeze=[], unfreeze=stage["trainable_paths"],
+                stack, freeze=[], unfreeze=stage_trainable,
             )
             opt = torch.optim.AdamW(
-                build_param_groups(stack, stage["lr_table"]),
+                build_param_groups(stack, stage_lr_table),
                 weight_decay=weight_decay,
             )
             current_stage_idx = stage["index"]
             print(
                 f"[stage] {stage['index']} {stage['name']}  "
                 f"epochs={stage['start_epoch']}..{stage['end_epoch']}  "
-                f"param_groups={len(opt.param_groups)}",
+                f"param_groups={len(opt.param_groups)}  "
+                f"action_only={action_only}",
                 flush=True,
             )
 
@@ -1228,10 +1840,13 @@ def train_gradual_unfreeze(
         n_batches = 0
         running_loss_sum: dict[str, float] = defaultdict(float)
         running_valid_sum: dict[str, int] = defaultdict(int)
+        stage_aux_coef = stage.get("aux_coef", 0.1)
         for batch in train_loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             preds = stack(batch)
-            total_loss, per_head = compute_loss(preds, batch)
+            total_loss, per_head = compute_loss(
+                preds, batch, stage_aux_coef, action_only=action_only,
+            )
             opt.zero_grad()
             total_loss.backward()
             opt.step()
@@ -1256,7 +1871,7 @@ def train_gradual_unfreeze(
 
         if epoch % eval_every == 0 or epoch == total_epochs:
             val = evaluate(stack, val_loader, device)
-            mean = sum(m["loss"] for m in val.values()) / max(1, len(val))
+            mean = _val_mean(val, action_only=action_only)
             entry["val_mean_loss"] = mean
             entry["val"] = val
             print(
@@ -1266,11 +1881,14 @@ def train_gradual_unfreeze(
             )
             if mean < best_val:
                 best_val = mean
+                epochs_since_improvement = 0
                 _save_checkpoint(
                     best_path, stack=stack, epoch=epoch,
                     stage_index=stage["index"], stage_name=stage["name"],
                     config=config,
                 )
+            else:
+                epochs_since_improvement += 1
 
         if epoch == stage["end_epoch"]:
             stage_path = out_dir / f"action_stage{stage['index']}_epoch{epoch}.pt"
@@ -1288,12 +1906,29 @@ def train_gradual_unfreeze(
         )
         (out_dir / "log.json").write_text(json.dumps(log, indent=2))
 
+        # Early stop: bail if val hasn't improved in `early_stop_patience`
+        # consecutive eval epochs. action_last.pt + action_best.pt are
+        # already saved above so no work is lost.
+        if (
+            early_stop_patience is not None
+            and epochs_since_improvement >= early_stop_patience
+        ):
+            early_stopped_at = epoch
+            print(
+                f"[action-gradual] early stop at epoch {epoch}: "
+                f"val hasn't improved in {early_stop_patience} epochs "
+                f"(best_val={best_val:.4f})",
+                flush=True,
+            )
+            break
+
     print("\n[action-gradual] evaluating best on test ...")
-    cross_b, decoder_b, ckpt_b = _load_action_checkpoint(
+    cross_b, decoder_b, global_dec_b, ckpt_b = _load_action_checkpoint(
         best_path, d_model=d_model, device=device,
     )
     stack.cross.load_state_dict(cross_b.state_dict())
     stack.action_decoder.load_state_dict(decoder_b.state_dict())
+    stack.global_decoder.load_state_dict(global_dec_b.state_dict())
     if ckpt_b.get("fleet_encoder"):
         stack.fleet_encoder.load_state_dict(ckpt_b["fleet_encoder"])
     if ckpt_b.get("planet_encoder"):
@@ -1363,6 +1998,36 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--decoder-only", action="store_true",
+        help="Train ONLY the GlobalStateDecoder (skip ActionDecoder + its losses). "
+             "Use to grow the CLS representation without coupling to action heads.",
+    )
+    parser.add_argument(
+        "--action-only", action="store_true",
+        help="Train ONLY the action heads (skip GlobalStateDecoder + its losses). "
+             "Useful when fine-tuning a contextual ActionDecoder on top of an "
+             "already-trained CLS without further auxiliary supervision.",
+    )
+    parser.add_argument(
+        "--unfreeze-cross", action="store_true",
+        help="In `--train-mode frozen`, also unfreeze the cross-attention "
+             "alongside the decoder(s) at LR = lr * 0.1.",
+    )
+    parser.add_argument(
+        "--early-stop-patience", type=int, default=None,
+        help="If set, stop training when val_mean hasn't improved for N "
+             "consecutive eval epochs. action_best.pt holds the best ckpt.",
+    )
+    parser.add_argument(
+        "--contextual-action-decoder", action="store_true",
+        help="Use ContextualActionDecoder (per-planet heads read [glob, ctx]) "
+             "instead of the default ActionDecoder. Strongly recommended once "
+             "the GlobalStateDecoder has trained the CLS to a useful state. "
+             "In `--train-mode frozen` this picks the class on construction; "
+             "in `--train-mode gradual-unfreeze` it's inferred from the "
+             "resumed checkpoint.",
+    )
     args = parser.parse_args()
 
     fleet_run = args.fleet_run_dir or _latest_run_dir(
@@ -1402,6 +2067,11 @@ def main() -> None:
             num_workers=args.num_workers,
             device=args.device,
             seed=args.seed,
+            decoder_only=args.decoder_only,
+            action_only=args.action_only,
+            unfreeze_cross=args.unfreeze_cross,
+            contextual_action_decoder=args.contextual_action_decoder,
+            early_stop_patience=args.early_stop_patience,
         )
         return
 
@@ -1454,6 +2124,8 @@ def main() -> None:
         device=args.device,
         seed=args.seed,
         stage_epochs=stage_epochs,
+        action_only=args.action_only,
+        early_stop_patience=args.early_stop_patience,
     )
 
 

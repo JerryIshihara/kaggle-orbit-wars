@@ -218,6 +218,55 @@ def _swept_disc_intersection(
     return None
 
 
+def _stationary_disc_segment_entry(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    cx: float,
+    cy: float,
+    radius: float,
+) -> float | None:
+    """Earliest segment fraction whose distance to a stationary disc is < radius.
+
+    Orbit Wars' env uses ``point_to_segment_distance(...) < radius`` for planet
+    and sun hits. A tangent where the minimum distance is exactly ``radius`` is
+    therefore a miss; once the segment enters the open disc, the boundary entry
+    time is the useful eta.
+    """
+    if radius <= 0.0:
+        return None
+    dx = x2 - x1
+    dy = y2 - y1
+    len_sq = dx * dx + dy * dy
+    if len_sq == 0.0:
+        return 0.0 if math.hypot(x1 - cx, y1 - cy) < radius else None
+
+    closest_t = max(0.0, min(1.0, ((cx - x1) * dx + (cy - y1) * dy) / len_sq))
+    closest_x = x1 + closest_t * dx
+    closest_y = y1 + closest_t * dy
+    if math.hypot(closest_x - cx, closest_y - cy) >= radius:
+        return None
+
+    ox = x1 - cx
+    oy = y1 - cy
+    c = ox * ox + oy * oy - radius * radius
+    if c < 0.0:
+        return 0.0
+
+    a = len_sq
+    b = 2.0 * (ox * dx + oy * dy)
+    disc = b * b - 4.0 * a * c
+    if disc <= 0.0:
+        return None
+    t_enter = (-b - math.sqrt(disc)) / (2.0 * a)
+    if 0.0 <= t_enter <= 1.0:
+        return t_enter
+    # Numerical guard for a segment that starts exactly on the boundary and
+    # immediately moves inside the disc.
+    return 0.0
+
+
 def find_first_collision(
     src_x: float,
     src_y: float,
@@ -230,16 +279,19 @@ def find_first_collision(
 ) -> dict | None:
     """Walk the fleet's straight-line trajectory against STATIC planets.
 
-    Mirrors the env's turn order for static snapshots:
+    Mirrors the env's fleet-movement order for static snapshots:
       1. move the fleet by one turn of speed
-      2. check boundary (env-exact: |coord| > board)
-      3. check sun crossing (with SUN_MARGIN as a safety buffer — the
+      2. check planets in observation order
+      3. check boundary (env-exact: |coord| > board)
+      4. check sun crossing (with SUN_MARGIN as a safety buffer — the
          env's hard cut is ``SUN_RADIUS`` but we drop launches that
          would pass within ``SUN_RADIUS + SUN_MARGIN`` of the sun
          center, mirroring :func:`crosses_sun`)
-      4. check planet collisions, picking the EARLIEST ``t`` (continuous
-         time within the step) — important when the fleet's segment
-         clips multiple discs in one turn.
+
+    The env checks planet collisions before boundary/sun and breaks on the
+    first planet in list order. Matching that order matters for fast fleets
+    whose one-turn segment both intersects a planet and crosses the sun or
+    board edge.
     """
     speed = fleet_speed(fleet_ships)
     if speed <= 0:
@@ -259,6 +311,21 @@ def find_first_collision(
         fleet_x += speed * ch
         fleet_y += speed * sh
 
+        for p in planets:
+            pid = p[P_ID]
+            px, py, pr = p[P_X], p[P_Y], p[P_RADIUS]
+            if pid == src_id and math.hypot(old_x - src_x, old_y - src_y) < src_radius + 1.0:
+                continue
+            t = _stationary_disc_segment_entry(old_x, old_y, fleet_x, fleet_y, px, py, pr)
+            if t is None:
+                continue
+            return {
+                "kind": "planet",
+                "planet": p,
+                "step": step,
+                "eta": (step - 1) + t,
+            }
+
         if (
             fleet_x < BOARD_MIN
             or fleet_x > BOARD_MAX
@@ -267,11 +334,9 @@ def find_first_collision(
         ):
             return {"kind": "boundary", "step": step, "x": fleet_x, "y": fleet_y}
 
-        # Sun: stationary disc, swept-disc intersection at sun-margin
-        # radius. Use ``<=`` to match the original ``crosses_sun`` semantics.
-        t_sun = _swept_disc_intersection(
+        t_sun = _stationary_disc_segment_entry(
             old_x, old_y, fleet_x, fleet_y,
-            SUN_CX, SUN_CY, SUN_CX, SUN_CY,
+            SUN_CX, SUN_CY,
             sun_radius_eff,
         )
         if t_sun is not None:
@@ -281,34 +346,6 @@ def find_first_collision(
                 "x": old_x + t_sun * (fleet_x - old_x),
                 "y": old_y + t_sun * (fleet_y - old_y),
                 "eta": (step - 1) + t_sun,
-            }
-
-        # Planets: find earliest entry across all candidates within the
-        # step. Iteration-order picks miss inter-planet ordering when
-        # the fleet's segment grazes multiple discs.
-        best_t = None
-        best_planet = None
-        for p in planets:
-            pid = p[P_ID]
-            px, py, pr = p[P_X], p[P_Y], p[P_RADIUS]
-            if pid == src_id and math.hypot(old_x - src_x, old_y - src_y) < src_radius + 1.0:
-                continue
-            t = _swept_disc_intersection(
-                old_x, old_y, fleet_x, fleet_y,
-                px, py, px, py,
-                pr,
-            )
-            if t is None:
-                continue
-            if best_t is None or t < best_t:
-                best_t = t
-                best_planet = p
-        if best_planet is not None:
-            return {
-                "kind": "planet",
-                "planet": best_planet,
-                "step": step,
-                "eta": (step - 1) + best_t,
             }
 
     return None
@@ -427,6 +464,7 @@ def validate_launch(
     av_signed: float | None = None,
     comet_planet_ids: set[int] | None = None,
     comets: list | None = None,
+    current_step: int = 1,
 ) -> tuple[bool, str]:
     """Return (is_valid, reason). False ⇒ drop the launch.
 
@@ -478,6 +516,7 @@ def validate_launch(
             angular_velocity=abs_av,
             av_signed=float(av_signed),
             comet_lookup=comet_lookup,
+            current_step=current_step,
         )
     else:
         hit = find_first_collision(
@@ -612,6 +651,18 @@ def _predict_orbital_xy(
     return SUN_CX + r * math.cos(angle), SUN_CY + r * math.sin(angle)
 
 
+def _orbital_turns_after_eta(turns: float, current_step: int) -> float:
+    """Orbital ticks elapsed after ``turns`` future turns from current obs.
+
+    In Orbit Wars, the reset observation at step 0 and the following step-1
+    observation share the same orbital positions. From step 1 onward, planets
+    advance one angular-velocity tick per env turn.
+    """
+    if current_step <= 0:
+        return max(0.0, turns - 1.0)
+    return max(0.0, turns)
+
+
 def _predict_comet_xy(
     planet: tuple,
     turns: float,
@@ -686,29 +737,23 @@ def _find_first_collision_dynamic(
     angular_velocity: float,
     av_signed: float,
     comet_lookup: dict[int, tuple[list, int]],
+    current_step: int = 1,
     max_distance: float = 200.0,
 ) -> dict | None:
-    """Per-step swept-disc intersection against MOVING planets / comets.
+    """Walk one fleet using Orbit Wars' exact movement ordering.
 
-    The previous implementation split the per-step check into two
-    approximations (fleet segment vs planet's start position, then
-    planet's sweep vs fleet endpoint). That double-pass produced both
-    false positives (calling HIT when relative motion never actually
-    closed the gap) and false negatives (missing a hit that occurred
-    mid-step when the planet drifted into the fleet's path). Either
-    error breaks downstream callers — a false positive in particular
-    makes ``validate_launch`` approve a trajectory that the real env
-    keeps flying straight, often into the sun or board edge.
+    The env does not move planets simultaneously with fleets. Each turn:
 
-    The closed-form fix: for every planet (and the sun), compute
-    ``F(t) - T(t)`` as a linear function of ``t ∈ [0, 1]`` within the
-    step and solve the quadratic for the earliest hit. Within each
-    step we still pick the EARLIEST t across all moving entities, then
-    convert to an absolute eta.
+      1. Fleet moves and checks its segment against current planet positions
+         in observation order.
+      2. If no planet was hit, the fleet endpoint is checked for boundary,
+         then the segment is checked against the sun.
+      3. Surviving fleets can then be swept by orbiting planets / comets as
+         those bodies move.
 
-    Step ordering still matches the env: boundary → sun → planets.
-    Planet positions are advanced once per step so the next step uses
-    the new positions as its ``old`` (start-of-step) values.
+    Matching this order avoids false approvals where a simultaneous swept-disc
+    model says "moving planet hit" even though the real env removes the fleet
+    for sun or boundary before planet movement happens.
     """
     speed = fleet_speed(fleet_ships)
     if speed <= 0:
@@ -737,7 +782,13 @@ def _find_first_collision_dynamic(
     # were left as stationary obstacles at their last known spot, which
     # caused both false-positive intercepts and stuck phantom blockers
     # for any subsequent fleet passing through that location.
-    dead_comets: set[int] = set()
+    dead_comets: set[int] = {
+        pid
+        for pid, (path, path_index) in comet_lookup.items()
+        if int(path_index) >= len(path)
+    }
+    for pid in dead_comets:
+        planet_pos.pop(pid, None)
 
     for step in range(1, max_steps + 1):
         old_fx = fleet_x
@@ -745,7 +796,28 @@ def _find_first_collision_dynamic(
         fleet_x += speed * ch
         fleet_y += speed * sh
 
-        # Boundary first (env-exact: tested against the fleet's endpoint).
+        # Fleet movement phase: current planet positions are checked before
+        # boundary/sun, and the env breaks on the first planet in list order.
+        for p in planets:
+            pid = int(p[P_ID])
+            if pid in dead_comets or pid not in planet_pos:
+                continue
+            old_pos = planet_pos[pid]
+            if pid == src_id and math.hypot(old_fx - src_x, old_fy - src_y) < src_radius + 1.0:
+                continue
+            t = _stationary_disc_segment_entry(
+                old_fx, old_fy, fleet_x, fleet_y,
+                old_pos[0], old_pos[1],
+                float(p[P_RADIUS]),
+            )
+            if t is not None:
+                return {
+                    "kind": "planet",
+                    "planet": p,
+                    "step": step,
+                    "eta": (step - 1) + t,
+                }
+
         if (
             fleet_x < BOARD_MIN
             or fleet_x > BOARD_MAX
@@ -754,21 +826,32 @@ def _find_first_collision_dynamic(
         ):
             return {"kind": "boundary", "step": step, "x": fleet_x, "y": fleet_y}
 
-        # Compute every entity's NEW position for this step. Static
-        # planets stay put; orbital rotate by 1 turn; comets advance
-        # one path index, and are marked DEAD when the path runs out.
+        t_sun = _stationary_disc_segment_entry(
+            old_fx, old_fy, fleet_x, fleet_y,
+            SUN_CX, SUN_CY,
+            sun_radius_eff,
+        )
+        if t_sun is not None:
+            return {
+                "kind": "sun",
+                "step": step,
+                "x": old_fx + t_sun * (fleet_x - old_fx),
+                "y": old_fy + t_sun * (fleet_y - old_fy),
+                "eta": (step - 1) + t_sun,
+            }
+
+        # Planet movement phase: surviving fleets can be swept by a moving
+        # planet/comet if the fleet endpoint lies inside that movement segment.
         new_planet_pos: dict[int, tuple[float, float]] = {}
         for p in planets:
             pid = int(p[P_ID])
-            if pid in dead_comets:
-                continue  # already removed from sweep
+            if pid in dead_comets or pid not in planet_pos:
+                continue
             old_pos = planet_pos[pid]
             if pid in comet_ids:
                 path, _idx0 = comet_lookup[pid]
                 next_idx = comet_indices[pid] + 1
                 if next_idx >= len(path):
-                    # Path exhausted — comet has died this turn. Don't
-                    # add to new_planet_pos so it's skipped going forward.
                     dead_comets.add(pid)
                     planet_pos.pop(pid, None)
                     comet_indices[pid] = next_idx
@@ -782,59 +865,26 @@ def _find_first_collision_dynamic(
                 float(p[P_RADIUS]),
                 angular_velocity,
             ):
-                new_pos = _predict_orbital_xy(old_pos[0], old_pos[1], 1.0, av_signed)
+                if current_step + step - 1 <= 0:
+                    new_pos = old_pos
+                else:
+                    new_pos = _predict_orbital_xy(old_pos[0], old_pos[1], 1.0, av_signed)
             else:
                 new_pos = old_pos
             new_planet_pos[pid] = new_pos
-
-        # Sun: stationary, with the safety margin.
-        t_sun = _swept_disc_intersection(
-            old_fx, old_fy, fleet_x, fleet_y,
-            SUN_CX, SUN_CY, SUN_CX, SUN_CY,
-            sun_radius_eff,
-        )
-
-        # Planets: closed-form swept-disc test against (old_pos → new_pos).
-        # Dead comets are excluded — they no longer exist in the env.
-        best_t = None
-        best_planet = None
-        for p in planets:
-            pid = int(p[P_ID])
-            if pid in dead_comets or pid not in new_planet_pos:
+            if old_pos == new_pos:
                 continue
-            old_pos = planet_pos[pid]
-            new_pos = new_planet_pos[pid]
-            if pid == src_id and math.hypot(old_fx - src_x, old_fy - src_y) < src_radius + 1.0:
-                continue
-            t = _swept_disc_intersection(
-                old_fx, old_fy, fleet_x, fleet_y,
-                old_pos[0], old_pos[1], new_pos[0], new_pos[1],
-                float(p[P_RADIUS]),
-            )
-            if t is None:
-                continue
-            if best_t is None or t < best_t:
-                best_t = t
-                best_planet = p
-
-        # Sun beats planet only if it lands EARLIER in the step. The
-        # env's order says sun is checked before planet within a step,
-        # so on a tie we still report sun.
-        if t_sun is not None and (best_t is None or t_sun <= best_t):
-            return {
-                "kind": "sun",
-                "step": step,
-                "x": old_fx + t_sun * (fleet_x - old_fx),
-                "y": old_fy + t_sun * (fleet_y - old_fy),
-                "eta": (step - 1) + t_sun,
-            }
-        if best_planet is not None:
-            return {
-                "kind": "planet",
-                "planet": best_planet,
-                "step": step,
-                "eta": (step - 1) + best_t,
-            }
+            if _point_to_segment_distance(
+                fleet_x, fleet_y,
+                old_pos[0], old_pos[1],
+                new_pos[0], new_pos[1],
+            ) < float(p[P_RADIUS]):
+                return {
+                    "kind": "planet",
+                    "planet": p,
+                    "step": step,
+                    "eta": float(step),
+                }
 
         # Advance planet positions for the next step.
         planet_pos = new_planet_pos
@@ -861,6 +911,7 @@ def _lead_aim_orbital(
     ty0: float,
     fleet_ships: int,
     av_signed: float,
+    current_step: int = 1,
     iters: int = LEAD_AIM_ITERS,
 ) -> tuple[float, float, float]:
     speed = fleet_speed(fleet_ships)
@@ -869,7 +920,11 @@ def _lead_aim_orbital(
     px, py = tx0, ty0
     turns = math.hypot(px - sx, py - sy) / speed
     for _ in range(iters):
-        px, py = _predict_orbital_xy(tx0, ty0, turns, av_signed)
+        px, py = _predict_orbital_xy(
+            tx0, ty0,
+            _orbital_turns_after_eta(turns, current_step),
+            av_signed,
+        )
         turns = math.hypot(px - sx, py - sy) / speed
     return px, py, turns
 
@@ -904,6 +959,7 @@ def lead_aim(
     fleet_ships: int,
     av_signed: float,
     target_orbiting: bool,
+    current_step: int = 1,
     iters: int = LEAD_AIM_ITERS,
 ) -> tuple[float, float, float]:
     """Compute (predicted_target_x, predicted_target_y, eta_turns).
@@ -917,7 +973,11 @@ def lead_aim(
     speed = fleet_speed(fleet_ships)
     if not target_orbiting or av_signed == 0 or speed <= 0:
         return _lead_aim_static(sx, sy, tx0, ty0, fleet_ships)
-    return _lead_aim_orbital(sx, sy, tx0, ty0, fleet_ships, av_signed, iters=iters)
+    return _lead_aim_orbital(
+        sx, sy, tx0, ty0, fleet_ships, av_signed,
+        current_step=current_step,
+        iters=iters,
+    )
 
 
 def _finalize_launch(
@@ -935,6 +995,7 @@ def _finalize_launch(
     angular_velocity: float,
     av_signed: float,
     comet_lookup: dict[int, tuple[list, int]],
+    current_step: int,
 ) -> Launch:
     sx = float(from_planet[P_X])
     sy = float(from_planet[P_Y])
@@ -961,6 +1022,7 @@ def _finalize_launch(
             angular_velocity=angular_velocity,
             av_signed=av_signed,
             comet_lookup=comet_lookup,
+            current_step=current_step,
         )
     if hit is None:
         return Launch(src_id, tid, angle, eta, ships, ok=False, reason="no_collision")
@@ -975,15 +1037,12 @@ def _finalize_launch(
     # from collision, more accurate than the lead-aim turns estimate).
     hit_eta = float(hit.get("eta", eta))
 
-    # Comet-alive-at-arrival check. If the intended target is a comet
-    # and its path runs out before our fleet would arrive, the env will
-    # see no comet there — even if the swept-disc sweep "hit" the
-    # comet's last-known position. Reject so callers (including
-    # plan_launch users that aren't sniper) don't queue a launch
-    # against a target that won't exist on touchdown. Matches
-    # ``extrapolate_trajectory``'s "None past path end" semantics.
-    if tid in comet_lookup:
-        path, path_index = comet_lookup[tid]
+    # Comet-alive-at-arrival check. If the hit planet is a comet and its path
+    # runs out before combat resolution, the env removes that comet and the
+    # fleet with it. Check the actual hit, not just the intended target, so an
+    # incidental comet intercept cannot be treated as a safe landing.
+    if hit_pid in comet_lookup:
+        path, path_index = comet_lookup[hit_pid]
         eta_steps = int(math.ceil(hit_eta))
         if path_index + eta_steps >= len(path):
             return Launch(
@@ -1056,6 +1115,7 @@ def _plan_launch_for_motion(
     angular_velocity: float,
     av_signed: float,
     comet_lookup: dict[int, tuple[list, int]],
+    current_step: int,
 ) -> Launch:
     sx = float(from_planet[P_X])
     sy = float(from_planet[P_Y])
@@ -1114,6 +1174,7 @@ def _plan_launch_for_motion(
         angular_velocity=angular_velocity,
         av_signed=av_signed,
         comet_lookup=comet_lookup,
+        current_step=current_step,
     )
 
 
@@ -1127,6 +1188,7 @@ def _plan_launch_static(
     angular_velocity: float,
     av_signed: float,
     comet_lookup: dict[int, tuple[list, int]],
+    current_step: int,
     fleet_ships: int | None,
     surplus: int | None,
     safety_buffer: int,
@@ -1151,6 +1213,7 @@ def _plan_launch_static(
         angular_velocity=angular_velocity,
         av_signed=av_signed,
         comet_lookup=comet_lookup,
+        current_step=current_step,
     )
 
 
@@ -1164,6 +1227,7 @@ def _plan_launch_orbital(
     angular_velocity: float,
     av_signed: float,
     comet_lookup: dict[int, tuple[list, int]],
+    current_step: int,
     fleet_ships: int | None,
     surplus: int | None,
     safety_buffer: int,
@@ -1191,10 +1255,12 @@ def _plan_launch_orbital(
             ty0,
             ships,
             av_signed,
+            current_step=current_step,
         ),
         angular_velocity=angular_velocity,
         av_signed=av_signed,
         comet_lookup=comet_lookup,
+        current_step=current_step,
     )
 
 
@@ -1208,6 +1274,7 @@ def _plan_launch_comet(
     angular_velocity: float,
     av_signed: float,
     comet_lookup: dict[int, tuple[list, int]],
+    current_step: int,
     fleet_ships: int | None,
     surplus: int | None,
     safety_buffer: int,
@@ -1236,6 +1303,7 @@ def _plan_launch_comet(
         angular_velocity=angular_velocity,
         av_signed=av_signed,
         comet_lookup=comet_lookup,
+        current_step=current_step,
     )
 
 
@@ -1254,6 +1322,7 @@ def plan_launch(
     surplus: int | None = None,
     safety_buffer: int = 3,
     convergence_iters: int = 3,
+    current_step: int = 1,
 ) -> Launch:
     """Compute the best from→to launch and validate it end-to-end.
 
@@ -1289,6 +1358,7 @@ def plan_launch(
             angular_velocity=abs(float(angular_velocity)),
             av_signed=av_signed,
             comet_lookup=comet_lookup,
+            current_step=current_step,
             fleet_ships=fleet_ships,
             surplus=surplus,
             safety_buffer=safety_buffer,
@@ -1304,6 +1374,7 @@ def plan_launch(
             angular_velocity=abs(float(angular_velocity)),
             av_signed=av_signed,
             comet_lookup=comet_lookup,
+            current_step=current_step,
             fleet_ships=fleet_ships,
             surplus=surplus,
             safety_buffer=safety_buffer,
@@ -1318,6 +1389,7 @@ def plan_launch(
         angular_velocity=abs(float(angular_velocity)),
         av_signed=av_signed,
         comet_lookup=comet_lookup,
+        current_step=current_step,
         fleet_ships=fleet_ships,
         surplus=surplus,
         safety_buffer=safety_buffer,
@@ -1465,6 +1537,7 @@ def sniper(
         comets=get("comets") or [],
         fleet_ships=int(num_ships),
         safety_buffer=safety_buffer,
+        current_step=current_step,
     )
     if not launch.ok:
         return 0, 0.0, 0.0

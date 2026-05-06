@@ -10,3 +10,8 @@ try:
     from . import runner  # noqa: F401
 except ImportError:
     pass
+
+try:
+    from . import ppo  # noqa: F401
+except ImportError:
+    pass

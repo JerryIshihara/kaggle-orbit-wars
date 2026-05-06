@@ -60,3 +60,6 @@ Untitled
 
 # claude code session files
 .claude/
+
+# scratch / planning notes (untracked workspace)
+tmp/
