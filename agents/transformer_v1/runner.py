@@ -48,7 +48,16 @@ from ..physics_utils import (
 from ..registry import register
 from .featurizer import FleetTracker, featurize_observation
 from .paths import ACTION_RUNS_DIR
-from .pretrain.expert_action import compute_action_log_prob, FRAC_Z_MIN
+# The decoder layer was removed during the encoder-freeze + pair-head
+# smoke test redesign. ``TransformerAgent.load`` and ``_predict`` raise
+# ``NotImplementedError`` rather than dispatching against a non-existent
+# action decoder. See agents/transformer_v1/pretrain/pair_score.py.
+_DECODER_REMOVED_MSG = (
+    "transformer_v1 action decoder was removed; runner.py is currently "
+    "non-functional. The encoder stack is being validated via "
+    "`agents.transformer_v1.pretrain.pair_score` (PairScoreHead). "
+    "Reinstate a runtime decoder before using this agent in a game."
+)
 
 
 # ---- Default ckpt resolution ----
@@ -155,13 +164,7 @@ class TransformerAgent:
         device: str | None = None,
         deterministic: bool = True,
     ) -> "TransformerAgent":
-        from .pretrain.expert_action import load_for_inference
-
-        ckpt_path = Path(ckpt_path) if ckpt_path else _default_ckpt()
-        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        stack = load_for_inference(ckpt_path, device=device)
-        print(f"[transformer_v1] loaded {ckpt_path} on {device}")
-        return cls(stack, device=device, deterministic=deterministic)
+        raise NotImplementedError(_DECODER_REMOVED_MSG)
 
     @torch.no_grad()
     def _predict(
@@ -170,14 +173,10 @@ class TransformerAgent:
         learner_slot: int,
         return_rollout: bool = False,
     ) -> tuple[int | None, int | None, dict[int, int]]:
-        """Return (source_planet_id, target_planet_id, pid_to_idx)
-        from the action decoder. Either id may be ``None`` if the policy
-        decides no action this turn (acted gate < 0.5) or no legal
-        target exists.
-
-        When ``return_rollout=True``, returns a rollout dict instead
-        (for PPO trajectory collection).
-        """
+        """Disabled while the action decoder is being redesigned."""
+        raise NotImplementedError(_DECODER_REMOVED_MSG)
+        # --- Original implementation kept below as a reference for the
+        # pair-head bring-up; never reached because of the raise above. ---
         batch, pid_to_idx = featurize_observation(
             obs,
             learner_slot=learner_slot,

@@ -5,7 +5,6 @@ The encoders are nn.Modules that project featurizer-emitted vectors to
 """
 
 from .entity_encoder import (
-    LaunchOutcomeDecoder,
     PlanetEntityEncoder,
     QueryConditionedPool,
     build_fleet_routing,
@@ -23,7 +22,6 @@ __all__ = [
     "PlanetScalarEncoder",
     "PlanetTrajectoryEncoder",
     "PlanetEntityEncoder",
-    "LaunchOutcomeDecoder",
     "QueryConditionedPool",
     "build_fleet_routing",
 ]

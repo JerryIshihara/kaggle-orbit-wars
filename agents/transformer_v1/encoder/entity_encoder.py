@@ -281,61 +281,6 @@ class PlanetEntityEncoder(nn.Module):
         return out
 
 
-# ---------- Action-conditioned decoder ----------
-class LaunchOutcomeDecoder(nn.Module):
-    """Predict launch outcome from a ``(source, target)`` entity pair.
-
-    Inputs:
-      source_token  (B, d) — entity-encoder output for the launching planet
-      target_token  (B, d) — entity-encoder output for the target planet
-      ships_log     (B,)   — ``log1p(ships) / SHIPS_LOG_MAX`` of the
-                             proposed fleet size
-
-    Outputs (dict, all shape ``(B,)``):
-      capture_logit       — pre-sigmoid binary head; >0 ⇒ predicts
-                            ownership flips on arrival.
-      capture_margin_log  — predicted ``signed_log1p(ships - garrison)``
-                            at arrival; positive ⇒ over-budget capture.
-      eta_norm            — predicted ``eta / ETA_NORM`` for the fleet.
-
-    Trained downstream of pretraining, on labels we already store
-    (``will_change_owner_on_arrival``, ``capture_margin_signed_log``,
-    derived ETA). The whole point of this decoder is to give the agent
-    a fast "score this candidate launch" head: at decision time, run
-    the planet/entity encoders once per turn, then evaluate every
-    ``(src, tgt)`` pair through this decoder for ~free.
-    """
-
-    def __init__(self, d_model: int = 64, hidden: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2 * d_model + 1, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-        )
-        self.head_capture = nn.Linear(hidden, 1)
-        self.head_margin = nn.Linear(hidden, 1)
-        self.head_eta = nn.Linear(hidden, 1)
-
-    def forward(
-        self,
-        source_token: torch.Tensor,
-        target_token: torch.Tensor,
-        ships_log: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        x = torch.cat(
-            [source_token, target_token, ships_log.unsqueeze(-1)],
-            dim=-1,
-        )
-        h = self.net(x)
-        return {
-            "capture_logit": self.head_capture(h).squeeze(-1),
-            "capture_margin_log": self.head_margin(h).squeeze(-1),
-            "eta_norm": torch.sigmoid(self.head_eta(h)).squeeze(-1),
-        }
-
-
 # ---------- Routing helper ----------
 def build_fleet_routing(
     fleet_records,
