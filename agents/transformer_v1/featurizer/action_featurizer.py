@@ -38,7 +38,9 @@ from ...physics_utils import (
     F_FROM,
     F_ID,
     F_OWNER,
+    F_SHIPS,
     P_ID,
+    P_SHIPS,
 )
 from ..paths import ACTION_DATASET_DIR
 
@@ -61,6 +63,9 @@ ACTION_LABEL_COLS: tuple[str, ...] = (
     "target_planet_idx",
     "expert_acted",
     "winner_seat",
+    "ships_sent",
+    "source_ships_before",
+    "frac_label",
 )
 
 # nn.CrossEntropyLoss ignore_index sentinel.
@@ -72,28 +77,29 @@ def _first_expert_action(
     next_obs: Any,
     *,
     learner_slot: int,
-) -> tuple[int | None, int | None]:
-    """Return ``(source_pid, target_pid)`` of the *first* new expert fleet.
+) -> tuple[int | None, int | None, int | None]:
+    """Return ``(source_pid, target_pid, ships_sent)`` of the *first* new expert fleet.
 
     "First" = smallest ``F_ID`` (the env's ``next_fleet_id`` is monotonic,
     so this is deterministic and matches the order the expert agent
     actually queued the fleets in). Returns:
 
-      * ``(None, None)`` — no expert fleet launched this turn (or no
-        next observation to inspect).
-      * ``(src_pid, None)`` — expert launched, but
+      * ``(None, None, None)`` — no expert fleet launched this turn.
+      * ``(src_pid, None, ships)`` — expert launched, but
         :func:`_resolve_target` couldn't determine the first-hit planet
-        (rare; off-board trajectory). Caller should still mark
-        ``expert_acted=1`` and supervise the source head.
-      * ``(src_pid, tgt_pid)`` — expert launched and target is known.
+        (rare; off-board trajectory). Caller still marks
+        ``expert_acted=1`` and supervises the source head.
+      * ``(src_pid, tgt_pid, ships)`` — expert launched and target is known.
 
     Source is taken straight from ``F_FROM`` and is always present when
     a new expert fleet exists, so we don't drop the source supervision
-    just because the target isn't resolvable.
+    just because the target isn't resolvable. ``ships_sent`` is the
+    fleet's ``F_SHIPS`` (an integer), used downstream as the numerator of
+    ``frac_label = ships_sent / source_ships_before``.
     """
     new_ids = _newly_launched_fleet_ids(prev_obs, next_obs)
     if not new_ids or not next_obs:
-        return None, None
+        return None, None, None
     next_planets = next_obs.get("planets") or []
     candidates: list[Any] = []
     for f in next_obs.get("fleets") or []:
@@ -105,12 +111,13 @@ def _first_expert_action(
             continue
         candidates.append(f)
     if not candidates:
-        return None, None
+        return None, None, None
     candidates.sort(key=lambda f: int(f[F_ID]))
     first = candidates[0]
     src_pid = int(first[F_FROM])
     tgt_pid, _eta, _planet = _resolve_target(first, next_planets)
-    return src_pid, (int(tgt_pid) if tgt_pid is not None else None)
+    ships_sent = int(first[F_SHIPS])
+    return src_pid, (int(tgt_pid) if tgt_pid is not None else None), ships_sent
 
 
 def save_episode_action_csv(
@@ -200,9 +207,14 @@ def save_episode_action_csv(
                     if isinstance(next_seat, dict) else None
                 )
 
-            src_pid, tgt_pid = _first_expert_action(
+            src_pid, tgt_pid, ships_sent = _first_expert_action(
                 obs, next_obs, learner_slot=learner_slot,
             )
+            # Frac fields default to empty (NaN downstream) on non-acted
+            # turns; populated when the expert launched.
+            source_ships_before_val: str | int = ""
+            ships_sent_val: str | int = ""
+            frac_label_val: str | float = ""
             if src_pid is None:
                 source_idx = ACTION_IGNORE_INDEX
                 target_idx = ACTION_IGNORE_INDEX
@@ -223,6 +235,24 @@ def save_episode_action_csv(
                     int(tgt_idx) if tgt_idx is not None
                     else ACTION_IGNORE_INDEX
                 )
+                # Source-ships-before-launch = source planet's ship count
+                # in the *current* obs (the turn the expert acted on).
+                # Subsequent launches in the same turn would mutate this
+                # in the env, but we're tracking the FIRST launch only.
+                src_planet_row = next(
+                    (p for p in raw_planets if int(p[P_ID]) == src_pid),
+                    None,
+                )
+                if src_planet_row is not None and ships_sent is not None:
+                    src_ships = int(src_planet_row[P_SHIPS])
+                    if src_ships > 0:
+                        source_ships_before_val = src_ships
+                        ships_sent_val = int(ships_sent)
+                        # Frac is the BC label for the launch-fraction
+                        # head. Clamped lightly below at training time;
+                        # written here as raw ratio so downstream can
+                        # also derive ships_sent / source_ships_before.
+                        frac_label_val = float(ships_sent) / float(src_ships)
 
             writer.writerow([
                 episode_id,
@@ -232,6 +262,9 @@ def save_episode_action_csv(
                 target_idx,
                 expert_acted,
                 winner_seat,
+                ships_sent_val,
+                source_ships_before_val,
+                frac_label_val,
             ])
             rows_written += 1
 

@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -119,6 +120,73 @@ class PairScoreHead(nn.Module):
         return scores
 
 
+# Inference-side clamp on ``frac_log_std`` (matches the deleted PPO
+# decoder's contract — see runner.py dead-code path). Training-side
+# clamps are applied via ``torch.clamp`` in the loss / metric paths so
+# the parameter is free to drift slightly outside before the next
+# update; ``FRAC_LOG_STD_MIN``/``MAX`` correspond to σ ∈ [0.30, 1.0].
+FRAC_LOG_STD_MIN: float = math.log(0.30)
+FRAC_LOG_STD_MAX: float = math.log(1.0)
+FRAC_LOG_STD_INIT: float = math.log(0.5)
+FRAC_LABEL_EPS: float = 1e-3
+
+
+class FracHead(nn.Module):
+    """Per-``(source, target)`` launch-fraction predictor.
+
+    Shares the pair-feature shape with :class:`PairScoreHead` but is its
+    own module so existing ``pair_score_best.pt`` files (which only
+    carry ``pair_score_head`` state) load cleanly via ``--init-from``
+    — a fresh ``FracHead`` initialises from scratch on the first frac
+    run and gets saved alongside ``pair_score_head`` on subsequent ones.
+
+    Pair feature per ``(i, j)``:
+        h_ij = [ glob ‖ ctx_i ‖ ctx_j ‖ ctx_i ⊙ ctx_j ]   (4·d)
+
+    Output dict:
+        frac_loc      (B, P, P)   — predicted mean of ``z = logit(frac)``
+        frac_log_std  scalar      — Normal log-std shared across pairs
+
+    Loss-side: sparse — supervise only at the ground-truth pair index.
+    Inference-side: deterministic = ``sigmoid(clamp(loc, min=FRAC_Z_MIN))``,
+    stochastic = truncated-Normal inverse-CDF at ``FRAC_Z_MIN`` (see
+    ``agents/transformer_v1/runner.py``'s dead-code path for the
+    reference implementation).
+    """
+
+    def __init__(self, d_model: int = 64, hidden: int = 128):
+        super().__init__()
+        self.d_model = d_model
+        self.mlp = nn.Sequential(
+            nn.Linear(4 * d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
+        nn.init.zeros_(self.mlp[-1].bias)
+        nn.init.normal_(self.mlp[-1].weight, std=1e-3)
+        # Global log-std for the per-pair Normal. Init log(0.5) so σ in
+        # z space is ~0.5, which maps to a ~12% spread in frac space.
+        self.frac_log_std = nn.Parameter(torch.tensor(FRAC_LOG_STD_INIT))
+
+    def forward(
+        self,
+        glob: torch.Tensor,                  # (B, d)
+        ctx: torch.Tensor,                   # (B, P, d)
+    ) -> dict[str, torch.Tensor]:
+        B, P, d = ctx.shape
+        if d != self.d_model:
+            raise ValueError(
+                f"ctx d={d} but FracHead built for d_model={self.d_model}"
+            )
+        glob_b = glob.view(B, 1, 1, d).expand(B, P, P, d)
+        src = ctx.unsqueeze(2).expand(B, P, P, d)
+        tgt = ctx.unsqueeze(1).expand(B, P, P, d)
+        had = src * tgt
+        feat = torch.cat([glob_b, src, tgt, had], dim=-1)         # (B,P,P,4d)
+        loc = self.mlp(feat).squeeze(-1)                           # (B,P,P)
+        return {"frac_loc": loc, "frac_log_std": self.frac_log_std}
+
+
 class PairScoreStack(nn.Module):
     """Frozen encoders + trainable :class:`PairScoreHead`.
 
@@ -135,6 +203,7 @@ class PairScoreStack(nn.Module):
         entity_encoder: PlanetEntityEncoder,
         cross: CrossEntityAttention,
         pair_score_head: PairScoreHead,
+        frac_head: FracHead | None = None,
     ):
         super().__init__()
         self.fleet_encoder = fleet_encoder
@@ -142,6 +211,11 @@ class PairScoreStack(nn.Module):
         self.entity_encoder = entity_encoder
         self.cross = cross
         self.pair_score_head = pair_score_head
+        # FracHead is optional: when ``--frac-weight 0`` (default) the
+        # head is never built and the stack remains byte-identical to
+        # the pre-frac contract. When non-None, it adds ~33k params and
+        # contributes ``frac_loc``/``frac_log_std`` to ``forward()``.
+        self.frac_head = frac_head
 
     # Encoder modules accessible by short name. Keep this as the
     # authoritative ordering — CLI arg parsing + checkpoint save/load
@@ -157,13 +231,25 @@ class PairScoreStack(nn.Module):
         """Backwards-compat alias: freeze every encoder."""
         self.set_freeze_state(unfrozen=())
 
-    def set_freeze_state(self, unfrozen: tuple[str, ...] | list[str] | set[str]) -> None:
+    def set_freeze_state(
+        self,
+        unfrozen: tuple[str, ...] | list[str] | set[str],
+        *,
+        freeze_pair_head: bool = False,
+    ) -> None:
         """Set each encoder's train/grad mode based on whether its name
-        appears in ``unfrozen``. The head is always trainable.
+        appears in ``unfrozen``. The frac head (when present) is always
+        trainable; the pair head is trainable by default but can be
+        frozen via ``freeze_pair_head=True``.
 
         ``unfrozen`` may contain ``"cross"``, ``"entity"`` (= entity_encoder),
         ``"planet"`` (= planet_encoder), or ``"fleet"`` (= fleet_encoder).
         Anything else raises.
+
+        Stage-2 frac-only training pattern: pass ``freeze_pair_head=True``
+        + ``unfrozen=()`` so only the FracHead trains. The pair head's
+        already-tuned calibration is preserved bit-exact, and the
+        encoders' representation stays fixed too.
         """
         canon = self._canonicalize(unfrozen)
         for name in self.ENCODER_MODULES:
@@ -176,6 +262,21 @@ class PairScoreStack(nn.Module):
                 module.eval()
                 for p in module.parameters():
                     p.requires_grad_(False)
+        # Pair head: trainable by default, frozen on opt-in.
+        if freeze_pair_head:
+            self.pair_score_head.eval()
+            for p in self.pair_score_head.parameters():
+                p.requires_grad_(False)
+        else:
+            self.pair_score_head.train()
+            for p in self.pair_score_head.parameters():
+                p.requires_grad_(True)
+        # Frac head (when present) is always trainable — that's the
+        # whole point of building it.
+        if self.frac_head is not None:
+            self.frac_head.train()
+            for p in self.frac_head.parameters():
+                p.requires_grad_(True)
 
     @classmethod
     def _canonicalize(cls, names) -> set[str]:
@@ -208,16 +309,25 @@ class PairScoreStack(nn.Module):
         return out
 
     def trainable_module_state(self, unfrozen: set[str]) -> dict[str, dict]:
-        """Collect state-dicts for the head + every unfrozen encoder.
+        """Collect state-dicts for the pair head + (when present) the
+        frac head + **every** encoder (frozen or not).
 
-        Used by the checkpoint writer so an unfreeze-cross run can be
-        chained with another (e.g. unfreeze-cross-and-entity) by passing
-        its ``pair_score_best.pt`` as the next run's ``--init-from``.
+        Self-contained checkpoint: downstream consumers (PPO, inference,
+        a next stage of pair_score) should only need this one file to
+        reconstruct the stack — no second hop through the original
+        ``--encoder-ckpt`` action_best.pt. Encoder states are small
+        (~700 KB total) so always saving them keeps the ckpt under
+        ~2 MB even with the frac head.
+
+        ``unfrozen`` is accepted for backwards compat but no longer
+        gates saving — the parameter is kept so the train loop's call
+        site doesn't need to change.
         """
         out: dict[str, dict] = {"pair_score_head": self.pair_score_head.state_dict()}
+        if self.frac_head is not None:
+            out["frac_head"] = self.frac_head.state_dict()
         for name in self.ENCODER_MODULES:
-            if name in unfrozen:
-                out[name] = getattr(self, name).state_dict()
+            out[name] = getattr(self, name).state_dict()
         return out
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -273,11 +383,16 @@ class PairScoreStack(nn.Module):
                 tgt_valid[rows, tgt_idx[rows]] = True
 
         pair_logits = self.pair_score_head(glob, ctx_now, src_valid, tgt_valid)
-        return {
+        out: dict[str, torch.Tensor] = {
             "pair_logits": pair_logits,
             "_ctx_now": ctx_now,
             "_glob": glob,
         }
+        if self.frac_head is not None:
+            frac_out = self.frac_head(glob, ctx_now)
+            out["frac_loc"] = frac_out["frac_loc"]
+            out["frac_log_std"] = frac_out["frac_log_std"]
+        return out
 
 
 # ---------- Loss + metrics ----------
@@ -325,6 +440,125 @@ def compute_pair_score_loss(
         metrics["src_top1"] = float((pred // P == si).float().mean().item())
         metrics["tgt_top1"] = float((pred % P == ti).float().mean().item())
     return loss, metrics
+
+
+def compute_frac_loss(
+    preds: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    *,
+    frac_baseline_mae: float | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Normal NLL on ``z = logit(frac_label)``, sparse over acted rows.
+
+    Supervision is dense in ``frac_loc`` only at inference (the agent
+    samples the cell of its chosen ``(src, tgt)``). At loss time, only
+    the expert's actual ``(src_idx, tgt_idx)`` cell contributes gradient
+    — gathering one prediction per acted row keeps the optimizer from
+    confusing the head about pairs the expert didn't take.
+
+    Returns ``(nll, metrics)``. Metrics keys (always present so the
+    per-epoch summary doesn't branch):
+
+      * ``frac_loss``         — the NLL (== ``nll.item()``)
+      * ``frac_mae``          — mean ``|sigmoid(loc) - frac_label|`` in frac space
+      * ``frac_baseline_mae`` — passes the train-mean baseline through (or NaN)
+      * ``frac_sigma``        — ``exp(frac_log_std)`` after the inference clamp
+      * ``n_frac_valid``      — number of supervised rows this batch
+    """
+    frac_loc = preds.get("frac_loc")
+    frac_log_std = preds.get("frac_log_std")
+    if frac_loc is None or frac_log_std is None:
+        # Frac head not installed — nothing to do. Return a zero-grad
+        # sentinel so the caller can still sum it into the total loss.
+        zero = next(iter(preds.values())).sum() * 0.0
+        return zero, {
+            "frac_loss": 0.0,
+            "frac_mae": 0.0,
+            "frac_baseline_mae": (
+                float(frac_baseline_mae) if frac_baseline_mae is not None else float("nan")
+            ),
+            "frac_sigma": 0.0,
+            "n_frac_valid": 0.0,
+        }
+
+    device = frac_loc.device
+    src_idx = batch["source_planet_idx"].to(device).long()
+    tgt_idx = batch["target_planet_idx"].to(device).long()
+    frac_label = batch["frac_label"].to(device).float()
+    B, P, _ = frac_loc.shape
+
+    valid = (
+        (src_idx >= 0) & (tgt_idx >= 0)
+        & (src_idx < P) & (tgt_idx < P)
+        & torch.isfinite(frac_label)
+        & (frac_label > 0.0)
+    )
+    n_valid = int(valid.sum().item())
+
+    # Inference-side σ clamp (mirrors the deleted PPO decoder's contract).
+    sigma_disp = float(
+        frac_log_std.detach()
+        .clamp(min=FRAC_LOG_STD_MIN, max=FRAC_LOG_STD_MAX)
+        .exp()
+        .item()
+    )
+    metrics: dict[str, float] = {
+        "frac_loss": 0.0,
+        "frac_mae": 0.0,
+        "frac_baseline_mae": (
+            float(frac_baseline_mae) if frac_baseline_mae is not None else float("nan")
+        ),
+        "frac_sigma": sigma_disp,
+        "n_frac_valid": float(n_valid),
+    }
+    if n_valid == 0:
+        zero = frac_loc.sum() * 0.0 + frac_log_std * 0.0
+        return zero, metrics
+
+    rows = torch.nonzero(valid, as_tuple=True)[0]
+    loc_at = frac_loc[rows, src_idx[rows], tgt_idx[rows]]              # (n_valid,)
+
+    f_clamped = frac_label[rows].clamp(min=FRAC_LABEL_EPS, max=1.0 - FRAC_LABEL_EPS)
+    z_target = torch.log(f_clamped / (1.0 - f_clamped))
+
+    # Differentiable σ — clamp via ``torch.clamp`` (gradient passes through
+    # the active range). At training the optimizer can still drift the
+    # underlying log-std slightly outside; the inference-side display uses
+    # ``.detach()`` to read a static σ.
+    sigma = torch.clamp(frac_log_std, min=FRAC_LOG_STD_MIN, max=FRAC_LOG_STD_MAX).exp()
+    dist = torch.distributions.Normal(loc=loc_at, scale=sigma)
+    nll = -dist.log_prob(z_target).mean()
+
+    with torch.no_grad():
+        frac_pred = torch.sigmoid(loc_at)
+        metrics["frac_loss"] = float(nll.item())
+        metrics["frac_mae"] = float((frac_pred - frac_label[rows]).abs().mean().item())
+    return nll, metrics
+
+
+def compute_frac_baseline_mae(
+    dataset: ActionSnapshotDataset,
+    indices,
+) -> float:
+    """Constant-predictor MAE: ``mean(|frac_global_mean - frac_label|)`` over
+    every acted snapshot in ``indices``. Computed once (cheap, ≪1 s) so the
+    per-epoch summary can display a fixed "trivial predictor" floor.
+    """
+    fracs: list[float] = []
+    for i in indices:
+        snap = dataset.snapshots[i]
+        acted = float(snap["expert_acted"].item())
+        if acted <= 0.5:
+            continue
+        f = float(snap["frac_label"].item())
+        if not math.isfinite(f) or f <= 0.0:
+            continue
+        fracs.append(f)
+    if not fracs:
+        return float("nan")
+    arr = torch.tensor(fracs)
+    mean = arr.mean()
+    return float((arr - mean).abs().mean().item())
 
 
 @torch.no_grad()
@@ -493,6 +727,144 @@ def acted_only_indices(dataset: ActionSnapshotDataset) -> list[int]:
     return out
 
 
+# ---------- Dataset materialization (with on-disk cache) ----------
+DEFAULT_DATASET_CACHE_DIR: Path = (
+    Path(__file__).resolve().parents[3] / "data" / "datasets" / "_cache"
+)
+
+
+def _dataset_cache_path(
+    cache_dir: Path,
+    *,
+    player: str | None,
+    filter_mode: str,
+    max_planets: int,
+    max_fleets: int,
+    n_history: int,
+) -> Path:
+    """Stable cache filename keyed on (player, filter, dataset shape).
+
+    Different ``--max-planets`` / ``--max-fleets`` / ``--n-history``
+    materialize different tensor shapes; cache must not collide.
+    """
+    tag = (
+        f"{player or 'any'}_{filter_mode}_"
+        f"p{max_planets}_f{max_fleets}_h{n_history}.pt"
+    )
+    return Path(cache_dir) / tag
+
+
+def prepare_dataset(
+    *,
+    player: str | None = None,
+    filter_mode: str = "all",
+    action_dir: Path | str = ACTION_DATASET_DIR,
+    planet_dir: Path | str = PLANET_DATASET_DIR,
+    fleet_dir: Path | str = FLEET_DATASET_DIR,
+    entity_dir: Path | str = ENTITY_DATASET_DIR,
+    cross_entity_dir: Path | str = CROSS_ENTITY_DATASET_DIR,
+    replay_dir: Path | str = "data/replays",
+    max_planets: int = 64,
+    max_fleets: int = 256,
+    n_history: int = 3,
+    cache_dir: Path | str | None = None,
+    rebuild_cache: bool = False,
+) -> ActionSnapshotDataset:
+    """Build the action-snapshot dataset for one expert (in-memory).
+
+    Returns an :class:`ActionSnapshotDataset` ready to drop into the
+    train loop. CSV → tensor materialization takes ~3 min for an
+    Ebi-sized corpus (434 replays, ~120k snapshots), so the intended
+    pattern is: **call once per Colab session, hold the returned dataset
+    in a kernel variable, and pass it to** :func:`train_pair_score_kwargs`
+    **via the** ``dataset=`` **kwarg** for every subsequent training
+    re-run. That keeps training-cell re-runs near-instant.
+
+    ``cache_dir`` enables an on-disk cache for survival across kernel
+    restarts. **Off by default** — the cache file is ~9 GB for an
+    Ebi-sized corpus and the save itself takes longer than rebuilding
+    from CSVs, so it's only worth enabling for non-Colab CLI workflows
+    where the same Python process won't stay alive long enough to hold
+    the in-memory dataset across runs. Pass ``cache_dir='data/datasets/_cache'``
+    (or any path) to opt in. ``rebuild_cache=True`` forces a fresh
+    build even when a cache file exists — set after regenerating CSVs.
+    """
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = _dataset_cache_path(
+            cache_dir,
+            player=player, filter_mode=filter_mode,
+            max_planets=max_planets, max_fleets=max_fleets, n_history=n_history,
+        )
+
+    if cache_path is not None and cache_path.exists() and not rebuild_cache:
+        print(f"[prepare] cache hit: {cache_path}", flush=True)
+        t0 = time.time()
+        dataset = ActionSnapshotDataset.from_cache(cache_path)
+        print(
+            f"[prepare] loaded {len(dataset)} snapshots from cache "
+            f"in {time.time() - t0:.1f}s",
+            flush=True,
+        )
+        return dataset
+
+    if cache_path is not None:
+        print(
+            f"[prepare] cache miss at {cache_path}; building from CSVs ...",
+            flush=True,
+        )
+    t0 = time.time()
+    action_csvs = discover_action_csvs(
+        Path(action_dir),
+        filter_mode=filter_mode,
+        player=player,
+        replay_dir=Path(replay_dir) if player else None,
+    )
+    if not action_csvs:
+        raise SystemExit(
+            f"no action CSVs found under {action_dir} "
+            f"with player={player!r} filter={filter_mode!r}"
+        )
+    print(
+        f"[prepare] {len(action_csvs)} action CSVs "
+        f"(player={player or 'any'}, filter={filter_mode!r})",
+        flush=True,
+    )
+
+    def _other(stems: list[str], dir_path: Path, prefix: str) -> list[Path]:
+        return [dir_path / f"{prefix}{s}.csv" for s in stems
+                if (dir_path / f"{prefix}{s}.csv").exists()]
+    stems = [p.stem.removeprefix("action_") for p in action_csvs]
+    planet_csvs = _other(stems, Path(planet_dir), "planet_")
+    fleet_csvs = _other(stems, Path(fleet_dir), "fleet_")
+    entity_csvs = _other(stems, Path(entity_dir), "entity_")
+    cross_csvs = _other(stems, Path(cross_entity_dir), "cross_entity_")
+
+    dataset = ActionSnapshotDataset(
+        planet_csv_paths=planet_csvs,
+        fleet_csv_paths=fleet_csvs,
+        entity_csv_paths=entity_csvs,
+        cross_entity_csv_paths=cross_csvs,
+        action_csv_paths=action_csvs,
+        max_planets=max_planets,
+        max_fleets=max_fleets,
+        n_history=n_history,
+    )
+    build_s = time.time() - t0
+    print(
+        f"[prepare] built {len(dataset)} snapshots in {build_s:.1f}s",
+        flush=True,
+    )
+    if cache_path is not None:
+        print(f"[prepare] saving cache to {cache_path} ...", flush=True)
+        t0 = time.time()
+        dataset.save_cache(cache_path)
+        print(f"[prepare] cache saved in {time.time() - t0:.1f}s", flush=True)
+    return dataset
+
+
 # ---------- Training loop ----------
 def _train_one_epoch(
     stack: PairScoreStack,
@@ -500,21 +872,34 @@ def _train_one_epoch(
     optim: torch.optim.Optimizer,
     device: torch.device,
     unfrozen: set[str],
+    *,
+    frac_weight: float = 0.0,
+    frac_baseline_mae: float | None = None,
+    freeze_pair_head: bool = False,
 ) -> dict[str, float]:
     stack.train()
-    stack.set_freeze_state(unfrozen)  # frozen modules stay in eval mode
+    stack.set_freeze_state(unfrozen, freeze_pair_head=freeze_pair_head)
     sums: dict[str, float] = {}
     n_batches = 0
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
         preds = stack(batch)
-        loss, metrics = compute_pair_score_loss(preds, batch)
+        pair_loss, pair_metrics = compute_pair_score_loss(preds, batch)
+        loss = pair_loss
+        for k, v in pair_metrics.items():
+            sums[k] = sums.get(k, 0.0) + v
+        if frac_weight > 0.0:
+            frac_loss, frac_metrics = compute_frac_loss(
+                preds, batch, frac_baseline_mae=frac_baseline_mae,
+            )
+            loss = loss + frac_weight * frac_loss
+            for k, v in frac_metrics.items():
+                sums[k] = sums.get(k, 0.0) + v
         optim.zero_grad(set_to_none=True)
         loss.backward()
         optim.step()
         sums["loss"] = sums.get("loss", 0.0) + float(loss.item())
-        for k, v in metrics.items():
-            sums[k] = sums.get(k, 0.0) + v
+        sums["pair_loss"] = sums.get("pair_loss", 0.0) + float(pair_loss.item())
         n_batches += 1
     return {k: v / max(1, n_batches) for k, v in sums.items()}
 
@@ -524,6 +909,9 @@ def _evaluate(
     stack: PairScoreStack,
     loader: DataLoader,
     device: torch.device,
+    *,
+    frac_weight: float = 0.0,
+    frac_baseline_mae: float | None = None,
 ) -> dict[str, float]:
     stack.eval()
     sums: dict[str, float] = {}
@@ -531,10 +919,19 @@ def _evaluate(
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
         preds = stack(batch)
-        loss, metrics = compute_pair_score_loss(preds, batch)
-        sums["loss"] = sums.get("loss", 0.0) + float(loss.item())
-        for k, v in metrics.items():
+        pair_loss, pair_metrics = compute_pair_score_loss(preds, batch)
+        total = pair_loss
+        for k, v in pair_metrics.items():
             sums[k] = sums.get(k, 0.0) + v
+        if frac_weight > 0.0:
+            frac_loss, frac_metrics = compute_frac_loss(
+                preds, batch, frac_baseline_mae=frac_baseline_mae,
+            )
+            total = total + frac_weight * frac_loss
+            for k, v in frac_metrics.items():
+                sums[k] = sums.get(k, 0.0) + v
+        sums["loss"] = sums.get("loss", 0.0) + float(total.item())
+        sums["pair_loss"] = sums.get("pair_loss", 0.0) + float(pair_loss.item())
         sums["random_valid_top1"] = (
             sums.get("random_valid_top1", 0.0) + random_valid_baseline(batch, device)
         )
@@ -542,7 +939,20 @@ def _evaluate(
     return {k: v / max(1, n_batches) for k, v in sums.items()}
 
 
-def train_pair_score(args: argparse.Namespace) -> Path:
+def train_pair_score(
+    args: argparse.Namespace,
+    *,
+    dataset: ActionSnapshotDataset | None = None,
+) -> Path:
+    """Run the pair-score (+ optional frac) training loop.
+
+    ``dataset`` (kwarg-only): pass a pre-built :class:`ActionSnapshotDataset`
+    to skip CSV parsing entirely. This is the fast notebook path —
+    materialize once via :func:`prepare_dataset` into a kernel variable,
+    then call this for each hyperparameter iteration. When ``None`` the
+    function falls back to ``prepare_dataset(...)`` with the args'
+    configuration.
+    """
     device = torch.device(args.device)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -560,45 +970,35 @@ def train_pair_score(args: argparse.Namespace) -> Path:
         args.encoder_ckpt, d_model=args.d_model, device=str(device),
     )
 
-    # ---- 2. Build dataset ----
-    action_csvs = discover_action_csvs(
-        Path(args.action_dir),
-        filter_mode=args.filter,
-        player=args.player,
-        replay_dir=Path(args.replay_dir) if args.player else None,
-    )
-    if not action_csvs:
-        raise SystemExit(
-            f"no action CSVs found under {args.action_dir} "
-            f"with player={args.player!r} filter={args.filter!r}"
+    # ---- 2. Get the dataset ----
+    # If the caller passed one in via the ``dataset`` kwarg (notebook
+    # pattern: one ``prepare_dataset`` call earlier in the session, held
+    # in a kernel variable), reuse it as-is. Otherwise build now,
+    # respecting ``--cache-dir`` / ``--rebuild-cache``.
+    if dataset is None:
+        cache_dir = getattr(args, "cache_dir", None)
+        rebuild_cache = bool(getattr(args, "rebuild_cache", False))
+        dataset = prepare_dataset(
+            player=args.player,
+            filter_mode=args.filter,
+            action_dir=args.action_dir,
+            planet_dir=args.planet_dir,
+            fleet_dir=args.fleet_dir,
+            entity_dir=args.entity_dir,
+            cross_entity_dir=args.cross_entity_dir,
+            replay_dir=args.replay_dir,
+            max_planets=args.max_planets,
+            max_fleets=args.max_fleets,
+            n_history=args.n_history,
+            cache_dir=cache_dir,
+            rebuild_cache=rebuild_cache,
         )
-    print(
-        f"[pair_score] {len(action_csvs)} action CSVs "
-        f"(player={args.player or 'any'}, filter={args.filter!r})",
-        flush=True,
-    )
-
-    # Match planet/fleet/entity/cross_entity CSVs by stem.
-    def _other(stems: list[str], dir_path: Path, prefix: str) -> list[Path]:
-        return [dir_path / f"{prefix}{s}.csv" for s in stems
-                if (dir_path / f"{prefix}{s}.csv").exists()]
-    stems = [p.stem.removeprefix("action_") for p in action_csvs]
-    planet_csvs = _other(stems, Path(args.planet_dir), "planet_")
-    fleet_csvs = _other(stems, Path(args.fleet_dir), "fleet_")
-    entity_csvs = _other(stems, Path(args.entity_dir), "entity_")
-    cross_csvs = _other(stems, Path(args.cross_entity_dir), "cross_entity_")
-
-    dataset = ActionSnapshotDataset(
-        planet_csv_paths=planet_csvs,
-        fleet_csv_paths=fleet_csvs,
-        entity_csv_paths=entity_csvs,
-        cross_entity_csv_paths=cross_csvs,
-        action_csv_paths=action_csvs,
-        max_planets=args.max_planets,
-        max_fleets=args.max_fleets,
-        n_history=args.n_history,
-    )
-    print(f"[pair_score] dataset size: {len(dataset)} snapshots", flush=True)
+    else:
+        print(
+            f"[pair_score] using caller-provided dataset "
+            f"({len(dataset)} snapshots) — skipping CSV parse",
+            flush=True,
+        )
 
     # ---- 3. Filter to acted rows; cap at --max-rows ----
     acted_idx = acted_only_indices(dataset)
@@ -618,14 +1018,22 @@ def train_pair_score(args: argparse.Namespace) -> Path:
     val_set = Subset(dataset, val_idx)
     print(f"[pair_score] train={len(train_set)} val={len(val_set)}", flush=True)
 
-    # ---- 4. Build pair head + stack ----
+    # ---- 4. Build pair head + (optional) frac head + stack ----
     head = PairScoreHead(d_model=args.d_model, hidden=args.hidden).to(device)
+    frac_weight = float(getattr(args, "frac_weight", 0.0) or 0.0)
+    frac_head: FracHead | None = None
+    if frac_weight > 0.0:
+        frac_hidden = int(getattr(args, "frac_hidden", args.hidden) or args.hidden)
+        frac_head = FracHead(d_model=args.d_model, hidden=frac_hidden).to(device)
+        print(f"[pair_score] frac head enabled (weight={frac_weight}, "
+              f"hidden={frac_hidden}, init log_std={FRAC_LOG_STD_INIT:.3f})", flush=True)
     stack = PairScoreStack(
         fleet_encoder=fenc,
         planet_encoder=penc,
         entity_encoder=eenc,
         cross=cross,
         pair_score_head=head,
+        frac_head=frac_head,
     ).to(device)
 
     # ---- 4b. Optional resume from a prior pair_score_best.pt ----
@@ -644,10 +1052,33 @@ def train_pair_score(args: argparse.Namespace) -> Path:
             if name in prior:
                 getattr(stack, name).load_state_dict(prior[name])
                 print(f"[pair_score] init-from: loaded {name} state", flush=True)
+        # Frac head reuse: only meaningful when we built one for this run.
+        if frac_head is not None:
+            if "frac_head" in prior:
+                frac_head.load_state_dict(prior["frac_head"])
+                print("[pair_score] init-from: loaded frac_head state", flush=True)
+            else:
+                print("[pair_score] init-from: frac_head missing in ckpt; "
+                      "initialized from scratch", flush=True)
         print(f"[pair_score] init-from: loaded pair_score_head from "
               f"{init_from} (epoch={prior.get('epoch')})", flush=True)
 
-    stack.set_freeze_state(unfrozen)
+    freeze_pair_head = bool(getattr(args, "freeze_pair_head", False))
+    if freeze_pair_head:
+        print("[pair_score] pair head FROZEN (stage-2 mode: only frac head + "
+              "any --unfreeze encoders are trainable)", flush=True)
+    stack.set_freeze_state(unfrozen, freeze_pair_head=freeze_pair_head)
+
+    # ---- 4c. Train-split baseline for frac MAE (constant predictor) ----
+    frac_baseline_mae: float | None = None
+    if frac_weight > 0.0:
+        frac_baseline_mae = compute_frac_baseline_mae(dataset, train_idx)
+        if math.isfinite(frac_baseline_mae):
+            print(f"[pair_score] frac baseline MAE (constant predictor on train): "
+                  f"{frac_baseline_mae:.4f}", flush=True)
+        else:
+            print("[pair_score] frac baseline MAE: NaN (no acted train rows had "
+                  "finite frac_label)", flush=True)
 
     # AdamW over every parameter that's actually trainable now (head +
     # any unfrozen encoders). filter is needed because frozen params
@@ -673,11 +1104,20 @@ def train_pair_score(args: argparse.Namespace) -> Path:
     log_path = out_dir / "log.json"
     log_entries: list[dict[str, Any]] = []
 
+    sigma_pinned_epochs = 0  # count epochs where log_std hit either clamp
+
     t0 = time.time()
     for epoch in range(1, args.epochs + 1):
         t_epoch = time.time()
-        train_metrics = _train_one_epoch(stack, train_loader, optim, device, unfrozen)
-        val_metrics = _evaluate(stack, val_loader, device)
+        train_metrics = _train_one_epoch(
+            stack, train_loader, optim, device, unfrozen,
+            frac_weight=frac_weight, frac_baseline_mae=frac_baseline_mae,
+            freeze_pair_head=freeze_pair_head,
+        )
+        val_metrics = _evaluate(
+            stack, val_loader, device,
+            frac_weight=frac_weight, frac_baseline_mae=frac_baseline_mae,
+        )
         elapsed = time.time() - t0
         log = {
             "epoch": epoch,
@@ -688,6 +1128,22 @@ def train_pair_score(args: argparse.Namespace) -> Path:
         }
         log_entries.append(log)
         log_path.write_text(json.dumps(log_entries, indent=2))
+
+        # Per-epoch summary: always shows pair metrics; frac block only
+        # appears when ``--frac-weight > 0`` so the no-frac path keeps
+        # its existing log format (smoke regression #2).
+        frac_block = ""
+        if frac_weight > 0.0:
+            frac_block = (
+                f"  ||  tr_frac_mae={train_metrics.get('frac_mae', 0):.3f} "
+                f"val_frac_mae={val_metrics.get('frac_mae', 0):.3f} "
+                f"vs_baseline={val_metrics.get('frac_baseline_mae', float('nan')):.3f} "
+                f"frac_sigma={val_metrics.get('frac_sigma', 0):.3f}"
+            )
+            sigma_disp = val_metrics.get("frac_sigma", 0.0)
+            if sigma_disp <= math.exp(FRAC_LOG_STD_MIN) + 1e-6 \
+                    or sigma_disp >= math.exp(FRAC_LOG_STD_MAX) - 1e-6:
+                sigma_pinned_epochs += 1
         print(
             f"[pair_score] ep={epoch:3d} "
             f"tr_loss={train_metrics.get('loss', 0):.4f} "
@@ -696,36 +1152,137 @@ def train_pair_score(args: argparse.Namespace) -> Path:
             f"val_top1={val_metrics.get('top1', 0):.3f} "
             f"val_top3={val_metrics.get('top3', 0):.3f} "
             f"val_top5={val_metrics.get('top5', 0):.3f} "
-            f"rand={val_metrics.get('random_valid_top1', 0):.3f} "
+            f"rand={val_metrics.get('random_valid_top1', 0):.3f}"
+            f"{frac_block}  "
             f"dt={time.time() - t_epoch:.1f}s",
             flush=True,
         )
 
-        # Save last + best. Include any unfrozen encoder state so a
-        # follow-up run can resume via --init-from.
+        # Save last + best. Include any unfrozen encoder state and the
+        # frac head (when built) so a follow-up run can resume via
+        # ``--init-from``.
         ckpt_payload: dict = {
             "epoch": epoch,
             "encoder_ckpt": str(args.encoder_ckpt),
             "init_from": str(init_from) if init_from else None,
             "unfrozen": sorted(unfrozen),
+            "frac_weight": frac_weight,
             "config": {
                 "d_model": args.d_model,
                 "hidden": args.hidden,
                 "max_planets": args.max_planets,
                 "max_fleets": args.max_fleets,
                 "n_history": args.n_history,
+                "frac_hidden": int(getattr(args, "frac_hidden", args.hidden) or args.hidden),
             },
             "metrics": {"train": train_metrics, "val": val_metrics},
         }
+        if frac_weight > 0.0:
+            ckpt_payload["frac_baseline_mae"] = (
+                float(frac_baseline_mae) if frac_baseline_mae is not None else float("nan")
+            )
         ckpt_payload.update(stack.trainable_module_state(unfrozen))
         torch.save(ckpt_payload, last_path)
         if val_metrics.get("loss", float("inf")) < best_val_loss:
             best_val_loss = val_metrics["loss"]
             torch.save(torch.load(last_path, weights_only=False), best_path)
 
+    if frac_weight > 0.0 and args.epochs > 0:
+        pin_ratio = sigma_pinned_epochs / args.epochs
+        if pin_ratio >= 0.8:
+            print(
+                f"[pair_score] WARNING: frac_log_std pinned at a clamp "
+                f"boundary for {sigma_pinned_epochs}/{args.epochs} epochs "
+                f"({pin_ratio:.0%}). Pinned-low = overconfident, "
+                f"pinned-high = uncertainty-dominated. Revisit "
+                f"FRAC_LOG_STD_INIT or --frac-weight.",
+                flush=True,
+            )
+
     print(f"[pair_score] done. best_val_loss={best_val_loss:.4f} "
           f"ckpts: {best_path.name}, {last_path.name}", flush=True)
     return best_path
+
+
+# ---------- In-kernel entry point ----------
+def train_pair_score_kwargs(
+    *,
+    encoder_ckpt,
+    out_dir,
+    action_dir=ACTION_DATASET_DIR,
+    planet_dir=PLANET_DATASET_DIR,
+    fleet_dir=FLEET_DATASET_DIR,
+    entity_dir=ENTITY_DATASET_DIR,
+    cross_entity_dir=CROSS_ENTITY_DATASET_DIR,
+    filter="all",
+    player=None,
+    replay_dir="data/replays",
+    max_rows=None,
+    overfit=False,
+    val_frac=0.2,
+    batch_size=64,
+    lr=1e-3,
+    weight_decay=0.0,
+    epochs=10,
+    d_model=64,
+    hidden=128,
+    max_planets=64,
+    max_fleets=256,
+    n_history=3,
+    device=None,
+    unfreeze=None,
+    init_from=None,
+    frac_weight=0.0,
+    frac_hidden=128,
+    freeze_pair_head=False,
+    cache_dir=None,
+    rebuild_cache=False,
+    dataset=None,
+) -> Path:
+    """Run :func:`train_pair_score` in the calling Python process.
+
+    Same surface as the CLI but no ``argparse`` and no ``subprocess`` —
+    every ``print(...)`` inside the trainer streams directly into the
+    caller's stdout (e.g. a Jupyter cell), so progress is visible epoch
+    by epoch instead of waiting for the subprocess to flush a buffer.
+
+    ``device`` defaults to ``cuda`` if available, else ``cpu``.
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    args = argparse.Namespace(
+        encoder_ckpt=Path(encoder_ckpt),
+        action_dir=Path(action_dir),
+        planet_dir=Path(planet_dir),
+        fleet_dir=Path(fleet_dir),
+        entity_dir=Path(entity_dir),
+        cross_entity_dir=Path(cross_entity_dir),
+        filter=filter,
+        player=player,
+        replay_dir=Path(replay_dir),
+        max_rows=max_rows,
+        overfit=overfit,
+        val_frac=val_frac,
+        batch_size=batch_size,
+        lr=lr,
+        weight_decay=weight_decay,
+        epochs=epochs,
+        d_model=d_model,
+        hidden=hidden,
+        max_planets=max_planets,
+        max_fleets=max_fleets,
+        n_history=n_history,
+        device=device,
+        out_dir=Path(out_dir),
+        unfreeze=unfreeze,
+        init_from=Path(init_from) if init_from is not None else None,
+        frac_weight=float(frac_weight),
+        frac_hidden=int(frac_hidden),
+        freeze_pair_head=bool(freeze_pair_head),
+        cache_dir=(Path(cache_dir) if cache_dir is not None else None),
+        rebuild_cache=bool(rebuild_cache),
+    )
+    return train_pair_score(args, dataset=dataset)
 
 
 # ---------- CLI ----------
@@ -771,9 +1328,32 @@ def main() -> None:
                         "Example: --unfreeze cross,entity")
     p.add_argument("--init-from", type=Path, default=None,
                    help="Resume from a prior pair_score_best.pt. Loads the "
-                        "head and any previously-thawed encoder state. "
-                        "Encoders not in the prior file fall back to the "
-                        "ones in --encoder-ckpt.")
+                        "head, frac head (if present), and any previously-"
+                        "thawed encoder state. Modules not in the prior "
+                        "file fall back to fresh init / --encoder-ckpt.")
+    p.add_argument("--frac-weight", type=float, default=0.0,
+                   help="Weight for the launch-fraction Normal-NLL loss "
+                        "(0.0 = disabled, no FracHead built, log format "
+                        "matches the pre-frac contract). 0.5 is a sane "
+                        "joint-training start.")
+    p.add_argument("--frac-hidden", type=int, default=128,
+                   help="Hidden width of the FracHead MLP. "
+                        "Ignored when --frac-weight 0.")
+    p.add_argument("--freeze-pair-head", action="store_true",
+                   help="Freeze the pair-score head (no gradient flows). "
+                        "Stage-2 frac-only pattern: pair head + all "
+                        "encoders frozen, only FracHead trains. Combine "
+                        "with --init-from <pair-trained best.pt>.")
+    p.add_argument("--cache-dir", type=Path, default=None,
+                   help="Optional on-disk cache for the materialized "
+                        "ActionSnapshotDataset. Off by default — the cache "
+                        "file can be multi-GB and saves take as long as a "
+                        "rebuild, so it's only worth enabling for non-"
+                        "Colab CLI workflows. Pass e.g. "
+                        f"--cache-dir {DEFAULT_DATASET_CACHE_DIR} to opt in.")
+    p.add_argument("--rebuild-cache", action="store_true",
+                   help="Force a fresh CSV parse even when a cache file exists "
+                        "(set this after regenerating action CSVs).")
     args = p.parse_args()
     train_pair_score(args)
 

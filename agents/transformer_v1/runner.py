@@ -1,25 +1,38 @@
-"""UI-runnable agent: wraps the freeze-trained action policy + physical helper.
+"""UI-runnable agent: pair-score + frac stack loaded from a combined ckpt.
 
-Loads ``action_best.pt`` from a freeze-train run, runs the policy each
-tick to pick a (source, target) planet pair, then delegates to the
-same physics primitives ``physical_v4`` uses (lead-aim, surplus check,
-ETA) to produce the ``[planet_id, angle, ships]`` action triples that
-``orbit_wars`` expects.
+Loads a ``pair_score_best.pt`` (FleetEncoder + PlanetEncoder +
+PlanetEntityEncoder + CrossEntityAttention + PairScoreHead + optional
+FracHead, all in one file) and runs inference each tick:
+
+  1. Featurize the obs via :func:`featurize_observation`.
+  2. Forward through :class:`PairScoreStack` to get per-pair logits and
+     (when the FracHead is present) per-pair launch-fraction loc.
+  3. Mask invalid pairs — source must be ours + launchable, target
+     must not be ours — then ``argmax`` the masked ``pair_logits``.
+  4. Look up ``frac_loc[src, tgt]`` (or fall back to the heuristic ship
+     sizing when the ckpt has no frac head), apply the deterministic
+     ``sigmoid(clamp(z, FRAC_Z_MIN))`` recipe, and convert to a ship
+     count.
+  5. Hand off to :func:`shoot_static` / :func:`shoot_orbit` /
+     :func:`shoot_comet` for the actual launch angle.
 
 Smoke test:
 
     python -m agents.transformer_v1.runner --smoke-test \\
-        --ckpt data/runs/action/<run>/action_best.pt
+        --ckpt data/runs/pair_score/<run>/pair_score_best.pt
 
 Plug into UI / runner:
 
     from agents.transformer_v1 import runner   # registers `transformer_v1`
     Agent("transformer_v1")                     # via agents.registry
 
-Note: the registry decorator runs on import. ``run.py`` already imports
-the agents package, which imports this module via the registry-loading
-path, so just ensure ``import agents.transformer_v1.runner`` lands in
-the import graph.
+The registry decorator runs on import — ``run.py`` already imports the
+agents package, which pulls this module in via the registry-loading
+path, so the agent is available wherever the registry is.
+
+Default ckpt resolution (override with the ``TRANSFORMER_V1_CKPT`` env
+var or :meth:`TransformerAgent.load`'s ``ckpt_path`` arg): newest
+``pair_score_best.pt`` under ``data/runs/pair_score/<run>/``.
 """
 
 from __future__ import annotations
@@ -46,45 +59,53 @@ from ..physics_utils import (
     _is_orbiting_xy, _infer_rotation_sign_raw,
 )
 from ..registry import register
+from .aggregator import CrossEntityAttention
+from .encoder import (
+    FleetEncoder, PlanetEncoder, PlanetEntityEncoder,
+)
 from .featurizer import FleetTracker, featurize_observation
 from .paths import ACTION_RUNS_DIR
-# The decoder layer was removed during the encoder-freeze + pair-head
-# smoke test redesign. ``TransformerAgent.load`` and ``_predict`` raise
-# ``NotImplementedError`` rather than dispatching against a non-existent
-# action decoder. See agents/transformer_v1/pretrain/pair_score.py.
-_DECODER_REMOVED_MSG = (
-    "transformer_v1 action decoder was removed; runner.py is currently "
-    "non-functional. The encoder stack is being validated via "
-    "`agents.transformer_v1.pretrain.pair_score` (PairScoreHead). "
-    "Reinstate a runtime decoder before using this agent in a game."
+from .pretrain.expert_action import FRAC_Z_MIN
+from .pretrain.pair_score import (
+    FRAC_LOG_STD_MAX,
+    FRAC_LOG_STD_MIN,
+    FracHead,
+    PairScoreHead,
+    PairScoreStack,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+PAIR_SCORE_RUNS_DIR: Path = _REPO_ROOT / "data" / "runs" / "pair_score"
 
 
 # ---- Default ckpt resolution ----
 def _default_ckpt() -> Path:
-    """Pick the newest ``action_best.pt`` (or ``action_last.pt``) under
-    ``data/runs/action/``. Override with ``TRANSFORMER_V1_CKPT`` env var.
+    """Pick the newest ``pair_score_best.pt`` (or ``pair_score_last.pt``)
+    under ``data/runs/pair_score/<run>/``. Override with the
+    ``TRANSFORMER_V1_CKPT`` env var or by passing ``ckpt_path`` to
+    :meth:`TransformerAgent.load`.
     """
     env_override = os.environ.get("TRANSFORMER_V1_CKPT")
     if env_override:
         return Path(env_override)
-    if not ACTION_RUNS_DIR.exists():
+    if not PAIR_SCORE_RUNS_DIR.exists():
         raise FileNotFoundError(
-            f"no action runs dir at {ACTION_RUNS_DIR}; train an action "
-            "policy first or set TRANSFORMER_V1_CKPT."
+            f"no pair_score runs dir at {PAIR_SCORE_RUNS_DIR}; train a "
+            "pair-score (+ optional frac) policy first or set "
+            "TRANSFORMER_V1_CKPT to a saved ckpt path."
         )
     candidates: list[Path] = []
-    for run_dir in sorted(ACTION_RUNS_DIR.iterdir()):
+    for run_dir in sorted(PAIR_SCORE_RUNS_DIR.iterdir()):
         if not run_dir.is_dir():
             continue
-        for name in ("action_best.pt", "action_last.pt"):
+        for name in ("pair_score_best.pt", "pair_score_last.pt"):
             p = run_dir / name
             if p.exists():
                 candidates.append(p)
                 break
     if not candidates:
         raise FileNotFoundError(
-            f"no action_*.pt under {ACTION_RUNS_DIR}/*/."
+            f"no pair_score_*.pt under {PAIR_SCORE_RUNS_DIR}/*/."
         )
     return candidates[-1]
 
@@ -134,11 +155,11 @@ def _learner_aim(
 
 
 class TransformerAgent:
-    """Inference wrapper around a freeze-trained action policy."""
+    """Inference wrapper around a pair-score (+ optional frac) policy."""
 
     def __init__(
         self,
-        stack: torch.nn.Module,
+        stack: PairScoreStack,
         *,
         device: str = "cpu",
         deterministic: bool = True,
@@ -164,19 +185,98 @@ class TransformerAgent:
         device: str | None = None,
         deterministic: bool = True,
     ) -> "TransformerAgent":
-        raise NotImplementedError(_DECODER_REMOVED_MSG)
+        """Reconstruct the stack from a combined ``pair_score_best.pt``.
+
+        The ckpt is expected to carry every encoder's state_dict + the
+        pair-score head state, with the FracHead state optional. Configs
+        for module dims come from the ckpt's ``config`` block; max_planets
+        / max_fleets / n_history default to the saved values, falling back
+        to the production defaults if missing.
+        """
+        ckpt_path = Path(ckpt_path) if ckpt_path is not None else _default_ckpt()
+        if not ckpt_path.exists():
+            raise FileNotFoundError(
+                f"transformer_v1 ckpt not found at {ckpt_path}. "
+                "Train a pair_score model first or set TRANSFORMER_V1_CKPT."
+            )
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        if "pair_score_head" not in ckpt:
+            raise ValueError(
+                f"{ckpt_path} has no 'pair_score_head' key — expected the "
+                "output of agents/transformer_v1/pretrain/pair_score.py."
+            )
+        for k in ("fleet_encoder", "planet_encoder", "entity_encoder", "cross"):
+            if k not in ckpt:
+                raise ValueError(
+                    f"{ckpt_path} is missing '{k}' state — pair_score ckpts "
+                    "since the self-contained refactor should carry every "
+                    "encoder. Re-train with current code, or pass the older "
+                    "action_best.pt path instead."
+                )
+
+        cfg = ckpt.get("config") or {}
+        d_model = int(cfg.get("d_model", 64))
+        hidden = int(cfg.get("hidden", 128))
+        frac_hidden = int(cfg.get("frac_hidden", hidden))
+        max_planets = int(cfg.get("max_planets", 64))
+        max_fleets = int(cfg.get("max_fleets", 256))
+
+        fenc = FleetEncoder(d_model=d_model)
+        fenc.load_state_dict(ckpt["fleet_encoder"])
+        penc = PlanetEncoder(d_model=d_model)
+        penc.load_state_dict(ckpt["planet_encoder"])
+        eenc = PlanetEntityEncoder(d_model=d_model)
+        eenc.load_state_dict(ckpt["entity_encoder"])
+        cross = CrossEntityAttention(d_model=d_model)
+        cross.load_state_dict(ckpt["cross"])
+
+        pair_head = PairScoreHead(d_model=d_model, hidden=hidden)
+        pair_head.load_state_dict(ckpt["pair_score_head"])
+
+        # FracHead is optional in the ckpt — older pair-only runs didn't
+        # write one. When absent, the agent falls back to physical_v4's
+        # surplus-based ship sizing in :meth:`_target_to_moves`.
+        frac_head: FracHead | None = None
+        if "frac_head" in ckpt:
+            frac_head = FracHead(d_model=d_model, hidden=frac_hidden)
+            frac_head.load_state_dict(ckpt["frac_head"])
+
+        stack = PairScoreStack(
+            fleet_encoder=fenc,
+            planet_encoder=penc,
+            entity_encoder=eenc,
+            cross=cross,
+            pair_score_head=pair_head,
+            frac_head=frac_head,
+        )
+        return cls(
+            stack,
+            device=device,
+            deterministic=deterministic,
+            max_planets=max_planets,
+            max_fleets=max_fleets,
+        )
 
     @torch.no_grad()
     def _predict(
         self,
         obs: dict[str, Any],
         learner_slot: int,
-        return_rollout: bool = False,
-    ) -> tuple[int | None, int | None, dict[int, int]]:
-        """Disabled while the action decoder is being redesigned."""
-        raise NotImplementedError(_DECODER_REMOVED_MSG)
-        # --- Original implementation kept below as a reference for the
-        # pair-head bring-up; never reached because of the raise above. ---
+    ) -> tuple[int | None, int | None, float | None]:
+        """Return ``(source_pid, target_pid, frac_or_None)`` for the
+        current turn.
+
+        ``frac`` is the deterministic ``sigmoid(clamp(z, FRAC_Z_MIN))``
+        sampled at ``frac_loc[src, tgt]`` when the loaded stack has a
+        FracHead; ``None`` when it doesn't, in which case the caller
+        falls back to ``physical_v4``'s surplus-based ship sizing.
+
+        Returns ``(None, None, None)`` if the agent has no legal
+        ``(source, target)`` pair this turn — empty owned planets,
+        no surplus, or every candidate masked out by the
+        ``planet/launchable`` / ``not-self`` filters.
+        """
         batch, pid_to_idx = featurize_observation(
             obs,
             learner_slot=learner_slot,
@@ -187,25 +287,15 @@ class TransformerAgent:
             device=self.device,
         )
         out = self.stack(batch)
+        pair_logits = out["pair_logits"].squeeze(0)               # (P, P)
+        frac_loc = out.get("frac_loc")
+        if frac_loc is not None:
+            frac_loc = frac_loc.squeeze(0)                         # (P, P)
 
-        acted_logit = out["expert_acted_logit"].squeeze(0)
-        acted_logit_val = float(acted_logit.squeeze().item())
-        if not return_rollout:
-            if self.deterministic:
-                if acted_logit_val < 0.0:
-                    # Sigmoid < 0.5 → policy says skip this turn.
-                    return None, None, pid_to_idx
-            else:
-                acted_dist = torch.distributions.Bernoulli(logits=acted_logit)
-                if int(acted_dist.sample().item()) == 0:
-                    return None, None, pid_to_idx
-
-        src_logits = out["source_planet_logits"].squeeze(0)   # (P,)
-        tgt_logits = out["target_planet_logits"].squeeze(0)   # (P,)
-        # Mask own / non-existent planet slots for the source head and
-        # own planets for the target head (we don't reinforce ourselves
-        # in v1).
+        P = pair_logits.size(0)
         idx_to_pid = {i: pid for pid, i in pid_to_idx.items()}
+
+        # ---- Build launchable / ownership masks from obs ----
         get = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
         raw_planets = get("planets") or []
         raw_fleets = get("fleets") or []
@@ -233,134 +323,57 @@ class TransformerAgent:
                     launchable_by_idx[idx] = (
                         owner == learner_slot and surplus >= min_launch
                     )
-        neg_inf = torch.finfo(src_logits.dtype).min
-        for i in range(src_logits.size(0)):
+
+        neg_inf = torch.finfo(pair_logits.dtype).min
+        # Build per-row / per-col legal masks. A source row is legal iff
+        # the corresponding planet exists, is ours, and has spend room;
+        # a target column is legal iff the planet exists and is NOT ours
+        # (we don't reinforce ourselves through the pair head — that's
+        # what frac=0 would be for, which we don't predict).
+        src_legal = torch.zeros(P, dtype=torch.bool, device=pair_logits.device)
+        tgt_legal = torch.zeros(P, dtype=torch.bool, device=pair_logits.device)
+        for i in range(P):
             if i not in idx_to_pid:
-                src_logits[i] = neg_inf
-                tgt_logits[i] = neg_inf
                 continue
-            owner = owner_by_idx.get(i, -1)
-            if not launchable_by_idx.get(i, False):
-                src_logits[i] = neg_inf  # source must be ours and launchable
-            if owner == learner_slot:
-                tgt_logits[i] = neg_inf  # don't pick own as target
+            if launchable_by_idx.get(i, False):
+                src_legal[i] = True
+            if owner_by_idx.get(i, -1) != learner_slot:
+                tgt_legal[i] = True
 
-        neg_inf_val = torch.finfo(src_logits.dtype).min
-        all_src_inf = bool((src_logits <= neg_inf_val / 2).all())
-        all_tgt_inf = bool((tgt_logits <= neg_inf_val / 2).all())
-        if (all_src_inf or all_tgt_inf) and not return_rollout:
-            return None, None, pid_to_idx
+        pair_mask = src_legal.unsqueeze(1) & tgt_legal.unsqueeze(0)   # (P, P)
+        if not pair_mask.any():
+            return None, None, None
+        masked = pair_logits.masked_fill(~pair_mask, neg_inf)
 
-        if all_src_inf or all_tgt_inf:
-            src_idx = -1
-            tgt_idx = -1
-        elif self.deterministic:
-            src_idx = int(src_logits.argmax().item())
-            tgt_idx = int(tgt_logits.argmax().item())
+        if self.deterministic:
+            flat_idx = int(masked.reshape(-1).argmax().item())
         else:
-            src_idx = int(torch.multinomial(torch.softmax(src_logits, -1), 1).item())
-            tgt_idx = int(torch.multinomial(torch.softmax(tgt_logits, -1), 1).item())
+            probs = torch.softmax(masked.reshape(-1), dim=-1)
+            flat_idx = int(torch.multinomial(probs, 1).item())
+        src_idx = flat_idx // P
+        tgt_idx = flat_idx % P
 
-        if return_rollout:
-            if all_src_inf or all_tgt_inf:
-                acted_int = 0
-            elif self.deterministic:
-                acted_int = 1 if acted_logit_val >= 0.0 else 0
-            else:
-                acted_dist = torch.distributions.Bernoulli(logits=acted_logit)
-                acted_int = int(acted_dist.sample().item())
-            value = float(out.get("value", torch.zeros(1, device=self.device)).squeeze().item()) \
-                if "value" in out else 0.0
-            if "frac_logits" in out:
-                frac_logits = out["frac_logits"].squeeze(0)
-            else:
-                frac_logits = torch.zeros(self.max_planets, device=self.device)
+        # Frac extraction: ``sigmoid(clamp(z, FRAC_Z_MIN))`` per the
+        # inference contract that lines up with the deleted PPO
+        # decoder's truncated-Normal deterministic branch. When the
+        # ckpt has no FracHead, return None so ``_target_to_moves``
+        # falls through to the physical_v4 sizing heuristic.
+        frac: float | None = None
+        if frac_loc is not None:
+            z = float(frac_loc[src_idx, tgt_idx].item())
+            z_clamped = max(z, FRAC_Z_MIN)
+            frac = 1.0 / (1.0 + math.exp(-z_clamped))
 
-            src_legal = src_logits > neg_inf_val / 2
-            tgt_legal = tgt_logits > neg_inf_val / 2
+        return idx_to_pid.get(src_idx), idx_to_pid.get(tgt_idx), frac
 
-            frac_z = 0.0
-            frac_val = 0.0
-            if acted_int and src_idx >= 0:
-                frac_loc = frac_logits[src_idx]
-                if self.deterministic:
-                    # Deterministic: use loc, but enforce z_min floor so the
-                    # executed action never falls below the truncation point.
-                    frac_z_t = torch.maximum(
-                        frac_loc,
-                        torch.tensor(FRAC_Z_MIN, dtype=frac_loc.dtype, device=frac_loc.device),
-                    )
-                else:
-                    # σ floor 0.30 (was 0.05). Tight σ collapsed frac
-                    # samples to the loc; keeping a non-trivial floor
-                    # preserves frac exploration during rollouts.
-                    frac_std = torch.clamp(
-                        self.stack.action_decoder.frac_log_std.exp(),
-                        min=0.30,
-                        max=1.0,
-                    ).to(device=frac_logits.device, dtype=frac_logits.dtype)
-                    frac_dist = torch.distributions.Normal(
-                        loc=frac_loc,
-                        scale=frac_std,
-                    )
-                    # Inverse-CDF sampling for lower-truncated Normal at FRAC_Z_MIN.
-                    # Single call, no rejection loop.
-                    # If loc << FRAC_Z_MIN (p_lo -> 1), clamp prevents NaN.
-                    z_min_t = torch.tensor(
-                        FRAC_Z_MIN, dtype=frac_loc.dtype, device=frac_loc.device,
-                    )
-                    p_lo = frac_dist.cdf(z_min_t)
-                    p_lo = torch.clamp(p_lo, max=1.0 - 1e-6)
-                    u = torch.rand(1, dtype=frac_loc.dtype, device=frac_loc.device).squeeze()
-                    p = p_lo + u * (1.0 - p_lo)
-                    frac_z_t = frac_dist.icdf(p)
-                    # Numerical safeguard in case icdf returns slightly below z_min.
-                    frac_z_t = torch.maximum(frac_z_t, z_min_t)
-                frac_z = float(frac_z_t.item())
-                frac_val = float(torch.sigmoid(frac_z_t).item())
-
-            log_prob = 0.0
-            if hasattr(self.stack.action_decoder, "frac_log_std"):
-                log_prob = compute_action_log_prob(
-                    out["expert_acted_logit"].squeeze(0),
-                    src_logits, tgt_logits, frac_logits,
-                    self.stack.action_decoder.frac_log_std,
-                    acted_int,
-                    src_idx if acted_int else 0,
-                    tgt_idx if acted_int else 0,
-                    frac_z,
-                ).item()
-
-            rollout = {
-                "acted": acted_int,
-                "src_idx": src_idx,
-                "tgt_idx": tgt_idx,
-                "frac": frac_val,
-                "frac_z": frac_z,
-                "value": value,
-                "log_prob": log_prob,
-                "pid_to_idx": pid_to_idx,
-                "src_legal_mask": src_legal.cpu(),
-                "tgt_legal_mask": tgt_legal.cpu(),
-                "batch": batch,
-                # Bernoulli logit + p_acted on the *raw* policy. Used to
-                # count exploration-driven launches: when acted_int=1 but
-                # p_acted<0.5, the sample beat the argmax (entropy bonus
-                # / stochasticity, not the policy's own preference).
-                "acted_logit": acted_logit_val,
-            }
-            return rollout
-
-        return idx_to_pid.get(src_idx), idx_to_pid.get(tgt_idx), pid_to_idx
-
-    def act(self, obs: dict[str, Any], frac_override: float | None = None) -> list[list]:
+    def act(self, obs: dict[str, Any]) -> list[list]:
         """Return ``[[planet_id, angle, ships], ...]`` action triples."""
         learner_slot = int(obs.get("player", 0)) if isinstance(obs, dict) else int(obs.player)
-        source_pid, target_pid, _ = self._predict(obs, learner_slot)
+        source_pid, target_pid, frac = self._predict(obs, learner_slot)
         if source_pid is None or target_pid is None:
             return []
         return self._target_to_moves(
-            source_pid, target_pid, obs, learner_slot, frac_override=frac_override,
+            source_pid, target_pid, obs, learner_slot, frac_override=frac,
         )
 
     @staticmethod
