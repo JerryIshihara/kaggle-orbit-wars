@@ -32,9 +32,9 @@
 
   .layout { display: flex; flex: 1; min-height: 0; }
   aside.sidebar { width: 320px; flex-shrink: 0; border-right: 1px solid var(--border); padding: 16px; background: var(--panel); overflow-y: auto; }
-  main { flex: 1; padding: 14px 18px; overflow: auto; min-width: 0; display: flex; flex-direction: column; }
+  main { flex: 1; padding: 14px 18px; overflow: hidden; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
   .pane { display: none; }
-  .pane.active { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+  .pane.active { display: flex; flex: 1; flex-direction: column; gap: 10px; min-height: 0; overflow: hidden; }
 
   .agent-list { display: flex; flex-direction: column; gap: 6px; }
   .agent-card { padding: 8px 12px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; cursor: grab; user-select: none; transition: all 0.15s; display: flex; flex-direction: column; gap: 3px; }
@@ -79,20 +79,63 @@
   #status.error { color: var(--err); }
   #summary { font-size: 13px; color: var(--muted); flex-shrink: 0; }
   #summary .winner { color: var(--win); font-weight: 600; }
-  .match-row { display: flex; gap: 12px; flex: 1; min-height: 0; }
-  #replay { flex: 1; min-width: 0; height: 100%; border: 1px solid var(--border); border-radius: 4px; background: #000; }
+  .match-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; flex: 1; min-height: 0; overflow: hidden; }
+  .replay-col, .data-col { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+  #replay { flex: 1; min-width: 0; min-height: 0; width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 4px; background: #000; }
 
-  /* Replay sits at the top of the main pane; charts stack vertically below
-     it, each spanning the full width. */
-  .match-row { display: flex; flex: 1; min-height: 320px; }
-  .charts-col { display: flex; flex-direction: column; gap: 10px; flex-shrink: 0; min-width: 0; }
-  .chart-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 8px; display: flex; flex-direction: column; min-width: 0; height: 220px; }
+  .data-scroll { flex: 1; min-width: 0; min-height: 0; display: flex; align-items: stretch; gap: 10px; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; padding-bottom: 8px; }
+  .data-scroll::-webkit-scrollbar { height: 10px; }
+  .data-scroll::-webkit-scrollbar-track { background: var(--panel); border-radius: 999px; }
+  .data-scroll::-webkit-scrollbar-thumb { background: #3a4157; border-radius: 999px; }
+  .data-scroll::-webkit-scrollbar-thumb:hover { background: #505a78; }
+  .chart-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 8px; display: flex; flex-direction: column; flex: 0 0 100%; min-width: 420px; min-height: 0; height: 100%; scroll-snap-align: start; }
   .chart-panel .chart-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 4px; flex-shrink: 0; }
   .chart-panel .chart-body { flex: 1; min-height: 0; }
   .chart-panel svg { width: 100%; height: 100%; display: block; }
   .chart-panel .empty { color: var(--muted); font-style: italic; font-size: 12px; padding: 12px; text-align: center; }
 
   .placeholder { color: var(--muted); font-style: italic; padding: 60px 20px; text-align: center; border: 1px dashed var(--border); border-radius: 6px; }
+  @media (max-width: 900px) {
+    .match-grid { grid-template-columns: 1fr; grid-template-rows: minmax(300px, 1fr) minmax(260px, 0.85fr); }
+    .chart-panel { min-width: min(420px, 86vw); }
+  }
+
+  /* Train tab — replay sync + viewer */
+  .train-grid { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 12px; flex: 1; min-height: 0; overflow: hidden; }
+  .runs-col { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 10px; overflow-y: auto; min-height: 0; }
+  .runs-col h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin: 4px 0 6px; }
+  .date-group { margin-bottom: 10px; }
+  .date-group > summary { cursor: pointer; user-select: none; padding: 4px 6px; border-radius: 3px; background: var(--panel-2); border: 1px solid var(--border); font-size: 12px; font-weight: 600; color: var(--text); display: flex; justify-content: space-between; align-items: center; gap: 8px; list-style: none; }
+  .date-group > summary::-webkit-details-marker { display: none; }
+  .date-group > summary::before { content: "▶"; font-size: 9px; color: var(--muted); transition: transform 0.15s; flex-shrink: 0; }
+  .date-group[open] > summary::before { transform: rotate(90deg); }
+  .date-group > summary:hover { background: #232a43; }
+  .date-group > summary .count { font-size: 10px; color: var(--muted); font-weight: 400; letter-spacing: 0.4px; }
+  .date-group-body { padding: 8px 4px 2px 14px; }
+  .run-block { margin-bottom: 12px; }
+  .run-block:last-child { margin-bottom: 4px; }
+  .run-id { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; color: var(--muted); margin-bottom: 4px; word-break: break-all; }
+  .run-time { color: var(--text); margin-right: 6px; }
+  .replay-list { display: flex; flex-direction: column; gap: 2px; }
+  .replay-item { padding: 4px 8px; font-size: 12px; font-family: ui-monospace, "SF Mono", Menlo, monospace; cursor: pointer; border-radius: 3px; color: var(--text); border: 1px solid transparent; }
+  .replay-item:hover { background: var(--panel-2); }
+  .replay-item.active { background: #2b3350; border-color: var(--accent); }
+  .replay-item .tag { font-size: 10px; padding: 1px 5px; border-radius: 3px; margin-right: 6px; text-transform: uppercase; font-weight: 600; letter-spacing: 0.4px; }
+  .replay-item .tag.win { background: #1f4f33; color: #7dd89f; }
+  .replay-item .tag.loss { background: #4f1f1f; color: #f07b7b; }
+  .replay-item .tag.draw { background: #3a4157; color: #c9d1de; }
+  .replay-item .tag.unknown { background: #3a4157; color: var(--muted); }
+  .replay-item .learner-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .replay-item .learner-dot.blue { background: var(--p1); }
+  .replay-item .learner-dot.orange { background: var(--p2); }
+  .replay-item .learner-dot.unknown { background: var(--border); }
+  .train-viewer-col { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  #trainReplay { flex: 1; min-width: 0; min-height: 0; width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 4px; background: #000; }
+  .sync-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; flex-shrink: 0; margin-bottom: 8px; }
+  .sync-row input[type=text] { flex: 1; min-width: 280px; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+  #trainStatus { font-size: 12px; color: var(--muted); margin-bottom: 6px; flex-shrink: 0; }
+  #trainStatus.error { color: var(--err); }
+  .train-empty { color: var(--muted); font-style: italic; font-size: 12px; padding: 8px; }
 </style>
 </head>
 <body>
@@ -129,26 +172,46 @@
       </div>
       <div id="status">ready</div>
       <div id="summary"></div>
-      <div class="match-row">
-        <iframe id="replay" src="about:blank"></iframe>
-      </div>
-      <div class="charts-col">
-        <div class="chart-panel">
-          <div class="chart-title">Ships over time</div>
-          <div class="chart-body" id="chart"><div class="empty">run a match to see per-step scores</div></div>
+      <div class="match-grid">
+        <div class="replay-col">
+          <iframe id="replay" src="about:blank"></iframe>
         </div>
-        <div class="chart-panel">
-          <div class="chart-title">Fleet outcomes (waste)</div>
-          <div class="chart-body" id="wasteChart"><div class="empty">no data</div></div>
-        </div>
-        <div class="chart-panel">
-          <div class="chart-title">Time-to-target distribution</div>
-          <div class="chart-body" id="ttoChart"><div class="empty">no data</div></div>
+        <div class="data-col">
+          <div class="data-scroll">
+            <div class="chart-panel">
+              <div class="chart-title">Ships over time</div>
+              <div class="chart-body" id="chart"><div class="empty">run a match to see per-step scores</div></div>
+            </div>
+            <div class="chart-panel">
+              <div class="chart-title">Fleet outcomes (waste)</div>
+              <div class="chart-body" id="wasteChart"><div class="empty">no data</div></div>
+            </div>
+            <div class="chart-panel">
+              <div class="chart-title">Time-to-target distribution</div>
+              <div class="chart-body" id="ttoChart"><div class="empty">no data</div></div>
+            </div>
+          </div>
         </div>
       </div>
     </section>
     <section class="pane" id="pane-train">
-      <div class="placeholder">Training mode coming soon.</div>
+      <div class="sync-row">
+        <input type="text" id="syncRemote"
+               placeholder="hirotakaishihara@mac.internal:/Users/agent/dev/kaggle-orbit-wars/data/runs/"
+               autocomplete="off" spellcheck="false">
+        <button id="syncBtn">Sync</button>
+        <button id="refreshBtn" class="secondary">Refresh</button>
+      </div>
+      <div id="trainStatus">no replays loaded</div>
+      <div class="train-grid">
+        <div class="runs-col">
+          <h3>Runs</h3>
+          <div id="runsList"><div class="train-empty">no runs found — sync from another machine to populate.</div></div>
+        </div>
+        <div class="train-viewer-col">
+          <iframe id="trainReplay" src="about:blank"></iframe>
+        </div>
+      </div>
     </section>
   </main>
 </div>
@@ -304,7 +367,158 @@ document.getElementById('tabs').addEventListener('click', e => {
   for (const p of document.querySelectorAll('.pane')) p.classList.remove('active');
   tab.classList.add('active');
   document.getElementById('pane-' + tab.dataset.tab).classList.add('active');
+  if (tab.dataset.tab === 'train') loadTrainingReplays();
 });
+
+// ---------- Train tab: sync + listing ----------
+const syncRemoteEl = document.getElementById('syncRemote');
+const syncBtn = document.getElementById('syncBtn');
+const refreshBtn = document.getElementById('refreshBtn');
+const trainStatusEl = document.getElementById('trainStatus');
+const runsListEl = document.getElementById('runsList');
+const trainReplayFrame = document.getElementById('trainReplay');
+let activeReplayUrl = null;
+
+const SYNC_REMOTE_KEY = 'ow.syncRemote';
+const DEFAULT_SYNC_REMOTE = 'hirotakaishihara@mac.internal:/Users/agent/dev/kaggle-orbit-wars/data/runs/';
+syncRemoteEl.value = localStorage.getItem(SYNC_REMOTE_KEY) || DEFAULT_SYNC_REMOTE;
+syncRemoteEl.addEventListener('change', () => {
+  localStorage.setItem(SYNC_REMOTE_KEY, syncRemoteEl.value);
+});
+
+function setTrainStatus(msg, isError) {
+  trainStatusEl.textContent = msg;
+  trainStatusEl.classList.toggle('error', !!isError);
+}
+
+// Pull "<YYYY-MM-DD>" / "<HH:MM:SS>" out of a run id like
+// "ppo_replay3_20260507-021123". Returns nulls if the timestamp suffix
+// isn't there.
+function parseRunTimestamp(runId) {
+  const m = /(\d{8})-(\d{6})/.exec(runId);
+  if (!m) return { date: null, time: null, sortKey: '' };
+  const d = m[1], t = m[2];
+  return {
+    date: `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`,
+    time: `${t.slice(0, 2)}:${t.slice(2, 4)}:${t.slice(4, 6)}`,
+    sortKey: d + t,
+  };
+}
+
+function groupRunsByDate(runs) {
+  const groups = new Map();  // date → { runs: [{ run, ts }], total }
+  for (const run of runs) {
+    const ts = parseRunTimestamp(run.run_id);
+    const key = ts.date || 'Other';
+    if (!groups.has(key)) groups.set(key, { runs: [], total: 0 });
+    const g = groups.get(key);
+    g.runs.push({ run, ts });
+    g.total += run.replays.length;
+  }
+  // Sort runs newest-first within each date.
+  for (const g of groups.values()) {
+    g.runs.sort((a, b) => b.ts.sortKey.localeCompare(a.ts.sortKey));
+  }
+  // Date keys newest-first; "Other" pinned to the bottom.
+  return [...groups.entries()]
+    .sort((a, b) => {
+      if (a[0] === 'Other') return 1;
+      if (b[0] === 'Other') return -1;
+      return b[0].localeCompare(a[0]);
+    });
+}
+
+function renderRuns(runs) {
+  if (!runs || !runs.length) {
+    runsListEl.innerHTML = '<div class="train-empty">no runs found — sync from another machine to populate.</div>';
+    return;
+  }
+  const groups = groupRunsByDate(runs);
+  const html = groups.map(([date, group], gi) => {
+    const blocks = group.runs.map(({ run, ts }) => {
+      const items = run.replays.map(r => {
+        const label = (r.iter >= 0)
+          ? `iter ${String(r.iter).padStart(3, '0')} · ep${String(r.ep).padStart(2, '0')}`
+          : r.name;
+        const outcome = r.outcome || 'unknown';
+        const color = r.color || 'unknown';
+        const tag = `<span class="tag ${outcome}">${outcome}</span>`;
+        const dot = `<span class="learner-dot ${color}" title="learner = ${color}"></span>`;
+        const active = r.url === activeReplayUrl ? ' active' : '';
+        return `<div class="replay-item${active}" data-url="${r.url}" title="${r.name}">${tag}${dot}${label}</div>`;
+      }).join('');
+      const idLabel = ts.time
+        ? `<span class="run-time">${ts.time}</span>${run.run_id}`
+        : run.run_id;
+      return `<div class="run-block">
+        <div class="run-id">${idLabel}</div>
+        <div class="replay-list">${items}</div>
+      </div>`;
+    }).join('');
+    // Default: most-recent date open, others collapsed.
+    const openAttr = gi === 0 ? ' open' : '';
+    return `<details class="date-group"${openAttr}>
+      <summary><span>${date}</span><span class="count">${group.runs.length} run${group.runs.length === 1 ? '' : 's'} · ${group.total} replay${group.total === 1 ? '' : 's'}</span></summary>
+      <div class="date-group-body">${blocks}</div>
+    </details>`;
+  }).join('');
+  runsListEl.innerHTML = html;
+  for (const item of runsListEl.querySelectorAll('.replay-item')) {
+    item.addEventListener('click', () => {
+      activeReplayUrl = item.dataset.url;
+      for (const i of runsListEl.querySelectorAll('.replay-item')) i.classList.remove('active');
+      item.classList.add('active');
+      trainReplayFrame.src = activeReplayUrl;
+    });
+  }
+}
+
+async function loadTrainingReplays() {
+  try {
+    const r = await fetch('/api/training/replays');
+    if (!r.ok) throw new Error('list failed: ' + r.status);
+    const data = await r.json();
+    const total = data.runs.reduce((n, run) => n + run.replays.length, 0);
+    setTrainStatus(`${data.runs.length} run(s), ${total} replay(s)`);
+    renderRuns(data.runs);
+  } catch (err) {
+    setTrainStatus('error: ' + err.message, true);
+  }
+}
+
+syncBtn.addEventListener('click', async () => {
+  const remote = syncRemoteEl.value.trim();
+  if (!remote) {
+    setTrainStatus('enter a remote URL first', true);
+    return;
+  }
+  localStorage.setItem(SYNC_REMOTE_KEY, remote);
+  syncBtn.disabled = true;
+  setTrainStatus('syncing from ' + remote + ' ...');
+  try {
+    const r = await fetch('/api/training/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ remote }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.ok) {
+      const msg = data.detail || data.stderr || 'sync failed';
+      setTrainStatus('sync failed: ' + msg, true);
+      if (data.runs) renderRuns(data.runs);
+      return;
+    }
+    const total = data.runs.reduce((n, run) => n + run.replays.length, 0);
+    setTrainStatus(`synced · ${data.runs.length} run(s), ${total} replay(s)`);
+    renderRuns(data.runs);
+  } catch (err) {
+    setTrainStatus('sync error: ' + err.message, true);
+  } finally {
+    syncBtn.disabled = false;
+  }
+});
+
+refreshBtn.addEventListener('click', loadTrainingReplays);
 
 function resetMatchUI(agentIds) {
   summaryEl.textContent = '';

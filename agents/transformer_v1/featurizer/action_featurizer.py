@@ -41,6 +41,13 @@ from ...physics_utils import (
     P_ID,
 )
 from ..paths import ACTION_DATASET_DIR
+
+# Side cache for per-turn launchable / target-valid masks. Sits next to
+# the action CSVs so loaders can match a CSV by stem to its
+# ``_masks/<stem>.npz``. Re-imported by
+# :class:`agents.transformer_v1.pretrain.expert_action.ActionSnapshotDataset`.
+ACTION_MASK_CACHE_DIR: Path = ACTION_DATASET_DIR / "_masks"
+
 from .entity_featurizer import (
     _compute_episode_summary,
     _infer_learner_slot_from_episode_path,

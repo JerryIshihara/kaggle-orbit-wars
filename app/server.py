@@ -10,6 +10,8 @@ if str(_REPO_ROOT) not in sys.path:
 import argparse
 import asyncio
 import json
+import re
+import subprocess
 import webbrowser
 
 from fastapi import FastAPI, HTTPException
@@ -31,6 +33,22 @@ from utils import (
 
 ROOT = Path(__file__).resolve().parent
 REPLAY_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Training replays live under data/runs/<run_id>/replays/<file>.html. Each
+# run's replays are written by the trainer; this server lets the user
+# rsync them in from another machine and serves them for the dashboard.
+DATA_RUNS = _REPO_ROOT / "data" / "runs"
+DATA_RUNS.mkdir(parents=True, exist_ok=True)
+
+# Filename convention: <outcome>_iter<NNN>_ep<MM>_<color>.html where
+# outcome ∈ {win, loss, draw} and color ∈ {blue, orange} matches the
+# learner's on-screen color (slot 0 = blue, slot 1 = orange — Wong
+# palette per orbit_wars.js). Trainer prefers a win-of-the-iter; if
+# no win, falls back to draw > highest-final_planets_owned loss.
+_REPLAY_RE = re.compile(
+    r"(?P<outcome>win|loss|draw)_iter(?P<iter>\d+)"
+    r"_ep(?P<ep>\d+)_(?P<color>blue|orange)\.html$"
+)
 
 STREAM_DELAY_SEC = 0.003
 
@@ -118,6 +136,108 @@ async def play(req: PlayRequest):
 
 
 app.mount("/replays", StaticFiles(directory=REPLAY_ROOT), name="replays")
+app.mount(
+    "/training_replays",
+    StaticFiles(directory=DATA_RUNS),
+    name="training_replays",
+)
+
+
+# ---------- Training replay sync + listing ----------
+class TrainingSyncRequest(BaseModel):
+    """Body for POST /api/training/sync.
+
+    ``remote`` is an rsync-style URL pointing at the *parent* of the
+    per-run directories on the source machine, e.g.
+    ``user@host:/path/to/repo/data/runs/``. We mirror only the
+    ``<run>/replays/`` subtrees down to local ``data/runs/``.
+    """
+
+    remote: str
+
+
+def _scan_runs() -> list[dict]:
+    """Return a list of `{run_id, replays: [{name, url, iter, ep, slot}]}`
+    for every directory under ``data/runs`` that has a ``replays/``
+    subfolder containing matching ``win_iter*.html`` files.
+    """
+    runs: list[dict] = []
+    if not DATA_RUNS.exists():
+        return runs
+    for run_dir in sorted(DATA_RUNS.iterdir()):
+        if not run_dir.is_dir():
+            continue
+        replays_dir = run_dir / "replays"
+        if not replays_dir.is_dir():
+            continue
+        replays: list[dict] = []
+        for path in sorted(replays_dir.glob("*.html")):
+            m = _REPLAY_RE.search(path.name)
+            iter_n = int(m.group("iter")) if m else -1
+            ep_n = int(m.group("ep")) if m else -1
+            color = m.group("color") if m else "unknown"
+            outcome = m.group("outcome") if m else "unknown"
+            replays.append({
+                "name": path.name,
+                "url": f"/training_replays/{run_dir.name}/replays/{path.name}",
+                "iter": iter_n,
+                "ep": ep_n,
+                "color": color,
+                "outcome": outcome,
+            })
+        if replays:
+            replays.sort(key=lambda r: (r["iter"], r["ep"], r["color"]))
+            runs.append({"run_id": run_dir.name, "replays": replays})
+    return runs
+
+
+@app.get("/api/training/replays")
+def list_training_replays():
+    return {"runs": _scan_runs()}
+
+
+@app.post("/api/training/sync")
+async def sync_training_replays(req: TrainingSyncRequest):
+    remote = req.remote.strip()
+    if not remote:
+        raise HTTPException(status_code=400, detail="remote is empty")
+    # Reject obvious shell metacharacters — rsync is invoked as an arg
+    # vector (no shell=True) but a malformed value would still confuse
+    # the underlying SSH layer. Allow @, :, /, ., -, _, alphanumeric.
+    if re.search(r"[\s;&|`$()<>\\\"']", remote):
+        raise HTTPException(status_code=400, detail="invalid remote URL")
+    # Always treat the remote as a directory whose children are run dirs.
+    if not remote.endswith("/"):
+        remote = remote + "/"
+
+    cmd = [
+        "rsync", "-az", "--prune-empty-dirs",
+        "--include=*/", "--include=replays/***", "--exclude=*",
+        remote, str(DATA_RUNS) + "/",
+    ]
+
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd,
+            capture_output=True, text=True, timeout=600,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise HTTPException(status_code=504, detail=f"rsync timed out: {e}")
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail="rsync not installed on this machine",
+        )
+
+    ok = proc.returncode == 0
+    return {
+        "ok": ok,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout[-4000:],
+        "stderr": proc.stderr[-4000:],
+        "cmd": cmd,
+        "runs": _scan_runs() if ok else [],
+    }
 
 
 def main() -> int:

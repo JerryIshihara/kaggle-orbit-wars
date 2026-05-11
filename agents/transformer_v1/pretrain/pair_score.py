@@ -143,16 +143,82 @@ class PairScoreStack(nn.Module):
         self.cross = cross
         self.pair_score_head = pair_score_head
 
+    # Encoder modules accessible by short name. Keep this as the
+    # authoritative ordering — CLI arg parsing + checkpoint save/load
+    # walk the same names.
+    ENCODER_MODULES: tuple[str, ...] = (
+        "fleet_encoder",
+        "planet_encoder",
+        "entity_encoder",
+        "cross",
+    )
+
     def freeze_encoders(self) -> None:
-        for m in (
-            self.fleet_encoder,
-            self.planet_encoder,
-            self.entity_encoder,
-            self.cross,
-        ):
-            m.eval()
-            for p in m.parameters():
-                p.requires_grad_(False)
+        """Backwards-compat alias: freeze every encoder."""
+        self.set_freeze_state(unfrozen=())
+
+    def set_freeze_state(self, unfrozen: tuple[str, ...] | list[str] | set[str]) -> None:
+        """Set each encoder's train/grad mode based on whether its name
+        appears in ``unfrozen``. The head is always trainable.
+
+        ``unfrozen`` may contain ``"cross"``, ``"entity"`` (= entity_encoder),
+        ``"planet"`` (= planet_encoder), or ``"fleet"`` (= fleet_encoder).
+        Anything else raises.
+        """
+        canon = self._canonicalize(unfrozen)
+        for name in self.ENCODER_MODULES:
+            module = getattr(self, name)
+            if name in canon:
+                module.train()
+                for p in module.parameters():
+                    p.requires_grad_(True)
+            else:
+                module.eval()
+                for p in module.parameters():
+                    p.requires_grad_(False)
+
+    @classmethod
+    def _canonicalize(cls, names) -> set[str]:
+        """Map user-facing aliases (e.g. ``entity`` → ``entity_encoder``)
+        and validate against ``ENCODER_MODULES``.
+        """
+        aliases = {
+            "fleet": "fleet_encoder",
+            "planet": "planet_encoder",
+            "entity": "entity_encoder",
+            "cross": "cross",
+        }
+        out: set[str] = set()
+        for n in names or ():
+            n = n.strip()
+            if not n:
+                continue
+            if n in cls.ENCODER_MODULES:
+                out.add(n)
+            elif n in aliases:
+                out.add(aliases[n])
+            elif n in ("head", "pair_score_head"):
+                # Always trainable; silently accepted.
+                continue
+            else:
+                raise ValueError(
+                    f"unknown unfreeze target {n!r}. "
+                    f"valid: {sorted(set(aliases) | set(cls.ENCODER_MODULES))}"
+                )
+        return out
+
+    def trainable_module_state(self, unfrozen: set[str]) -> dict[str, dict]:
+        """Collect state-dicts for the head + every unfrozen encoder.
+
+        Used by the checkpoint writer so an unfreeze-cross run can be
+        chained with another (e.g. unfreeze-cross-and-entity) by passing
+        its ``pair_score_best.pt`` as the next run's ``--init-from``.
+        """
+        out: dict[str, dict] = {"pair_score_head": self.pair_score_head.state_dict()}
+        for name in self.ENCODER_MODULES:
+            if name in unfrozen:
+                out[name] = getattr(self, name).state_dict()
+        return out
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         entity_tokens, entity_mask = _entity_tokens_per_step(
@@ -178,8 +244,33 @@ class PairScoreStack(nn.Module):
             tgt_valid = mask_now
         # Dataset masks may have been allocated wider than the encoder's
         # planet axis; clip so shapes match.
-        src_valid = src_valid[..., :P].bool()
-        tgt_valid = tgt_valid[..., :P].bool()
+        src_valid = src_valid[..., :P].bool().clone()
+        tgt_valid = tgt_valid[..., :P].bool().clone()
+        mask_now = mask_now[..., :P].bool()
+
+        # Older action CSV packs do not have the optional `_masks/*.npz`
+        # side cache, which leaves src/tgt masks all-False. Fall back to
+        # the current real-planet mask for those rows so pair CE remains
+        # trainable, then force-include the supervised pair labels.
+        if mask_now.shape == src_valid.shape:
+            src_empty = ~src_valid.any(dim=-1)
+            tgt_empty = ~tgt_valid.any(dim=-1)
+            fallback = src_empty | tgt_empty
+            src_valid[fallback] = mask_now[fallback]
+            tgt_valid[fallback] = mask_now[fallback]
+
+        src_idx = batch.get("source_planet_idx")
+        tgt_idx = batch.get("target_planet_idx")
+        if src_idx is not None:
+            src_idx = src_idx.to(src_valid.device).long()
+            rows = torch.nonzero((src_idx >= 0) & (src_idx < P), as_tuple=True)[0]
+            if rows.numel() > 0:
+                src_valid[rows, src_idx[rows]] = True
+        if tgt_idx is not None:
+            tgt_idx = tgt_idx.to(tgt_valid.device).long()
+            rows = torch.nonzero((tgt_idx >= 0) & (tgt_idx < P), as_tuple=True)[0]
+            if rows.numel() > 0:
+                tgt_valid[rows, tgt_idx[rows]] = True
 
         pair_logits = self.pair_score_head(glob, ctx_now, src_valid, tgt_valid)
         return {
@@ -408,9 +499,10 @@ def _train_one_epoch(
     loader: DataLoader,
     optim: torch.optim.Optimizer,
     device: torch.device,
+    unfrozen: set[str],
 ) -> dict[str, float]:
     stack.train()
-    stack.freeze_encoders()  # ensure encoders stay in eval mode
+    stack.set_freeze_state(unfrozen)  # frozen modules stay in eval mode
     sums: dict[str, float] = {}
     n_batches = 0
     for batch in loader:
@@ -454,6 +546,14 @@ def train_pair_score(args: argparse.Namespace) -> Path:
     device = torch.device(args.device)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- 0. Resolve unfrozen modules ----
+    unfreeze_list: list[str] = []
+    if getattr(args, "unfreeze", None):
+        unfreeze_list = [s.strip() for s in args.unfreeze.split(",") if s.strip()]
+    unfrozen = PairScoreStack._canonicalize(unfreeze_list)
+    if unfrozen:
+        print(f"[pair_score] unfreezing {sorted(unfrozen)}", flush=True)
 
     # ---- 1. Load + freeze encoders ----
     fenc, penc, eenc, cross = load_frozen_encoder_stack(
@@ -527,11 +627,37 @@ def train_pair_score(args: argparse.Namespace) -> Path:
         cross=cross,
         pair_score_head=head,
     ).to(device)
-    stack.freeze_encoders()
 
+    # ---- 4b. Optional resume from a prior pair_score_best.pt ----
+    init_from = getattr(args, "init_from", None)
+    if init_from:
+        prior = torch.load(Path(init_from), map_location=device, weights_only=False)
+        if "pair_score_head" not in prior:
+            raise SystemExit(
+                f"--init-from {init_from} has no 'pair_score_head' key — "
+                "expected output of a prior pair_score run."
+            )
+        head.load_state_dict(prior["pair_score_head"])
+        # If the prior run unfroze any encoders, prefer those weights —
+        # otherwise the encoder state from --encoder-ckpt is kept.
+        for name in PairScoreStack.ENCODER_MODULES:
+            if name in prior:
+                getattr(stack, name).load_state_dict(prior[name])
+                print(f"[pair_score] init-from: loaded {name} state", flush=True)
+        print(f"[pair_score] init-from: loaded pair_score_head from "
+              f"{init_from} (epoch={prior.get('epoch')})", flush=True)
+
+    stack.set_freeze_state(unfrozen)
+
+    # AdamW over every parameter that's actually trainable now (head +
+    # any unfrozen encoders). filter is needed because frozen params
+    # have requires_grad=False.
+    trainable_params = [p for p in stack.parameters() if p.requires_grad]
     optim = torch.optim.AdamW(
-        head.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+        trainable_params, lr=args.lr, weight_decay=args.weight_decay,
     )
+    n_train_params = sum(p.numel() for p in trainable_params)
+    print(f"[pair_score] trainable params: {n_train_params:,}", flush=True)
 
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True, drop_last=False,
@@ -550,7 +676,7 @@ def train_pair_score(args: argparse.Namespace) -> Path:
     t0 = time.time()
     for epoch in range(1, args.epochs + 1):
         t_epoch = time.time()
-        train_metrics = _train_one_epoch(stack, train_loader, optim, device)
+        train_metrics = _train_one_epoch(stack, train_loader, optim, device, unfrozen)
         val_metrics = _evaluate(stack, val_loader, device)
         elapsed = time.time() - t0
         log = {
@@ -575,23 +701,24 @@ def train_pair_score(args: argparse.Namespace) -> Path:
             flush=True,
         )
 
-        # Save last + best.
-        torch.save(
-            {
-                "epoch": epoch,
-                "pair_score_head": head.state_dict(),
-                "encoder_ckpt": str(args.encoder_ckpt),
-                "config": {
-                    "d_model": args.d_model,
-                    "hidden": args.hidden,
-                    "max_planets": args.max_planets,
-                    "max_fleets": args.max_fleets,
-                    "n_history": args.n_history,
-                },
-                "metrics": {"train": train_metrics, "val": val_metrics},
+        # Save last + best. Include any unfrozen encoder state so a
+        # follow-up run can resume via --init-from.
+        ckpt_payload: dict = {
+            "epoch": epoch,
+            "encoder_ckpt": str(args.encoder_ckpt),
+            "init_from": str(init_from) if init_from else None,
+            "unfrozen": sorted(unfrozen),
+            "config": {
+                "d_model": args.d_model,
+                "hidden": args.hidden,
+                "max_planets": args.max_planets,
+                "max_fleets": args.max_fleets,
+                "n_history": args.n_history,
             },
-            last_path,
-        )
+            "metrics": {"train": train_metrics, "val": val_metrics},
+        }
+        ckpt_payload.update(stack.trainable_module_state(unfrozen))
+        torch.save(ckpt_payload, last_path)
         if val_metrics.get("loss", float("inf")) < best_val_loss:
             best_val_loss = val_metrics["loss"]
             torch.save(torch.load(last_path, weights_only=False), best_path)
@@ -637,6 +764,16 @@ def main() -> None:
     p.add_argument("--n-history", type=int, default=3)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out-dir", type=Path, required=True)
+    p.add_argument("--unfreeze", default=None,
+                   help="Comma-separated encoder modules to thaw alongside "
+                        "the head. Names: cross, entity (=entity_encoder), "
+                        "planet (=planet_encoder), fleet (=fleet_encoder). "
+                        "Example: --unfreeze cross,entity")
+    p.add_argument("--init-from", type=Path, default=None,
+                   help="Resume from a prior pair_score_best.pt. Loads the "
+                        "head and any previously-thawed encoder state. "
+                        "Encoders not in the prior file fall back to the "
+                        "ones in --encoder-ckpt.")
     args = p.parse_args()
     train_pair_score(args)
 

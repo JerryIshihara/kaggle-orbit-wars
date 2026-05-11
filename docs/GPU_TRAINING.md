@@ -70,19 +70,21 @@ multi-GB tars.
 bash scripts/pack_for_gpu.sh
 ```
 
-Produces three tarballs in `/tmp/orbit-pack/`:
+Produces tarballs in `/tmp/orbit-pack/`:
 
 * `code.tgz` — agents/, scripts/, utils/, requirements.txt
   (~few MB; everything you'd need to re-run training)
-* `data.tgz` — only the dataset dirs the cross-entity training
-  reads: `data/datasets/{fleet,planet,entity,cross_entity}/`
-  (~600 MB)
+* `data.tgz` — every featurized CSV dataset the pretrain scripts read:
+  `data/datasets/{fleet,planet,entity,cross_entity,action}/`
 * `weights.tgz` — frozen encoder checkpoints to load at training
   start (`data/runs/fleet/<best>/`, `data/runs/planet/<best>/`,
   `data/runs/entity/<best>/`)
+* `pair_score_assets.tgz` — by default, the latest action-stage
+  checkpoint plus `data/replays/kovi/`, used by
+  `notebooks/train_pair_score_colab.ipynb`
 
 The script prints `gsutil cp` commands to copy each tarball to the
-bucket — paste them or pipe through.
+bucket. Set `UPLOAD=1` to upload immediately.
 
 ### 4. Push and unpack on the VM
 
@@ -155,10 +157,11 @@ code or data.
 | `agents/transformer_v1/` | ✓ | training code |
 | `scripts/`, `utils/` | ✓ | data loaders, runners |
 | `requirements.txt` | ✓ | reproducible env |
-| `data/datasets/{fleet,planet,entity,cross_entity}/*.csv` | ✓ | training data |
+| `data/datasets/{fleet,planet,entity,cross_entity,action}/*.csv` | ✓ | training data |
 | `data/datasets/*/manifest.json` | ✓ | split definitions |
 | `data/runs/{fleet,planet,entity}/<best>/*.pt` | ✓ | frozen encoder weights |
-| `data/replays/` | ✗ | not needed once datasets exist |
+| `data/runs/action/<run>/action_best.pt` | ✓ for pair score | frozen encoder/cross source |
+| `data/replays/` | ✗ normally; selected player included for pair score | pair-score player filtering maps replay stems to action CSVs |
 | `notebooks/`, `data/runs/.../log.json` from prior local runs | ✗ | not used by the GPU run |
 | `.venv/`, `__pycache__/` | ✗ | rebuilt on the VM |
 
@@ -167,10 +170,10 @@ code or data.
 * **Bucket as relay** instead of direct scp — robust to connection
   drops on multi-GB transfers and lets you re-pull on a fresh VM
   without re-tarring locally.
-* **Three tarballs** (code/data/weights) instead of one — code is
-  tiny and changes often, data is big and changes rarely, weights
-  are medium and change per pretrain stage. Independent uploads
-  minimize re-transfer when iterating.
+* **Split tarballs** instead of one archive — code is tiny and changes
+  often, data is big and changes rarely, weights/assets are medium and
+  change per pretrain stage. Independent uploads minimize re-transfer
+  when iterating.
 * **tmux + `gsutil` JSON pulls** beats W&B / TensorBoard for the
   size of run we have here. If the project grows to needing real-
   time dashboards, switching to W&B is a one-line addition to the
