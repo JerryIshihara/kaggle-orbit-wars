@@ -81,9 +81,12 @@ PAIR_SCORE_RUNS_DIR: Path = _REPO_ROOT / "data" / "runs" / "pair_score"
 # ---- Default ckpt resolution ----
 def _default_ckpt() -> Path:
     """Pick the newest ``pair_score_best.pt`` (or ``pair_score_last.pt``)
-    under ``data/runs/pair_score/<run>/``. Override with the
-    ``TRANSFORMER_V1_CKPT`` env var or by passing ``ckpt_path`` to
-    :meth:`TransformerAgent.load`.
+    under ``data/runs/pair_score/<run>/``, ranked by **directory mtime**
+    so a freshly-pushed stage-2 run beats older runs whose lexicographic
+    sort happens to put them later (e.g. ``unfreeze_cross_*`` would
+    otherwise win over ``exp3_frac_only_*``). Empty run dirs without a
+    valid ckpt file are skipped. Override with the ``TRANSFORMER_V1_CKPT``
+    env var or by passing ``ckpt_path`` to :meth:`TransformerAgent.load`.
     """
     env_override = os.environ.get("TRANSFORMER_V1_CKPT")
     if env_override:
@@ -94,20 +97,20 @@ def _default_ckpt() -> Path:
             "pair-score (+ optional frac) policy first or set "
             "TRANSFORMER_V1_CKPT to a saved ckpt path."
         )
-    candidates: list[Path] = []
-    for run_dir in sorted(PAIR_SCORE_RUNS_DIR.iterdir()):
-        if not run_dir.is_dir():
-            continue
+    # mtime-sorted, newest first.
+    run_dirs = sorted(
+        (d for d in PAIR_SCORE_RUNS_DIR.iterdir() if d.is_dir()),
+        key=lambda d: d.stat().st_mtime,
+        reverse=True,
+    )
+    for run_dir in run_dirs:
         for name in ("pair_score_best.pt", "pair_score_last.pt"):
             p = run_dir / name
             if p.exists():
-                candidates.append(p)
-                break
-    if not candidates:
-        raise FileNotFoundError(
-            f"no pair_score_*.pt under {PAIR_SCORE_RUNS_DIR}/*/."
-        )
-    return candidates[-1]
+                return p
+    raise FileNotFoundError(
+        f"no pair_score_*.pt under {PAIR_SCORE_RUNS_DIR}/*/."
+    )
 
 
 def _learner_aim(
