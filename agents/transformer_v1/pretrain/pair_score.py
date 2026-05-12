@@ -1003,6 +1003,7 @@ def _train_one_epoch(
     device: torch.device,
     unfrozen: set[str],
     *,
+    pair_weight: float = 1.0,
     frac_weight: float = 0.0,
     frac_baseline_mae: float | None = None,
     target_weight: float = 0.0,
@@ -1023,9 +1024,12 @@ def _train_one_epoch(
         batch = {k: v.to(device) for k, v in batch.items()}
         preds = stack(batch)
         pair_loss, pair_metrics = compute_pair_score_loss(preds, batch)
-        loss = pair_loss
+        # Always compute pair_metrics so logs stay informative even when
+        # pair_weight=0 (caller may freeze the pair head and still want
+        # to read off its frozen accuracy as a sanity check).
         for k, v in pair_metrics.items():
             sums[k] = sums.get(k, 0.0) + v
+        loss = pair_weight * pair_loss if pair_weight > 0.0 else pair_loss * 0.0
         if frac_weight > 0.0:
             frac_loss, frac_metrics = compute_frac_loss(
                 preds, batch, frac_baseline_mae=frac_baseline_mae,
@@ -1053,6 +1057,7 @@ def _evaluate(
     loader: DataLoader,
     device: torch.device,
     *,
+    pair_weight: float = 1.0,
     frac_weight: float = 0.0,
     frac_baseline_mae: float | None = None,
     target_weight: float = 0.0,
@@ -1064,9 +1069,9 @@ def _evaluate(
         batch = {k: v.to(device) for k, v in batch.items()}
         preds = stack(batch)
         pair_loss, pair_metrics = compute_pair_score_loss(preds, batch)
-        total = pair_loss
         for k, v in pair_metrics.items():
             sums[k] = sums.get(k, 0.0) + v
+        total = pair_weight * pair_loss if pair_weight > 0.0 else pair_loss * 0.0
         if frac_weight > 0.0:
             frac_loss, frac_metrics = compute_frac_loss(
                 preds, batch, frac_baseline_mae=frac_baseline_mae,
@@ -1167,22 +1172,55 @@ def train_pair_score(
     val_set = Subset(dataset, val_idx)
     print(f"[pair_score] train={len(train_set)} val={len(val_set)}", flush=True)
 
-    # ---- 4. Build pair head + (optional) frac / target heads + stack ----
+    # ---- 4. Build heads + stack ----
+    # Optional heads are built when EITHER their weight > 0 OR the
+    # --init-from ckpt already carries their state. This means a
+    # target-only stage that resumes from a pair+frac ckpt rebuilds and
+    # freezes the frac head (preserving it on save) instead of silently
+    # dropping it from the output.
     head = PairScoreHead(d_model=args.d_model, hidden=args.hidden).to(device)
+    pair_weight = float(getattr(args, "pair_weight", 1.0) or 0.0)
+    if pair_weight == 0.0:
+        print("[pair_score] pair_weight=0 — pair_loss excluded from total "
+              "(still computed for metric display).", flush=True)
     frac_weight = float(getattr(args, "frac_weight", 0.0) or 0.0)
+    target_weight = float(getattr(args, "target_weight", 0.0) or 0.0)
+
+    # Peek at the init-from ckpt before deciding which heads to build so
+    # we can preserve any extra heads it carries.
+    init_from = getattr(args, "init_from", None)
+    init_payload: dict[str, Any] | None = None
+    if init_from is not None:
+        init_payload = torch.load(
+            Path(init_from), map_location=device, weights_only=False,
+        )
+
+    have_prior_frac = bool(init_payload and "frac_head" in init_payload)
+    have_prior_target = bool(init_payload and "target_head" in init_payload)
+
     frac_head: FracHead | None = None
-    if frac_weight > 0.0:
+    if frac_weight > 0.0 or have_prior_frac:
         frac_hidden = int(getattr(args, "frac_hidden", args.hidden) or args.hidden)
         frac_head = FracHead(d_model=args.d_model, hidden=frac_hidden).to(device)
-        print(f"[pair_score] frac head enabled (weight={frac_weight}, "
-              f"hidden={frac_hidden}, init log_std={FRAC_LOG_STD_INIT:.3f})", flush=True)
-    target_weight = float(getattr(args, "target_weight", 0.0) or 0.0)
+        why = "weight>0" if frac_weight > 0.0 else "preserved from --init-from"
+        print(
+            f"[pair_score] frac head enabled (weight={frac_weight}, "
+            f"hidden={frac_hidden}, init log_std={FRAC_LOG_STD_INIT:.3f}, "
+            f"reason={why})",
+            flush=True,
+        )
+
     target_head: TargetHead | None = None
-    if target_weight > 0.0:
+    if target_weight > 0.0 or have_prior_target:
         target_hidden = int(getattr(args, "target_hidden", args.hidden) or args.hidden)
         target_head = TargetHead(d_model=args.d_model, hidden=target_hidden).to(device)
-        print(f"[pair_score] target head enabled (weight={target_weight}, "
-              f"hidden={target_hidden})", flush=True)
+        why = "weight>0" if target_weight > 0.0 else "preserved from --init-from"
+        print(
+            f"[pair_score] target head enabled (weight={target_weight}, "
+            f"hidden={target_hidden}, reason={why})",
+            flush=True,
+        )
+
     stack = PairScoreStack(
         fleet_encoder=fenc,
         planet_encoder=penc,
@@ -1193,23 +1231,19 @@ def train_pair_score(
         target_head=target_head,
     ).to(device)
 
-    # ---- 4b. Optional resume from a prior pair_score_best.pt ----
-    init_from = getattr(args, "init_from", None)
-    if init_from:
-        prior = torch.load(Path(init_from), map_location=device, weights_only=False)
+    # ---- 4b. Apply init-from state to the freshly built modules ----
+    if init_payload is not None:
+        prior = init_payload
         if "pair_score_head" not in prior:
             raise SystemExit(
                 f"--init-from {init_from} has no 'pair_score_head' key — "
                 "expected output of a prior pair_score run."
             )
         head.load_state_dict(prior["pair_score_head"])
-        # If the prior run unfroze any encoders, prefer those weights —
-        # otherwise the encoder state from --encoder-ckpt is kept.
         for name in PairScoreStack.ENCODER_MODULES:
             if name in prior:
                 getattr(stack, name).load_state_dict(prior[name])
                 print(f"[pair_score] init-from: loaded {name} state", flush=True)
-        # Frac head reuse: only meaningful when we built one for this run.
         if frac_head is not None:
             if "frac_head" in prior:
                 frac_head.load_state_dict(prior["frac_head"])
@@ -1217,7 +1251,6 @@ def train_pair_score(
             else:
                 print("[pair_score] init-from: frac_head missing in ckpt; "
                       "initialized from scratch", flush=True)
-        # Target head reuse: same pattern as frac head.
         if target_head is not None:
             if "target_head" in prior:
                 target_head.load_state_dict(prior["target_head"])
@@ -1290,6 +1323,7 @@ def train_pair_score(
         t_epoch = time.time()
         train_metrics = _train_one_epoch(
             stack, train_loader, optim, device, unfrozen,
+            pair_weight=pair_weight,
             frac_weight=frac_weight, frac_baseline_mae=frac_baseline_mae,
             target_weight=target_weight,
             freeze_pair_head=freeze_pair_head,
@@ -1298,6 +1332,7 @@ def train_pair_score(
         )
         val_metrics = _evaluate(
             stack, val_loader, device,
+            pair_weight=pair_weight,
             frac_weight=frac_weight, frac_baseline_mae=frac_baseline_mae,
             target_weight=target_weight,
         )
@@ -1424,6 +1459,7 @@ def train_pair_score_kwargs(
     device=None,
     unfreeze=None,
     init_from=None,
+    pair_weight=1.0,
     frac_weight=0.0,
     frac_hidden=128,
     target_weight=0.0,
@@ -1472,6 +1508,7 @@ def train_pair_score_kwargs(
         out_dir=Path(out_dir),
         unfreeze=unfreeze,
         init_from=Path(init_from) if init_from is not None else None,
+        pair_weight=float(pair_weight),
         frac_weight=float(frac_weight),
         frac_hidden=int(frac_hidden),
         target_weight=float(target_weight),
@@ -1539,6 +1576,15 @@ def main() -> None:
     p.add_argument("--frac-hidden", type=int, default=128,
                    help="Hidden width of the FracHead MLP. "
                         "Ignored when --frac-weight 0.")
+    p.add_argument("--pair-weight", type=float, default=1.0,
+                   help="Weight on pair_loss in the total. 1.0 (default) "
+                        "= include normally. Set to 0.0 for target-only "
+                        "or frac-only stages: pair_metrics are still "
+                        "computed for the log, but pair_loss does not "
+                        "contribute gradients (encoders won't shift "
+                        "toward the pair objective). Combine with the "
+                        "matching --freeze-*-head flags to fully isolate "
+                        "one head.")
     p.add_argument("--freeze-pair-head", action="store_true",
                    help="Freeze the pair-score head (no gradient flows). "
                         "Stage-2 frac-only pattern: pair head + all "
