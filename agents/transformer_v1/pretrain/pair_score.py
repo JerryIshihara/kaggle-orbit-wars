@@ -131,6 +131,52 @@ FRAC_LOG_STD_INIT: float = math.log(0.5)
 FRAC_LABEL_EPS: float = 1e-3
 
 
+class TargetHead(nn.Module):
+    """Per-planet target-attractiveness score.
+
+    A marginal-over-source companion to :class:`PairScoreHead`: instead
+    of scoring every ``(source, target)`` pair, this head scores every
+    planet on its own ``"would the expert pick this planet as a target
+    this turn"`` — own / neutral / enemy alike, with no ownership mask
+    at the head level. Downstream code can combine the per-planet logit
+    with the pair head's conditional (e.g. ``pair_logits + α·target_logits``
+    at inference, or treat it as an auxiliary BC loss during training).
+
+    Per planet ``i``:
+        feat_i = [ glob ‖ ctx_i ]        (2·d)
+        score_i = MLP(feat_i)            (1)
+
+    Output ``target_logits`` has shape ``(B, P)``. Lightweight (~17 k
+    params at d=64, hidden=128) and stays separate from the pair head
+    so the stage-2 / stage-3 chain of ``--init-from`` still loads cleanly.
+    """
+
+    def __init__(self, d_model: int = 64, hidden: int = 128):
+        super().__init__()
+        self.d_model = d_model
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
+        nn.init.zeros_(self.mlp[-1].bias)
+        nn.init.normal_(self.mlp[-1].weight, std=1e-3)
+
+    def forward(
+        self,
+        glob: torch.Tensor,                # (B, d)
+        ctx: torch.Tensor,                 # (B, P, d)
+    ) -> torch.Tensor:
+        B, P, d = ctx.shape
+        if d != self.d_model:
+            raise ValueError(
+                f"ctx d={d} but TargetHead built for d_model={self.d_model}"
+            )
+        glob_b = glob.unsqueeze(1).expand(B, P, d)
+        feat = torch.cat([glob_b, ctx], dim=-1)            # (B, P, 2d)
+        return self.mlp(feat).squeeze(-1)                   # (B, P)
+
+
 class FracHead(nn.Module):
     """Per-``(source, target)`` launch-fraction predictor.
 
@@ -204,6 +250,7 @@ class PairScoreStack(nn.Module):
         cross: CrossEntityAttention,
         pair_score_head: PairScoreHead,
         frac_head: FracHead | None = None,
+        target_head: TargetHead | None = None,
     ):
         super().__init__()
         self.fleet_encoder = fleet_encoder
@@ -216,6 +263,10 @@ class PairScoreStack(nn.Module):
         # the pre-frac contract. When non-None, it adds ~33k params and
         # contributes ``frac_loc``/``frac_log_std`` to ``forward()``.
         self.frac_head = frac_head
+        # TargetHead is optional in the same way (controlled by
+        # ``--target-weight``). When non-None, it adds ~17k params and
+        # contributes ``target_logits`` to ``forward()``.
+        self.target_head = target_head
 
     # Encoder modules accessible by short name. Keep this as the
     # authoritative ordering — CLI arg parsing + checkpoint save/load
@@ -236,20 +287,22 @@ class PairScoreStack(nn.Module):
         unfrozen: tuple[str, ...] | list[str] | set[str],
         *,
         freeze_pair_head: bool = False,
+        freeze_frac_head: bool = False,
+        freeze_target_head: bool = False,
     ) -> None:
         """Set each encoder's train/grad mode based on whether its name
-        appears in ``unfrozen``. The frac head (when present) is always
-        trainable; the pair head is trainable by default but can be
-        frozen via ``freeze_pair_head=True``.
+        appears in ``unfrozen``. The pair / frac / target heads default
+        to trainable; each can be individually frozen with the matching
+        keyword flag so stage-N runs can pin earlier-trained heads.
 
         ``unfrozen`` may contain ``"cross"``, ``"entity"`` (= entity_encoder),
         ``"planet"`` (= planet_encoder), or ``"fleet"`` (= fleet_encoder).
         Anything else raises.
 
-        Stage-2 frac-only training pattern: pass ``freeze_pair_head=True``
-        + ``unfrozen=()`` so only the FracHead trains. The pair head's
-        already-tuned calibration is preserved bit-exact, and the
-        encoders' representation stays fixed too.
+        Stage-2 frac-only training pattern: pass
+        ``freeze_pair_head=True`` + ``unfrozen=()`` so only the FracHead
+        trains. Stage-3 target-only on top of a stage-2 ckpt: also pass
+        ``freeze_frac_head=True`` so the frac calibration is preserved.
         """
         canon = self._canonicalize(unfrozen)
         for name in self.ENCODER_MODULES:
@@ -271,12 +324,26 @@ class PairScoreStack(nn.Module):
             self.pair_score_head.train()
             for p in self.pair_score_head.parameters():
                 p.requires_grad_(True)
-        # Frac head (when present) is always trainable — that's the
-        # whole point of building it.
+        # Frac head (when present) trainable by default, frozen on opt-in.
         if self.frac_head is not None:
-            self.frac_head.train()
-            for p in self.frac_head.parameters():
-                p.requires_grad_(True)
+            if freeze_frac_head:
+                self.frac_head.eval()
+                for p in self.frac_head.parameters():
+                    p.requires_grad_(False)
+            else:
+                self.frac_head.train()
+                for p in self.frac_head.parameters():
+                    p.requires_grad_(True)
+        # Target head (when present) trainable by default, frozen on opt-in.
+        if self.target_head is not None:
+            if freeze_target_head:
+                self.target_head.eval()
+                for p in self.target_head.parameters():
+                    p.requires_grad_(False)
+            else:
+                self.target_head.train()
+                for p in self.target_head.parameters():
+                    p.requires_grad_(True)
 
     @classmethod
     def _canonicalize(cls, names) -> set[str]:
@@ -326,6 +393,8 @@ class PairScoreStack(nn.Module):
         out: dict[str, dict] = {"pair_score_head": self.pair_score_head.state_dict()}
         if self.frac_head is not None:
             out["frac_head"] = self.frac_head.state_dict()
+        if self.target_head is not None:
+            out["target_head"] = self.target_head.state_dict()
         for name in self.ENCODER_MODULES:
             out[name] = getattr(self, name).state_dict()
         return out
@@ -392,6 +461,8 @@ class PairScoreStack(nn.Module):
             frac_out = self.frac_head(glob, ctx_now)
             out["frac_loc"] = frac_out["frac_loc"]
             out["frac_log_std"] = frac_out["frac_log_std"]
+        if self.target_head is not None:
+            out["target_logits"] = self.target_head(glob, ctx_now)
         return out
 
 
@@ -534,6 +605,65 @@ def compute_frac_loss(
         metrics["frac_loss"] = float(nll.item())
         metrics["frac_mae"] = float((frac_pred - frac_label[rows]).abs().mean().item())
     return nll, metrics
+
+
+def compute_target_loss(
+    preds: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Cross-entropy over the per-planet target head, sparse on acted rows.
+
+    Same label as the pair head's target dimension —
+    ``batch["target_planet_idx"]`` — but supervised against the
+    standalone ``target_logits`` (no source conditioning). The head
+    learns a marginal-over-source target preference. No
+    ``tgt_valid`` masking is applied at loss time so the head sees
+    own / neutral / enemy uniformly; the caller decides how to use
+    it at inference.
+
+    Returns ``(loss, metrics)`` with keys ``target_loss``,
+    ``target_top1``, ``target_top3``, ``target_top5``, ``n_target_valid``.
+    Always populated so the per-epoch summary doesn't branch.
+    """
+    target_logits = preds.get("target_logits")
+    if target_logits is None:
+        zero = next(iter(preds.values())).sum() * 0.0
+        return zero, {
+            "target_loss": 0.0,
+            "target_top1": 0.0,
+            "target_top3": 0.0,
+            "target_top5": 0.0,
+            "n_target_valid": 0.0,
+        }
+
+    device = target_logits.device
+    tgt_idx = batch["target_planet_idx"].to(device).long()
+    B, P = target_logits.shape
+    valid = (tgt_idx >= 0) & (tgt_idx < P)
+    n_valid = int(valid.sum().item())
+    metrics: dict[str, float] = {
+        "target_loss": 0.0,
+        "target_top1": 0.0,
+        "target_top3": 0.0,
+        "target_top5": 0.0,
+        "n_target_valid": float(n_valid),
+    }
+    if n_valid == 0:
+        return target_logits.sum() * 0.0, metrics
+
+    logits = target_logits[valid]                                  # (Nv, P)
+    y = tgt_idx[valid]                                             # (Nv,)
+    loss = F.cross_entropy(logits, y)
+
+    with torch.no_grad():
+        k = min(5, P)
+        top_ids = logits.topk(k, dim=-1).indices                   # (Nv, k)
+        match = top_ids == y.unsqueeze(-1)
+        metrics["target_loss"] = float(loss.item())
+        metrics["target_top1"] = float(match[:, 0].float().mean().item())
+        metrics["target_top3"] = float(match[:, : min(3, k)].any(-1).float().mean().item())
+        metrics["target_top5"] = float(match.any(-1).float().mean().item())
+    return loss, metrics
 
 
 def compute_frac_baseline_mae(
@@ -875,10 +1005,18 @@ def _train_one_epoch(
     *,
     frac_weight: float = 0.0,
     frac_baseline_mae: float | None = None,
+    target_weight: float = 0.0,
     freeze_pair_head: bool = False,
+    freeze_frac_head: bool = False,
+    freeze_target_head: bool = False,
 ) -> dict[str, float]:
     stack.train()
-    stack.set_freeze_state(unfrozen, freeze_pair_head=freeze_pair_head)
+    stack.set_freeze_state(
+        unfrozen,
+        freeze_pair_head=freeze_pair_head,
+        freeze_frac_head=freeze_frac_head,
+        freeze_target_head=freeze_target_head,
+    )
     sums: dict[str, float] = {}
     n_batches = 0
     for batch in loader:
@@ -894,6 +1032,11 @@ def _train_one_epoch(
             )
             loss = loss + frac_weight * frac_loss
             for k, v in frac_metrics.items():
+                sums[k] = sums.get(k, 0.0) + v
+        if target_weight > 0.0:
+            target_loss, target_metrics = compute_target_loss(preds, batch)
+            loss = loss + target_weight * target_loss
+            for k, v in target_metrics.items():
                 sums[k] = sums.get(k, 0.0) + v
         optim.zero_grad(set_to_none=True)
         loss.backward()
@@ -912,6 +1055,7 @@ def _evaluate(
     *,
     frac_weight: float = 0.0,
     frac_baseline_mae: float | None = None,
+    target_weight: float = 0.0,
 ) -> dict[str, float]:
     stack.eval()
     sums: dict[str, float] = {}
@@ -929,6 +1073,11 @@ def _evaluate(
             )
             total = total + frac_weight * frac_loss
             for k, v in frac_metrics.items():
+                sums[k] = sums.get(k, 0.0) + v
+        if target_weight > 0.0:
+            target_loss, target_metrics = compute_target_loss(preds, batch)
+            total = total + target_weight * target_loss
+            for k, v in target_metrics.items():
                 sums[k] = sums.get(k, 0.0) + v
         sums["loss"] = sums.get("loss", 0.0) + float(total.item())
         sums["pair_loss"] = sums.get("pair_loss", 0.0) + float(pair_loss.item())
@@ -1018,7 +1167,7 @@ def train_pair_score(
     val_set = Subset(dataset, val_idx)
     print(f"[pair_score] train={len(train_set)} val={len(val_set)}", flush=True)
 
-    # ---- 4. Build pair head + (optional) frac head + stack ----
+    # ---- 4. Build pair head + (optional) frac / target heads + stack ----
     head = PairScoreHead(d_model=args.d_model, hidden=args.hidden).to(device)
     frac_weight = float(getattr(args, "frac_weight", 0.0) or 0.0)
     frac_head: FracHead | None = None
@@ -1027,6 +1176,13 @@ def train_pair_score(
         frac_head = FracHead(d_model=args.d_model, hidden=frac_hidden).to(device)
         print(f"[pair_score] frac head enabled (weight={frac_weight}, "
               f"hidden={frac_hidden}, init log_std={FRAC_LOG_STD_INIT:.3f})", flush=True)
+    target_weight = float(getattr(args, "target_weight", 0.0) or 0.0)
+    target_head: TargetHead | None = None
+    if target_weight > 0.0:
+        target_hidden = int(getattr(args, "target_hidden", args.hidden) or args.hidden)
+        target_head = TargetHead(d_model=args.d_model, hidden=target_hidden).to(device)
+        print(f"[pair_score] target head enabled (weight={target_weight}, "
+              f"hidden={target_hidden})", flush=True)
     stack = PairScoreStack(
         fleet_encoder=fenc,
         planet_encoder=penc,
@@ -1034,6 +1190,7 @@ def train_pair_score(
         cross=cross,
         pair_score_head=head,
         frac_head=frac_head,
+        target_head=target_head,
     ).to(device)
 
     # ---- 4b. Optional resume from a prior pair_score_best.pt ----
@@ -1060,14 +1217,36 @@ def train_pair_score(
             else:
                 print("[pair_score] init-from: frac_head missing in ckpt; "
                       "initialized from scratch", flush=True)
+        # Target head reuse: same pattern as frac head.
+        if target_head is not None:
+            if "target_head" in prior:
+                target_head.load_state_dict(prior["target_head"])
+                print("[pair_score] init-from: loaded target_head state", flush=True)
+            else:
+                print("[pair_score] init-from: target_head missing in ckpt; "
+                      "initialized from scratch", flush=True)
         print(f"[pair_score] init-from: loaded pair_score_head from "
               f"{init_from} (epoch={prior.get('epoch')})", flush=True)
 
     freeze_pair_head = bool(getattr(args, "freeze_pair_head", False))
+    freeze_frac_head = bool(getattr(args, "freeze_frac_head", False))
+    freeze_target_head = bool(getattr(args, "freeze_target_head", False))
+    frozen_heads = []
     if freeze_pair_head:
-        print("[pair_score] pair head FROZEN (stage-2 mode: only frac head + "
-              "any --unfreeze encoders are trainable)", flush=True)
-    stack.set_freeze_state(unfrozen, freeze_pair_head=freeze_pair_head)
+        frozen_heads.append("pair")
+    if freeze_frac_head and frac_head is not None:
+        frozen_heads.append("frac")
+    if freeze_target_head and target_head is not None:
+        frozen_heads.append("target")
+    if frozen_heads:
+        print(f"[pair_score] heads FROZEN: {frozen_heads} — only the unfrozen "
+              "heads + any --unfreeze encoders will train", flush=True)
+    stack.set_freeze_state(
+        unfrozen,
+        freeze_pair_head=freeze_pair_head,
+        freeze_frac_head=freeze_frac_head,
+        freeze_target_head=freeze_target_head,
+    )
 
     # ---- 4c. Train-split baseline for frac MAE (constant predictor) ----
     frac_baseline_mae: float | None = None
@@ -1112,11 +1291,15 @@ def train_pair_score(
         train_metrics = _train_one_epoch(
             stack, train_loader, optim, device, unfrozen,
             frac_weight=frac_weight, frac_baseline_mae=frac_baseline_mae,
+            target_weight=target_weight,
             freeze_pair_head=freeze_pair_head,
+            freeze_frac_head=freeze_frac_head,
+            freeze_target_head=freeze_target_head,
         )
         val_metrics = _evaluate(
             stack, val_loader, device,
             frac_weight=frac_weight, frac_baseline_mae=frac_baseline_mae,
+            target_weight=target_weight,
         )
         elapsed = time.time() - t0
         log = {
@@ -1129,9 +1312,9 @@ def train_pair_score(
         log_entries.append(log)
         log_path.write_text(json.dumps(log_entries, indent=2))
 
-        # Per-epoch summary: always shows pair metrics; frac block only
-        # appears when ``--frac-weight > 0`` so the no-frac path keeps
-        # its existing log format (smoke regression #2).
+        # Per-epoch summary: always shows pair metrics; per-head blocks
+        # only appear when the corresponding weight > 0 so the no-extra
+        # paths keep their existing log format (smoke regression test).
         frac_block = ""
         if frac_weight > 0.0:
             frac_block = (
@@ -1144,6 +1327,13 @@ def train_pair_score(
             if sigma_disp <= math.exp(FRAC_LOG_STD_MIN) + 1e-6 \
                     or sigma_disp >= math.exp(FRAC_LOG_STD_MAX) - 1e-6:
                 sigma_pinned_epochs += 1
+        target_block = ""
+        if target_weight > 0.0:
+            target_block = (
+                f"  ||  tr_tgt_top1={train_metrics.get('target_top1', 0):.3f} "
+                f"val_tgt_top1={val_metrics.get('target_top1', 0):.3f} "
+                f"val_tgt_top3={val_metrics.get('target_top3', 0):.3f}"
+            )
         print(
             f"[pair_score] ep={epoch:3d} "
             f"tr_loss={train_metrics.get('loss', 0):.4f} "
@@ -1153,7 +1343,7 @@ def train_pair_score(
             f"val_top3={val_metrics.get('top3', 0):.3f} "
             f"val_top5={val_metrics.get('top5', 0):.3f} "
             f"rand={val_metrics.get('random_valid_top1', 0):.3f}"
-            f"{frac_block}  "
+            f"{frac_block}{target_block}  "
             f"dt={time.time() - t_epoch:.1f}s",
             flush=True,
         )
@@ -1167,6 +1357,7 @@ def train_pair_score(
             "init_from": str(init_from) if init_from else None,
             "unfrozen": sorted(unfrozen),
             "frac_weight": frac_weight,
+            "target_weight": target_weight,
             "config": {
                 "d_model": args.d_model,
                 "hidden": args.hidden,
@@ -1174,6 +1365,7 @@ def train_pair_score(
                 "max_fleets": args.max_fleets,
                 "n_history": args.n_history,
                 "frac_hidden": int(getattr(args, "frac_hidden", args.hidden) or args.hidden),
+                "target_hidden": int(getattr(args, "target_hidden", args.hidden) or args.hidden),
             },
             "metrics": {"train": train_metrics, "val": val_metrics},
         }
@@ -1234,7 +1426,11 @@ def train_pair_score_kwargs(
     init_from=None,
     frac_weight=0.0,
     frac_hidden=128,
+    target_weight=0.0,
+    target_hidden=128,
     freeze_pair_head=False,
+    freeze_frac_head=False,
+    freeze_target_head=False,
     cache_dir=None,
     rebuild_cache=False,
     dataset=None,
@@ -1278,7 +1474,11 @@ def train_pair_score_kwargs(
         init_from=Path(init_from) if init_from is not None else None,
         frac_weight=float(frac_weight),
         frac_hidden=int(frac_hidden),
+        target_weight=float(target_weight),
+        target_hidden=int(target_hidden),
         freeze_pair_head=bool(freeze_pair_head),
+        freeze_frac_head=bool(freeze_frac_head),
+        freeze_target_head=bool(freeze_target_head),
         cache_dir=(Path(cache_dir) if cache_dir is not None else None),
         rebuild_cache=bool(rebuild_cache),
     )
@@ -1344,6 +1544,21 @@ def main() -> None:
                         "Stage-2 frac-only pattern: pair head + all "
                         "encoders frozen, only FracHead trains. Combine "
                         "with --init-from <pair-trained best.pt>.")
+    p.add_argument("--freeze-frac-head", action="store_true",
+                   help="Freeze the FracHead. Pairs with --init-from to "
+                        "preserve a previously-trained frac while training "
+                        "other heads.")
+    p.add_argument("--freeze-target-head", action="store_true",
+                   help="Freeze the TargetHead. Pairs with --init-from to "
+                        "preserve a previously-trained target head while "
+                        "training other heads.")
+    p.add_argument("--target-weight", type=float, default=0.0,
+                   help="Weight for the per-planet target-attractiveness CE "
+                        "loss (0.0 = disabled, no TargetHead built). 0.5 is "
+                        "a sane joint-training default.")
+    p.add_argument("--target-hidden", type=int, default=128,
+                   help="Hidden width of the TargetHead MLP. "
+                        "Ignored when --target-weight 0.")
     p.add_argument("--cache-dir", type=Path, default=None,
                    help="Optional on-disk cache for the materialized "
                         "ActionSnapshotDataset. Off by default — the cache "
