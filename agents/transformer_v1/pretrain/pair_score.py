@@ -134,38 +134,71 @@ FRAC_LABEL_EPS: float = 1e-3
 class TargetHead(nn.Module):
     """Per-planet target-attractiveness score.
 
-    A marginal-over-source companion to :class:`PairScoreHead`: instead
+    Marginal-over-source companion to :class:`PairScoreHead`: instead
     of scoring every ``(source, target)`` pair, this head scores every
-    planet on its own ``"would the expert pick this planet as a target
-    this turn"`` — own / neutral / enemy alike, with no ownership mask
-    at the head level. Downstream code can combine the per-planet logit
-    with the pair head's conditional (e.g. ``pair_logits + α·target_logits``
-    at inference, or treat it as an auxiliary BC loss during training).
+    planet on its own — own / neutral / enemy uniform, no ownership
+    mask. Downstream code combines the per-planet logit with the pair
+    head's conditional however it likes (e.g. ``pair_logits[src, :]
+    + α · target_logits`` at inference, or treats it as an auxiliary
+    BC loss in training).
 
-    Per planet ``i``:
-        feat_i = [ glob ‖ ctx_i ]        (2·d)
-        score_i = MLP(feat_i)            (1)
+    Per-planet feature (depending on ``use_entity``):
 
-    Output ``target_logits`` has shape ``(B, P)``. Lightweight (~17 k
-    params at d=64, hidden=128) and stays separate from the pair head
-    so the stage-2 / stage-3 chain of ``--init-from`` still loads cleanly.
+      * ``use_entity=False`` (v1 default for older ckpts):
+          feat_i = [ glob ‖ ctx_i ]                       (2·d)
+      * ``use_entity=True``  (v2 default):
+          feat_i = [ glob ‖ ctx_i ‖ entity_i ]            (3·d)
+        where ``entity_i`` is the post-:class:`PlanetEntityEncoder`
+        token (after the per-(planet, owner) fleet pooling) and
+        before cross-attention — i.e., the entity-local view of
+        planet ``i`` that the cross attention then mixes globally.
+
+    ``num_layers`` chooses 2- or 3-layer MLP depth. v1 used 2, v2
+    bumps to 3 for more capacity since the input dim grew 2d → 3d.
+
+    Parameter count (d=64, hidden=128):
+      * v1 (2d, 2 layers): 2·64·128 + 128 + 128·1 + 1  ≈ **16 641**
+      * v2 (3d, 3 layers): 3·64·128 + 128 + 128·128 + 128 + 128·1 + 1
+                                                       ≈ **41 345**
+
+    Loaders should pass ``use_entity`` and ``num_layers`` from the
+    saved ckpt's config block so older 2d/2-layer ckpts still load
+    state_dicts cleanly.
     """
 
-    def __init__(self, d_model: int = 64, hidden: int = 128):
+    def __init__(
+        self,
+        d_model: int = 64,
+        hidden: int = 128,
+        *,
+        use_entity: bool = True,
+        num_layers: int = 3,
+    ):
         super().__init__()
+        if num_layers < 2:
+            raise ValueError(f"num_layers must be >= 2 (got {num_layers})")
         self.d_model = d_model
-        self.mlp = nn.Sequential(
-            nn.Linear(2 * d_model, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, 1),
-        )
+        self.hidden = hidden
+        self.use_entity = bool(use_entity)
+        self.num_layers = int(num_layers)
+
+        in_dim = (3 if self.use_entity else 2) * d_model
+        layers: list[nn.Module] = []
+        cur = in_dim
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(cur, hidden))
+            layers.append(nn.GELU())
+            cur = hidden
+        layers.append(nn.Linear(cur, 1))
+        self.mlp = nn.Sequential(*layers)
         nn.init.zeros_(self.mlp[-1].bias)
         nn.init.normal_(self.mlp[-1].weight, std=1e-3)
 
     def forward(
         self,
-        glob: torch.Tensor,                # (B, d)
-        ctx: torch.Tensor,                 # (B, P, d)
+        glob: torch.Tensor,                          # (B, d)
+        ctx: torch.Tensor,                           # (B, P, d)
+        entity_now: torch.Tensor | None = None,      # (B, P, d) — required when use_entity=True
     ) -> torch.Tensor:
         B, P, d = ctx.shape
         if d != self.d_model:
@@ -173,8 +206,17 @@ class TargetHead(nn.Module):
                 f"ctx d={d} but TargetHead built for d_model={self.d_model}"
             )
         glob_b = glob.unsqueeze(1).expand(B, P, d)
-        feat = torch.cat([glob_b, ctx], dim=-1)            # (B, P, 2d)
-        return self.mlp(feat).squeeze(-1)                   # (B, P)
+        if self.use_entity:
+            if entity_now is None:
+                raise ValueError(
+                    "TargetHead was built with use_entity=True; pass "
+                    "entity_now (the post-PlanetEntityEncoder token, last "
+                    "history step) when calling forward."
+                )
+            feat = torch.cat([glob_b, ctx, entity_now], dim=-1)   # (B, P, 3d)
+        else:
+            feat = torch.cat([glob_b, ctx], dim=-1)               # (B, P, 2d)
+        return self.mlp(feat).squeeze(-1)                          # (B, P)
 
 
 class FracHead(nn.Module):
@@ -451,18 +493,27 @@ class PairScoreStack(nn.Module):
             if rows.numel() > 0:
                 tgt_valid[rows, tgt_idx[rows]] = True
 
+        # entity_now: the post-PlanetEntityEncoder token for the
+        # current turn — required by the v2 TargetHead.
+        entity_now = (
+            entity_tokens[:, -1] if entity_tokens.dim() == 4 else entity_tokens
+        )
         pair_logits = self.pair_score_head(glob, ctx_now, src_valid, tgt_valid)
         out: dict[str, torch.Tensor] = {
             "pair_logits": pair_logits,
             "_ctx_now": ctx_now,
             "_glob": glob,
+            "_entity_now": entity_now,
         }
         if self.frac_head is not None:
             frac_out = self.frac_head(glob, ctx_now)
             out["frac_loc"] = frac_out["frac_loc"]
             out["frac_log_std"] = frac_out["frac_log_std"]
         if self.target_head is not None:
-            out["target_logits"] = self.target_head(glob, ctx_now)
+            if getattr(self.target_head, "use_entity", False):
+                out["target_logits"] = self.target_head(glob, ctx_now, entity_now)
+            else:
+                out["target_logits"] = self.target_head(glob, ctx_now)
         return out
 
 
@@ -1093,6 +1144,258 @@ def _evaluate(
     return {k: v / max(1, n_batches) for k, v in sums.items()}
 
 
+# ---------- Target-only fast path: precompute frozen features ----------
+@torch.no_grad()
+def _precompute_frozen_features(
+    stack: PairScoreStack,
+    dataset: ActionSnapshotDataset,
+    indices: list[int],
+    *,
+    device: torch.device,
+    batch_size: int = 64,
+) -> list[dict[str, torch.Tensor]]:
+    """Walk the indexed snapshots once through the frozen encoder + cross
+    stack and cache the resulting ``glob`` + ``ctx_now`` per snapshot,
+    plus the labels the TargetHead loss / metrics need. Returns a list
+    of CPU-resident dicts, one per snapshot.
+
+    The cache scales as ``len(indices) * (d + P * d) * 4 bytes`` —
+    ~16 KB per snapshot at d=64 / P=64. 26 k Ebi acted rows ≈ 425 MB.
+    Doesn't carry pair-specific tensors like ``src_valid`` because the
+    pair head is assumed frozen here.
+    """
+    stack.eval()
+    subset = Subset(dataset, indices)
+    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, drop_last=False)
+    cached: list[dict[str, torch.Tensor]] = []
+    for batch in loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        entity_tokens, entity_mask = _entity_tokens_per_step(
+            batch,
+            stack.fleet_encoder,
+            stack.planet_encoder,
+            stack.entity_encoder,
+        )
+        ctx, glob = stack.cross(entity_tokens, entity_mask)
+        ctx_now = ctx[:, -1] if ctx.dim() == 4 else ctx
+        entity_now = (
+            entity_tokens[:, -1] if entity_tokens.dim() == 4 else entity_tokens
+        )
+        B = glob.shape[0]
+        for i in range(B):
+            cached.append({
+                "glob": glob[i].detach().cpu(),
+                "ctx": ctx_now[i].detach().cpu(),
+                # Cache the pre-cross-attention entity token so a v2
+                # TargetHead (use_entity=True) can train without re-
+                # running the encoder. ~16 KB per snapshot at d=64/P=64
+                # → adds ~450 MB for a full-Ebi acted-row cache.
+                "entity": entity_now[i].detach().cpu(),
+                "target_planet_idx": batch["target_planet_idx"][i].detach().cpu(),
+                "source_planet_idx": batch["source_planet_idx"][i].detach().cpu(),
+            })
+    return cached
+
+
+class _CachedFeatureDataset(torch.utils.data.Dataset):
+    """Lightweight wrapper around a list of precomputed feature dicts."""
+
+    def __init__(self, items: list[dict[str, torch.Tensor]]):
+        self.items = items
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
+        return self.items[i]
+
+
+def _train_target_only_fast(
+    target_head: TargetHead,
+    pair_score_head: PairScoreHead,
+    train_cached: list[dict[str, torch.Tensor]],
+    val_cached: list[dict[str, torch.Tensor]],
+    *,
+    device: torch.device,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    batch_size: int,
+    out_dir: Path,
+    init_from_path: str | None,
+    config: dict,
+    save_extras: dict[str, dict] | None = None,
+) -> Path:
+    """Train ONLY the TargetHead on cached frozen-encoder features.
+
+    Skips every encoder + cross-attention forward each batch — the
+    cached ``(glob, ctx)`` per snapshot is the input to TargetHead +
+    PairScoreHead (the latter only used to log frozen pair_top1 as a
+    sanity check). Designed for the stage-N pattern where the pair
+    head, frac head, and all encoders are frozen.
+
+    Args:
+      target_head: the only module that updates.
+      pair_score_head: used in eval-only mode to recompute pair_top1
+        per epoch from cached ctx. Stays on the CPU; small.
+      train_cached / val_cached: outputs of :func:`_precompute_frozen_features`.
+      save_extras: extra state-dicts to embed in the saved ckpt
+        (e.g. frac_head, every encoder) so the output stays self-
+        contained — same contract as the full path's ``trainable_module_state``.
+
+    Returns the path to the best ckpt.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target_head = target_head.to(device).train()
+    pair_score_head = pair_score_head.to(device).eval()
+    optim = torch.optim.AdamW(
+        target_head.parameters(), lr=lr, weight_decay=weight_decay,
+    )
+    train_loader = DataLoader(
+        _CachedFeatureDataset(train_cached),
+        batch_size=batch_size, shuffle=True, drop_last=False,
+    )
+    val_loader = DataLoader(
+        _CachedFeatureDataset(val_cached),
+        batch_size=batch_size, shuffle=False, drop_last=False,
+    )
+
+    best_val_loss = float("inf")
+    best_path = out_dir / "pair_score_best.pt"
+    last_path = out_dir / "pair_score_last.pt"
+    log_path = out_dir / "log.json"
+    log_entries: list[dict[str, Any]] = []
+    t0 = time.time()
+
+    for epoch in range(1, epochs + 1):
+        t_epoch = time.time()
+        target_head.train()
+        # ---- Train ----
+        n_train_batches = 0
+        train_sums: dict[str, float] = {}
+        for batch in train_loader:
+            glob = batch["glob"].to(device)
+            ctx = batch["ctx"].to(device)
+            entity = batch["entity"].to(device) if "entity" in batch else None
+            tgt_idx = batch["target_planet_idx"].to(device).long()
+            if getattr(target_head, "use_entity", False):
+                logits = target_head(glob, ctx, entity)
+            else:
+                logits = target_head(glob, ctx)
+            B, P = logits.shape
+            valid = (tgt_idx >= 0) & (tgt_idx < P)
+            if not valid.any():
+                continue
+            loss = F.cross_entropy(logits[valid], tgt_idx[valid])
+            optim.zero_grad(set_to_none=True)
+            loss.backward()
+            optim.step()
+            train_sums["target_loss"] = train_sums.get("target_loss", 0.0) + float(loss.item())
+            with torch.no_grad():
+                k = min(5, P)
+                top_ids = logits[valid].topk(k, dim=-1).indices
+                yv = tgt_idx[valid]
+                match = top_ids == yv.unsqueeze(-1)
+                train_sums["target_top1"] = train_sums.get("target_top1", 0.0) + \
+                    float(match[:, 0].float().mean().item())
+                train_sums["target_top3"] = train_sums.get("target_top3", 0.0) + \
+                    float(match[:, : min(3, k)].any(-1).float().mean().item())
+            n_train_batches += 1
+        train_metrics = {k: v / max(1, n_train_batches) for k, v in train_sums.items()}
+
+        # ---- Eval (target loss + frozen pair sanity) ----
+        target_head.eval()
+        n_val_batches = 0
+        val_sums: dict[str, float] = {}
+        with torch.no_grad():
+            for batch in val_loader:
+                glob = batch["glob"].to(device)
+                ctx = batch["ctx"].to(device)
+                entity = batch["entity"].to(device) if "entity" in batch else None
+                tgt_idx = batch["target_planet_idx"].to(device).long()
+                src_idx = batch["source_planet_idx"].to(device).long()
+                if getattr(target_head, "use_entity", False):
+                    logits = target_head(glob, ctx, entity)
+                else:
+                    logits = target_head(glob, ctx)
+                B, P = logits.shape
+                valid_t = (tgt_idx >= 0) & (tgt_idx < P)
+                if valid_t.any():
+                    loss = F.cross_entropy(logits[valid_t], tgt_idx[valid_t])
+                    val_sums["target_loss"] = val_sums.get("target_loss", 0.0) + float(loss.item())
+                    k = min(5, P)
+                    top_ids = logits[valid_t].topk(k, dim=-1).indices
+                    yv = tgt_idx[valid_t]
+                    match = top_ids == yv.unsqueeze(-1)
+                    val_sums["target_top1"] = val_sums.get("target_top1", 0.0) + \
+                        float(match[:, 0].float().mean().item())
+                    val_sums["target_top3"] = val_sums.get("target_top3", 0.0) + \
+                        float(match[:, : min(3, k)].any(-1).float().mean().item())
+                    val_sums["target_top5"] = val_sums.get("target_top5", 0.0) + \
+                        float(match.any(-1).float().mean().item())
+                # Pair sanity (frozen): full pair_logits over (P, P) for the batch.
+                pair_logits = pair_score_head(glob, ctx)
+                valid_p = (src_idx >= 0) & (tgt_idx >= 0) & (src_idx < P) & (tgt_idx < P)
+                if valid_p.any():
+                    pl = pair_logits[valid_p]
+                    si = src_idx[valid_p]
+                    ti = tgt_idx[valid_p]
+                    flat = pl.reshape(pl.shape[0], P * P)
+                    y = si * P + ti
+                    pred = flat.argmax(-1)
+                    val_sums["pair_top1"] = val_sums.get("pair_top1", 0.0) + \
+                        float((pred == y).float().mean().item())
+                n_val_batches += 1
+        val_metrics = {k: v / max(1, n_val_batches) for k, v in val_sums.items()}
+
+        elapsed = time.time() - t0
+        log = {
+            "epoch": epoch,
+            "elapsed_s": round(elapsed, 1),
+            "epoch_s": round(time.time() - t_epoch, 1),
+            "train": train_metrics,
+            "val": val_metrics,
+        }
+        log_entries.append(log)
+        log_path.write_text(json.dumps(log_entries, indent=2))
+        print(
+            f"[pair_score-fast] ep={epoch:3d} "
+            f"tr_loss={train_metrics.get('target_loss', 0):.4f} "
+            f"tr_tgt_top1={train_metrics.get('target_top1', 0):.3f}  |  "
+            f"val_loss={val_metrics.get('target_loss', 0):.4f} "
+            f"val_tgt_top1={val_metrics.get('target_top1', 0):.3f} "
+            f"val_tgt_top3={val_metrics.get('target_top3', 0):.3f} "
+            f"val_tgt_top5={val_metrics.get('target_top5', 0):.3f}  ||  "
+            f"pair_top1={val_metrics.get('pair_top1', 0):.3f} "
+            f"(frozen sanity)  "
+            f"dt={time.time() - t_epoch:.1f}s",
+            flush=True,
+        )
+
+        ckpt_payload: dict = {
+            "epoch": epoch,
+            "init_from": init_from_path,
+            "config": config,
+            "metrics": {"train": train_metrics, "val": val_metrics},
+            "target_weight": 1.0,
+            "pair_weight": 0.0,
+            "frac_weight": 0.0,
+            "target_head": target_head.state_dict(),
+            "pair_score_head": pair_score_head.state_dict(),
+        }
+        if save_extras:
+            ckpt_payload.update(save_extras)
+        torch.save(ckpt_payload, last_path)
+        val_loss = val_metrics.get("target_loss", float("inf"))
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(torch.load(last_path, weights_only=False), best_path)
+
+    print(f"[pair_score-fast] done. best target_loss={best_val_loss:.4f} "
+          f"ckpts: {best_path.name}, {last_path.name}", flush=True)
+    return best_path
+
+
 def train_pair_score(
     args: argparse.Namespace,
     *,
@@ -1213,11 +1516,25 @@ def train_pair_score(
     target_head: TargetHead | None = None
     if target_weight > 0.0 or have_prior_target:
         target_hidden = int(getattr(args, "target_hidden", args.hidden) or args.hidden)
-        target_head = TargetHead(d_model=args.d_model, hidden=target_hidden).to(device)
+        # Honor the prior ckpt's TargetHead shape when resuming so its
+        # state_dict loads. New training runs default to the v2 head
+        # (use_entity=True, num_layers=3).
+        prior_cfg = init_payload.get("config", {}) if init_payload else {}
+        if have_prior_target:
+            t_use_entity = bool(prior_cfg.get("target_use_entity", False))
+            t_num_layers = int(prior_cfg.get("target_num_layers", 2))
+        else:
+            t_use_entity = bool(getattr(args, "target_use_entity", True))
+            t_num_layers = int(getattr(args, "target_num_layers", 3))
+        target_head = TargetHead(
+            d_model=args.d_model, hidden=target_hidden,
+            use_entity=t_use_entity, num_layers=t_num_layers,
+        ).to(device)
         why = "weight>0" if target_weight > 0.0 else "preserved from --init-from"
         print(
             f"[pair_score] target head enabled (weight={target_weight}, "
-            f"hidden={target_hidden}, reason={why})",
+            f"hidden={target_hidden}, use_entity={t_use_entity}, "
+            f"num_layers={t_num_layers}, reason={why})",
             flush=True,
         )
 
@@ -1291,6 +1608,76 @@ def train_pair_score(
         else:
             print("[pair_score] frac baseline MAE: NaN (no acted train rows had "
                   "finite frac_label)", flush=True)
+
+    # Detect target-only mode: every encoder frozen, pair head frozen,
+    # frac head missing-or-frozen, target head present and trainable.
+    # In that mode the encoder + cross + pair + frac forward never
+    # changes — we precompute (glob, ctx) per snapshot once and iterate
+    # the TargetHead alone, which lets full-Ebi training fit a local
+    # CPU budget (~minutes instead of ~hours).
+    encoders_frozen = not unfrozen
+    frac_path_inert = (frac_head is None) or freeze_frac_head
+    target_only_mode = (
+        encoders_frozen
+        and freeze_pair_head
+        and frac_path_inert
+        and target_head is not None
+        and not freeze_target_head
+    )
+    if target_only_mode:
+        print(
+            "[pair_score] target-only fast path engaged: precomputing "
+            "(glob, ctx) per snapshot, then training only the TargetHead "
+            f"on {len(train_idx)} train + {len(val_idx)} val cached features.",
+            flush=True,
+        )
+        t_pc = time.time()
+        train_cached = _precompute_frozen_features(
+            stack, dataset, train_idx,
+            device=device, batch_size=args.batch_size,
+        )
+        val_cached = _precompute_frozen_features(
+            stack, dataset, val_idx,
+            device=device, batch_size=args.batch_size,
+        )
+        print(
+            f"[pair_score] precomputed {len(train_cached) + len(val_cached)} "
+            f"snapshot features in {time.time() - t_pc:.1f}s",
+            flush=True,
+        )
+        # Self-contained ckpt extras: encoder + pair + frac states stay
+        # bit-exact (none of them updates this run).
+        save_extras: dict[str, dict] = {}
+        for name in PairScoreStack.ENCODER_MODULES:
+            save_extras[name] = getattr(stack, name).state_dict()
+        if frac_head is not None:
+            save_extras["frac_head"] = frac_head.state_dict()
+        save_extras["encoder_ckpt"] = str(args.encoder_ckpt)
+        config = {
+            "d_model": args.d_model,
+            "hidden": args.hidden,
+            "max_planets": args.max_planets,
+            "max_fleets": args.max_fleets,
+            "n_history": args.n_history,
+            "target_hidden": int(getattr(args, "target_hidden", args.hidden) or args.hidden),
+            "target_use_entity": bool(getattr(target_head, "use_entity", False)),
+            "target_num_layers": int(getattr(target_head, "num_layers", 2)),
+        }
+        return _train_target_only_fast(
+            target_head=target_head,
+            pair_score_head=head,
+            train_cached=train_cached,
+            val_cached=val_cached,
+            device=device,
+            epochs=args.epochs,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            batch_size=args.batch_size,
+            out_dir=out_dir,
+            init_from_path=str(init_from) if init_from else None,
+            config=config,
+            save_extras=save_extras,
+        )
 
     # AdamW over every parameter that's actually trainable now (head +
     # any unfrozen encoders). filter is needed because frozen params
@@ -1401,6 +1788,8 @@ def train_pair_score(
                 "n_history": args.n_history,
                 "frac_hidden": int(getattr(args, "frac_hidden", args.hidden) or args.hidden),
                 "target_hidden": int(getattr(args, "target_hidden", args.hidden) or args.hidden),
+                "target_use_entity": bool(getattr(target_head, "use_entity", False)) if target_head is not None else False,
+                "target_num_layers": int(getattr(target_head, "num_layers", 2)) if target_head is not None else 2,
             },
             "metrics": {"train": train_metrics, "val": val_metrics},
         }
@@ -1464,6 +1853,8 @@ def train_pair_score_kwargs(
     frac_hidden=128,
     target_weight=0.0,
     target_hidden=128,
+    target_use_entity=True,
+    target_num_layers=3,
     freeze_pair_head=False,
     freeze_frac_head=False,
     freeze_target_head=False,
@@ -1513,6 +1904,8 @@ def train_pair_score_kwargs(
         frac_hidden=int(frac_hidden),
         target_weight=float(target_weight),
         target_hidden=int(target_hidden),
+        target_use_entity=bool(target_use_entity),
+        target_num_layers=int(target_num_layers),
         freeze_pair_head=bool(freeze_pair_head),
         freeze_frac_head=bool(freeze_frac_head),
         freeze_target_head=bool(freeze_target_head),
@@ -1605,6 +1998,19 @@ def main() -> None:
     p.add_argument("--target-hidden", type=int, default=128,
                    help="Hidden width of the TargetHead MLP. "
                         "Ignored when --target-weight 0.")
+    p.add_argument("--target-use-entity", dest="target_use_entity",
+                   action="store_true", default=True,
+                   help="v2 TargetHead: concat the pre-cross-attention "
+                        "entity token alongside glob/ctx (3·d input). "
+                        "Default. Use --target-no-entity for the v1 2d head.")
+    p.add_argument("--target-no-entity", dest="target_use_entity",
+                   action="store_false",
+                   help="Force the v1 TargetHead (no entity input).")
+    p.add_argument("--target-num-layers", type=int, default=3,
+                   help="MLP depth for the TargetHead. v1 used 2; v2 "
+                        "default is 3. Resume runs override this from "
+                        "the prior ckpt's config to keep state_dict shapes "
+                        "consistent.")
     p.add_argument("--cache-dir", type=Path, default=None,
                    help="Optional on-disk cache for the materialized "
                         "ActionSnapshotDataset. Off by default — the cache "
