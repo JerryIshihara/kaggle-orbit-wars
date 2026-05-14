@@ -869,6 +869,7 @@ def discover_action_csvs(
     filter_mode: str,                  # "winner" or "all"
     player: str | None = None,
     replay_dir: Path | None = None,
+    exclude_stems: set[str] | None = None,
 ) -> list[Path]:
     """Find action CSVs, optionally restricted to one player and/or
     winner-only perspectives.
@@ -882,6 +883,11 @@ def discover_action_csvs(
     under ``<replay_dir>/<player>/``. Composes with ``filter_mode`` —
     ``player='kovi', filter_mode='winner'`` keeps only kovi's actions in
     replays kovi won.
+
+    ``exclude_stems`` (optional): drop any CSV whose stem is in this set.
+    Wire this to data-integrity audits (e.g. fleet CSVs that stopped
+    short of their replay's last turn — interrupted writes that produce
+    nonzero inbound labels paired with empty fleet inputs).
     """
     csvs = sorted(action_dir.glob("action_*.csv"))
 
@@ -890,6 +896,10 @@ def discover_action_csvs(
             raise ValueError("player= requires replay_dir=")
         keep_stems = player_replay_stems(replay_dir, player)
         csvs = [p for p in csvs if p.stem.removeprefix("action_") in keep_stems]
+
+    if exclude_stems:
+        csvs = [p for p in csvs
+                if p.stem.removeprefix("action_") not in exclude_stems]
 
     if filter_mode == "all":
         return csvs
@@ -946,10 +956,11 @@ def prepare_dataset(
     cross_entity_dir: Path | str = CROSS_ENTITY_DATASET_DIR,
     replay_dir: Path | str = "data/replays",
     max_planets: int = 64,
-    max_fleets: int = 256,
+    max_fleets: int = 1024,
     n_history: int = 3,
     cache_dir: Path | str | None = None,
     rebuild_cache: bool = False,
+    exclude_stems: set[str] | None = None,
 ) -> ActionSnapshotDataset:
     """Build the action-snapshot dataset for one expert (in-memory).
 
@@ -1002,6 +1013,7 @@ def prepare_dataset(
         filter_mode=filter_mode,
         player=player,
         replay_dir=Path(replay_dir) if player else None,
+        exclude_stems=exclude_stems,
     )
     if not action_csvs:
         raise SystemExit(
@@ -1843,7 +1855,7 @@ def train_pair_score_kwargs(
     d_model=64,
     hidden=128,
     max_planets=64,
-    max_fleets=256,
+    max_fleets=1024,
     n_history=3,
     device=None,
     unfreeze=None,
@@ -1947,7 +1959,7 @@ def main() -> None:
     p.add_argument("--d-model", type=int, default=64)
     p.add_argument("--hidden", type=int, default=128)
     p.add_argument("--max-planets", type=int, default=64)
-    p.add_argument("--max-fleets", type=int, default=256)
+    p.add_argument("--max-fleets", type=int, default=1024)
     p.add_argument("--n-history", type=int, default=3)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out-dir", type=Path, required=True)

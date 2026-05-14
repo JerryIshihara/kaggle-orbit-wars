@@ -88,7 +88,15 @@ class CrossEntityAttention(nn.Module):
             dropout=dropout,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        # Pre-LN disables PyTorch's nested-tensor fast path; setting this
+        # explicitly avoids a noisy warning on every Colab run.
+        try:
+            self.encoder = nn.TransformerEncoder(
+                layer, num_layers=n_layers, enable_nested_tensor=False,
+            )
+        except TypeError:
+            # Older PyTorch versions do not expose enable_nested_tensor.
+            self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
 
     def forward(
         self,

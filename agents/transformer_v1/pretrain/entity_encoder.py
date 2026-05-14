@@ -127,7 +127,7 @@ class EntitySnapshotDataset(Dataset):
         entity_csv_paths: list[Path],
         *,
         max_planets: int = 64,
-        max_fleets: int = 256,
+        max_fleets: int = 1024,
         learner_slot: int = 0,
         num_players: int = 4,
         num_load_workers: int | None = None,
@@ -712,7 +712,7 @@ def train(
     weight_decay: float = 1e-4,
     eval_every: int = 1,
     max_planets: int = 64,
-    max_fleets: int = 256,
+    max_fleets: int = 1024,
     num_workers: int = 0,
     device: str | None = None,
     seed: int = 0,
@@ -866,7 +866,12 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--max-planets", type=int, default=64)
-    parser.add_argument("--max-fleets", type=int, default=256)
+    parser.add_argument("--max-fleets", type=int, default=1024,
+                        help="Per-snapshot fleet cap. Real max observed = 813 "
+                             "across all replays; 1024 is the next pow-of-2 "
+                             "above it. Lower values (256/512) save memory "
+                             "but truncate ~3k snapshots and corrupt the "
+                             "inbound labels for them.")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)

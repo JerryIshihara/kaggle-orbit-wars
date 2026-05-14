@@ -42,13 +42,15 @@ class ActionSnapshotDataset(CrossEntitySnapshotDataset):
       * ``expert_acted`` (Float) — 0/1
       * ``frac_label`` (Float) — ``ships_sent / source_ships`` (BEFORE
         launch), in (0, 1]; NaN when no acted / source unknown
-      * ``src_valid`` (Bool, ``(max_planets,)``) — owned & launchable
+      * ``src_valid`` (Bool, ``(max_planets,)``) — owned-source mask (``own ∧ ships > 0``). NOT the runtime surplus-based "launchable" rule. See target_rank.py module docstring for the rationale (force-includes the expert's gold source so BC supervision survives stricter heuristics).
       * ``tgt_valid`` (Bool, ``(max_planets,)``) — planet exists
 
     Mask side cache (``data/datasets/action/_masks/<stem>.npz``) is
     loaded alongside action CSVs in ``__init__`` and sliced per
-    snapshot. A missing mask file falls back to all-False (defensive —
-    the loss code masks loss contributions accordingly).
+    snapshot. A missing mask file falls back to masks derived from the
+    current snapshot: ``tgt_valid = planet_mask`` and
+    ``src_valid = own & ships > 0``. The gold source/target are then
+    force-included on acted rows.
     """
 
     def __init__(
@@ -60,7 +62,7 @@ class ActionSnapshotDataset(CrossEntitySnapshotDataset):
         action_csv_paths: list[Path],
         *,
         max_planets: int = 64,
-        max_fleets: int = 256,
+        max_fleets: int = 1024,
         learner_slot: int = 0,
         num_players: int = 4,
         n_history: int = 3,
@@ -155,6 +157,7 @@ class ActionSnapshotDataset(CrossEntitySnapshotDataset):
         src_valid = torch.zeros(self.max_planets, dtype=torch.bool)
         tgt_valid = torch.zeros(self.max_planets, dtype=torch.bool)
         idx_map = self._mask_index.get(ep_id)
+        loaded_mask = False
         if idx_map is not None and turn in idx_map:
             row_i = idx_map[turn]
             src_arr, tgt_arr = self._mask_arrays[ep_id]
@@ -162,14 +165,25 @@ class ActionSnapshotDataset(CrossEntitySnapshotDataset):
             P_use = min(P_file, self.max_planets)
             src_valid[:P_use] = torch.from_numpy(src_arr[row_i, :P_use])
             tgt_valid[:P_use] = torch.from_numpy(tgt_arr[row_i, :P_use])
-        # Force-include the expert's chosen source whenever it acted.
-        # The featurizer's "launchable" rule (compute_surplus >= min_launch)
-        # is a heuristic and disagrees with the expert ~25% of the time —
-        # mostly when the expert launches with a smaller surplus than our
-        # min_launch threshold. Excluding the expert's own source here
-        # would push CE→inf and discard the supervision signal entirely.
+            loaded_mask = True
+        if not loaded_mask:
+            # Older data.tgz builds do not carry _masks/*.npz. Falling
+            # back to all-False and then force-including gold collapses
+            # target CE to one candidate (loss=0/top1=1), so derive the
+            # broad masks directly from the current snapshot.
+            planet_mask = snapshot["planet_mask"].bool()
+            planet_features = snapshot["planet_features"]
+            owned = planet_features[..., 1] > 0.5      # owner-self one-hot
+            has_ships = planet_features[..., 6] > 0.0  # log1p(ships) norm
+            src_valid = owned & has_ships & planet_mask
+            tgt_valid = planet_mask.clone()
+        # Force-include the expert's chosen source/target whenever it
+        # acted. This preserves BC supervision if a stricter heuristic or
+        # a stale mask sidecar excludes the expert label.
         if expert_acted > 0.5 and 0 <= source_idx < self.max_planets:
             src_valid[source_idx] = True
+        if expert_acted > 0.5 and 0 <= target_idx < self.max_planets:
+            tgt_valid[target_idx] = True
         snapshot["src_valid"] = src_valid
         snapshot["tgt_valid"] = tgt_valid
         return snapshot

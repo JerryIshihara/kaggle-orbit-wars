@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Target-Score Replay</title>
+<style>
+  :root {
+    --bg: #0f1320; --panel: #1a1f33; --border: #2a3148; --text: #d8dee9;
+    --muted: #7a8295; --accent: #6aa0ff;
+  }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+               font-family: -apple-system, system-ui, sans-serif; overflow: hidden; }
+  body { display: flex; flex-direction: column; height: 100vh; }
+  header { padding: 6px 12px; border-bottom: 1px solid var(--border);
+           display: flex; gap: 12px; align-items: center; font-size: 12px;
+           flex-shrink: 0; }
+  header .title { font-weight: 600; color: var(--text); }
+  header .meta { color: var(--muted); }
+  header .spacer { flex: 1; }
+  header .turn { color: var(--text); font-family: ui-monospace, Menlo, monospace; }
+  /* Determinate progress bar shown during /api/target_scores/stream */
+  #progressWrap { flex-shrink: 0; padding: 4px 12px; border-bottom: 1px solid var(--border);
+                   display: none; }
+  #progressWrap.active { display: block; }
+  #progressBar { width: 100%; height: 6px; appearance: none; background: var(--panel);
+                  border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
+  #progressBar::-webkit-progress-bar { background: var(--panel); }
+  #progressBar::-webkit-progress-value { background: var(--accent); transition: width 0.1s linear; }
+  #progressBar::-moz-progress-bar { background: var(--accent); }
+  #progressText { font-size: 10px; color: var(--muted); margin-top: 2px;
+                   font-family: ui-monospace, Menlo, monospace; }
+  main { flex: 1; min-height: 0; position: relative; }
+  #board { display: block; width: 100%; height: 100%; background: #000; }
+  .legend { position: absolute; bottom: 8px; right: 8px; background: rgba(20,25,40,0.85);
+            padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border);
+            font-size: 11px; color: var(--text); pointer-events: none; }
+  .legend .bar { display: inline-block; vertical-align: middle; height: 8px; width: 100px;
+                  margin: 0 6px;
+                  background: linear-gradient(90deg, #1a1a3a, #1a4a8a, #5fa2ff, #ffe066, #ff6066); }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">Target Scores</span>
+  <span class="meta" id="meta">loading…</span>
+  <span class="spacer"></span>
+  <span class="turn" id="turnLabel">turn –</span>
+</header>
+<div id="progressWrap">
+  <progress id="progressBar" max="100" value="0"></progress>
+  <div id="progressText">scoring turn 0 / 0</div>
+</div>
+<main>
+  <canvas id="board"></canvas>
+  <div class="legend">target prob: low <span class="bar"></span> high</div>
+</main>
+<script>
+/* Driven entirely from the parent dashboard via window.postMessage.
+ * Messages handled:
+ *   { type: 'play' }              — resume the internal tick loop
+ *   { type: 'pause' }             — pause
+ *   { type: 'setStep', step: N }  — jump to a specific turn
+ *   { type: 'setSpeed', mult: X } — set playback rate (1=baseline)
+ *   { type: 'reload' }            — re-fetch data (rerun the scorer)
+ *
+ * There are no inner play / scrub / speed buttons — the dashboard owns
+ * the controls so the kaggle replay and this canvas advance together.
+ */
+const params = new URLSearchParams(location.search);
+const runId = params.get('run_id') || '';
+const slot = parseInt(params.get('slot') || '0', 10);
+const mode = params.get('mode') || 'play';
+
+const canvas = document.getElementById('board');
+const ctx = canvas.getContext('2d');
+const meta = document.getElementById('meta');
+const turnLabel = document.getElementById('turnLabel');
+
+const PLAYER_COLORS = ['#0072B2', '#E69F00', '#009E73', '#F0E442'];
+const NEUTRAL = '#6a6f80';
+const BOARD = 100;            // Kaggle Orbit Wars uses a 100×100 board.
+const STEP_MS_BASE = 333;     // 1× speed (matches kaggle renderer default).
+
+let data = null;
+let cur = 0;
+let playing = false;
+let speedMult = 1.0;
+let lastTick = 0;
+
+function resize() {
+  const r = canvas.getBoundingClientRect();
+  canvas.width = Math.max(1, Math.floor(r.width * devicePixelRatio));
+  canvas.height = Math.max(1, Math.floor(r.height * devicePixelRatio));
+  ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  draw();
+}
+window.addEventListener('resize', resize);
+
+function probToColor(p) {
+  // 0→navy, .25→blue, .5→cyan, .75→yellow, 1→red (perceptual-ish)
+  const stops = [
+    [0.00, [26, 26, 58]], [0.25, [26, 74, 138]], [0.50, [95, 162, 255]],
+    [0.75, [255, 224, 102]], [1.00, [255, 96, 102]],
+  ];
+  let lo = stops[0], hi = stops[stops.length - 1];
+  for (let i = 0; i < stops.length - 1; i++) {
+    if (p >= stops[i][0] && p <= stops[i + 1][0]) {
+      lo = stops[i]; hi = stops[i + 1]; break;
+    }
+  }
+  const t = (p - lo[0]) / Math.max(1e-9, hi[0] - lo[0]);
+  const c = lo[1].map((v, i) => Math.round(v + (hi[1][i] - v) * t));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+
+function ownerColor(o) {
+  return o < 0 ? NEUTRAL : PLAYER_COLORS[o % PLAYER_COLORS.length];
+}
+
+function draw() {
+  const w = canvas.width / devicePixelRatio;
+  const h = canvas.height / devicePixelRatio;
+  ctx.clearRect(0, 0, w, h);
+  if (!data || !data.steps.length) {
+    // While the /api/target_scores fetch is in flight, show a clear
+    // loading indicator so the iframe doesn't look broken. The
+    // <header>#meta text also carries the same message.
+    ctx.fillStyle = '#7a8295';
+    ctx.font = '13px ui-monospace, Menlo, monospace';
+    ctx.textAlign = 'center';
+    const msg = (meta.textContent || '').toLowerCase();
+    if (msg.startsWith('scoring')) {
+      ctx.fillText('scoring replay turns…', w / 2, h / 2 - 8);
+      ctx.fillStyle = '#5a6280';
+      ctx.fillText('(first run takes 10–30s on CPU)', w / 2, h / 2 + 12);
+    } else if (msg.startsWith('error')) {
+      ctx.fillStyle = '#f07b7b';
+      ctx.fillText(meta.textContent, w / 2, h / 2);
+    } else {
+      ctx.fillText('no data', w / 2, h / 2);
+    }
+    return;
+  }
+  const idx = Math.min(cur, data.steps.length - 1);
+  const step = data.steps[idx];
+  if ((step.planets || []).length === 0) {
+    // Mid-replay turn with empty obs (fog-of-war at game start, or
+    // the agent's seat had no visibility this turn). Draw the empty
+    // grid + a hint so the panel isn't blank.
+    const m = Math.min(w, h);
+    const cx0 = (w - m) / 2, cy0 = (h - m) / 2, sc = m / BOARD;
+    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+    ctx.lineWidth = 1;
+    for (let i = 10; i < BOARD; i += 10) {
+      ctx.beginPath(); ctx.moveTo(cx0 + i * sc, cy0); ctx.lineTo(cx0 + i * sc, cy0 + m); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx0, cy0 + i * sc); ctx.lineTo(cx0 + m, cy0 + i * sc); ctx.stroke();
+    }
+    ctx.fillStyle = '#5a6280';
+    ctx.font = '12px ui-monospace, Menlo, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`turn ${step.turn} — no planets visible from slot ${slot}`, w / 2, h / 2);
+    turnLabel.textContent = `turn ${step.turn} / ${data.steps.at(-1).turn}`;
+    return;
+  }
+  const m = Math.min(w, h);
+  const cx0 = (w - m) / 2;
+  const cy0 = (h - m) / 2;
+  const sc = m / BOARD;
+
+  // Grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth = 1;
+  for (let i = 10; i < BOARD; i += 10) {
+    ctx.beginPath(); ctx.moveTo(cx0 + i * sc, cy0); ctx.lineTo(cx0 + i * sc, cy0 + m); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx0, cy0 + i * sc); ctx.lineTo(cx0 + m, cy0 + i * sc); ctx.stroke();
+  }
+
+  // Saturate heatmap at the per-turn argmax so the spatial pattern is
+  // visible across turns where total probability mass is concentrated.
+  let pmax = 0;
+  for (const p of step.planets) pmax = Math.max(pmax, p.prob);
+  if (pmax <= 0) pmax = 1;
+
+  // Index planets by id so edge drawing can look up xy in O(1).
+  const planetById = new Map();
+  for (const p of step.planets) planetById.set(p.id, p);
+
+  // Stage A attention edges (source → target). Drawn UNDER the planet
+  // dots so the source/target endpoints stay clearly visible. Line
+  // width and alpha scale with attention weight (∈ (0, 1] within each
+  // target row). Color = the target's heatmap color so the eye groups
+  // "this target is good because of these sources" naturally.
+  if (step.edges && step.edges.length) {
+    for (const e of step.edges) {
+      const src = planetById.get(e.src);
+      const tgt = planetById.get(e.tgt);
+      if (!src || !tgt) continue;
+      const sx = cx0 + src.x * sc, sy = cy0 + src.y * sc;
+      const tx = cx0 + tgt.x * sc, ty = cy0 + tgt.y * sc;
+      // Weight is ∈ (0, 1] over the target's source row. Modulate by
+      // target prob so weak targets don't dominate the canvas.
+      const wProb = Math.min(1, (e.tgt_prob || 0) / pmax);
+      const wLine = e.weight * (0.4 + 0.6 * wProb);
+      const alpha = Math.min(0.85, 0.15 + 0.7 * wLine);
+      const widthPx = 0.6 + 2.4 * wLine;
+      ctx.strokeStyle = probToColor(wProb).replace('rgb', 'rgba').replace(')', `,${alpha})`);
+      ctx.lineWidth = widthPx;
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(tx, ty);
+      ctx.stroke();
+      // Small arrowhead at the target end so direction is unambiguous.
+      const dx = tx - sx, dy = ty - sy;
+      const L = Math.hypot(dx, dy) || 1;
+      const ux = dx / L, uy = dy / L;
+      const ah = 5 + 4 * wLine;          // arrowhead length
+      const aw = 3 + 2 * wLine;          // half-width
+      const bx = tx - ux * (ah + 5);     // back from planet edge
+      const by = ty - uy * (ah + 5);
+      const lx = bx + (-uy) * aw, ly = by + ux * aw;
+      const rx = bx + uy * aw, ry = by + (-ux) * aw;
+      ctx.fillStyle = ctx.strokeStyle;
+      ctx.beginPath();
+      ctx.moveTo(tx - ux * 5, ty - uy * 5);
+      ctx.lineTo(lx, ly);
+      ctx.lineTo(rx, ry);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  for (const p of step.planets) {
+    const cx = cx0 + p.x * sc;
+    const cy = cy0 + p.y * sc;
+    const probNorm = Math.min(1, p.prob / pmax);
+    const r = 6 + 16 * probNorm;
+    const grd = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+    grd.addColorStop(0, probToColor(probNorm));
+    grd.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grd;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI); ctx.fill();
+
+    // Planet core
+    ctx.fillStyle = ownerColor(p.owner);
+    ctx.beginPath(); ctx.arc(cx, cy, 4, 0, 2 * Math.PI); ctx.fill();
+    if (p.owner === slot) {
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(cx, cy, 5.5, 0, 2 * Math.PI); ctx.stroke();
+    }
+
+    ctx.fillStyle = '#d8dee9';
+    ctx.font = '9px ui-monospace, Menlo, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(String(p.id), cx, cy - 8);
+    ctx.fillStyle = '#9aa3b8';
+    ctx.fillText(String(p.ships), cx, cy + 14);
+  }
+  turnLabel.textContent = `turn ${step.turn} / ${data.steps.at(-1).turn}`;
+}
+
+function tick(ts) {
+  if (!playing || !data) return;
+  if (!lastTick) lastTick = ts;
+  const stepMs = STEP_MS_BASE / Math.max(0.1, speedMult);
+  if (ts - lastTick >= stepMs) {
+    const adv = Math.max(1, Math.floor((ts - lastTick) / stepMs));
+    cur = Math.min(cur + adv, data.steps.length - 1);
+    draw();
+    lastTick = ts;
+    if (cur >= data.steps.length - 1) {
+      playing = false;
+      return;
+    }
+  }
+  requestAnimationFrame(tick);
+}
+
+/* External control. The parent dashboard owns play / scrub / speed; we
+ * just react. Echo back the current step on every tick so the parent
+ * (or other listeners) can keep their UIs in sync if they want.
+ */
+window.addEventListener('message', e => {
+  const m = e.data || {};
+  if (!m || typeof m !== 'object') return;
+  switch (m.type) {
+    case 'play':
+      if (!data) return;
+      if (cur >= data.steps.length - 1) cur = 0;   // restart if at end
+      playing = true; lastTick = 0;
+      requestAnimationFrame(tick);
+      break;
+    case 'pause':
+      playing = false;
+      break;
+    case 'setStep':
+      if (!data) return;
+      cur = Math.max(0, Math.min(parseInt(m.step, 10) || 0, data.steps.length - 1));
+      draw();
+      break;
+    case 'setSpeed':
+      speedMult = Math.max(0.1, parseFloat(m.mult) || 1.0);
+      break;
+    case 'reload':
+      load();
+      break;
+  }
+});
+
+const progressWrap = document.getElementById('progressWrap');
+const progressBar = document.getElementById('progressBar');
+const progressText = document.getElementById('progressText');
+
+function setProgress(current, total) {
+  if (!progressWrap.classList.contains('active')) {
+    progressWrap.classList.add('active');
+  }
+  progressBar.max = Math.max(1, total);
+  progressBar.value = current;
+  progressText.textContent = `scoring turn ${current} / ${total}`;
+}
+
+function clearProgress() { progressWrap.classList.remove('active'); }
+
+/* Read NDJSON line-by-line off the response stream. Each line is a
+ * complete JSON event; we call ``onEvent`` for each. */
+async function readNdjson(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buf = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      try { onEvent(JSON.parse(line)); }
+      catch (e) { console.warn('bad NDJSON line:', line, e); }
+    }
+  }
+  if (buf.trim()) {
+    try { onEvent(JSON.parse(buf.trim())); } catch (_) {}
+  }
+}
+
+async function load() {
+  if (!runId) {
+    meta.textContent = 'missing ?run_id=… (open the dashboard, click Run Match)';
+    resize();
+    return;
+  }
+  meta.textContent = `scoring ${mode}/${runId}, slot ${slot}…`;
+  resize();
+  // Provisional skeleton so the canvas isn't blank during scoring.
+  data = { steps: [], config: {}, num_players: 4 };
+
+  try {
+    const resp = await fetch(
+      `/api/target_scores/stream?run_id=${encodeURIComponent(runId)}` +
+      `&slot=${slot}&mode=${mode}`,
+    );
+    if (!resp.ok) {
+      const txt = await resp.text();
+      throw new Error(`${resp.status}: ${txt.slice(0, 200)}`);
+    }
+
+    let totalTurns = 0;
+    const stepsAccum = [];
+    let initCfg = {};
+
+    await readNdjson(resp, (ev) => {
+      if (ev.type === 'init') {
+        totalTurns = ev.n_total || 0;
+        initCfg = ev.config || {};
+        if (typeof ev.num_players === 'number') data.num_players = ev.num_players;
+        meta.textContent = `${totalTurns} turns · d=${initCfg.d_model}/${initCfg.d_rank}`;
+        setProgress(0, totalTurns);
+      } else if (ev.type === 'progress') {
+        setProgress(ev.current, ev.total);
+      } else if (ev.type === 'done') {
+        // Final payload landed; replace working buffer with it
+        for (const s of ev.steps) stepsAccum.push(s);
+        data = { steps: stepsAccum, config: initCfg, n_steps: ev.n_steps,
+                  num_players: data.num_players };
+      }
+    });
+
+    // Done streaming
+    clearProgress();
+    cur = 0;
+    for (let i = 0; i < data.steps.length; i++) {
+      if ((data.steps[i].planets || []).length > 0) { cur = i; break; }
+    }
+    playing = false;
+    meta.textContent = `${data.steps.length} turns · d=${initCfg.d_model}/${initCfg.d_rank} · seek=${cur}`;
+    resize();
+    draw();
+
+    if (window.parent && window.parent !== window) {
+      window.parent.postMessage(
+        { type: 'targetReady', n_steps: data.steps.length, num_players: data.num_players },
+        '*',
+      );
+    }
+    setTimeout(() => {
+      if (!playing && data && data.steps.length) {
+        playing = true; lastTick = 0;
+        requestAnimationFrame(tick);
+      }
+    }, 400);
+  } catch (e) {
+    clearProgress();
+    meta.textContent = `error: ${e.message}`;
+    resize();
+  }
+}
+
+load();
+</script>
+</body>
+</html>

@@ -40,6 +40,7 @@ from ...physics_utils import (
     F_OWNER,
     F_SHIPS,
     P_ID,
+    P_OWNER,
     P_SHIPS,
 )
 from ..paths import ACTION_DATASET_DIR
@@ -137,6 +138,7 @@ def save_episode_action_csv(
     import csv
     import gzip
     import json
+    import numpy as np
 
     episode_path = Path(episode_path)
     if out_path is None:
@@ -170,6 +172,9 @@ def save_episode_action_csv(
     ]
 
     rows_written = 0
+    mask_turns: list[int] = []
+    src_masks: list[list[bool]] = []
+    tgt_masks: list[list[bool]] = []
     with out_path.open("w", newline="") as out_fh:
         writer = csv.writer(out_fh)
         writer.writerow(header)
@@ -190,6 +195,17 @@ def save_episode_action_csv(
             pid_to_idx = {
                 int(p[P_ID]): i for i, p in enumerate(visible_planets)
             }
+            src_valid = [False] * max_entities
+            tgt_valid = [False] * max_entities
+            for i, p in enumerate(visible_planets):
+                # Broad source legality: the planet is ours and has ships.
+                # Downstream training force-includes the expert label because
+                # stricter surplus heuristics disagree with real expert
+                # launches on a meaningful fraction of rows.
+                src_valid[i] = (
+                    int(p[P_OWNER]) == learner_slot and int(p[P_SHIPS]) > 0
+                )
+                tgt_valid[i] = True
 
             # Pull next_obs from the same seat as ``obs`` so any
             # seat-locality in the env doesn't leak across the
@@ -235,6 +251,10 @@ def save_episode_action_csv(
                     int(tgt_idx) if tgt_idx is not None
                     else ACTION_IGNORE_INDEX
                 )
+                if 0 <= source_idx < max_entities:
+                    src_valid[source_idx] = True
+                if 0 <= target_idx < max_entities:
+                    tgt_valid[target_idx] = True
                 # Source-ships-before-launch = source planet's ship count
                 # in the *current* obs (the turn the expert acted on).
                 # Subsequent launches in the same turn would mutate this
@@ -266,7 +286,20 @@ def save_episode_action_csv(
                 source_ships_before_val,
                 frac_label_val,
             ])
+            mask_turns.append(t)
+            src_masks.append(src_valid)
+            tgt_masks.append(tgt_valid)
             rows_written += 1
 
+    ACTION_MASK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    mask_path = ACTION_MASK_CACHE_DIR / f"{out_path.stem.removeprefix('action_')}.npz"
+    np.savez_compressed(
+        mask_path,
+        turns=np.asarray(mask_turns, dtype=np.int32),
+        src_valid=np.asarray(src_masks, dtype=np.bool_),
+        tgt_valid=np.asarray(tgt_masks, dtype=np.bool_),
+    )
+
     print(f"[action_featurizer] wrote {rows_written} rows → {out_path}")
+    print(f"[action_featurizer] wrote masks → {mask_path}")
     return out_path

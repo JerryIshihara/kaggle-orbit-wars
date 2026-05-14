@@ -34,7 +34,10 @@
   aside.sidebar { width: 320px; flex-shrink: 0; border-right: 1px solid var(--border); padding: 16px; background: var(--panel); overflow-y: auto; }
   main { flex: 1; padding: 14px 18px; overflow: hidden; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
   .pane { display: none; }
-  .pane.active { display: flex; flex: 1; flex-direction: column; gap: 10px; min-height: 0; overflow: hidden; }
+  /* Pane scrolls vertically once its children exceed the viewport
+     (large replays + slider + chart row don't fit on short screens).
+     Horizontal scroll stays off so wide layouts can't run off-screen. */
+  .pane.active { display: flex; flex: 1; flex-direction: column; gap: 10px; min-height: 0; overflow-x: hidden; overflow-y: auto; }
 
   .agent-list { display: flex; flex-direction: column; gap: 6px; }
   .agent-card { padding: 8px 12px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; cursor: grab; user-select: none; transition: all 0.15s; display: flex; flex-direction: column; gap: 3px; }
@@ -79,9 +82,49 @@
   #status.error { color: var(--err); }
   #summary { font-size: 13px; color: var(--muted); flex-shrink: 0; }
   #summary .winner { color: var(--win); font-weight: 600; }
-  .match-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; flex: 1; min-height: 0; overflow: hidden; }
-  .replay-col, .data-col { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
-  #replay { flex: 1; min-width: 0; min-height: 0; width: 100%; height: 100%; border: 1px solid var(--border); border-radius: 4px; background: #000; }
+  /* 3-row layout: replays / slider / data charts.
+     - row 1: two iframes side-by-side. The row spans the full pane
+              width; each column is ``minmax(33vw, 1fr)`` so each
+              replay is **at least 33vw** but grows together to fill
+              whatever extra horizontal space is available (adaptive).
+     - row 2: a single slider scrubber driving both replays
+     - row 3: ships-over-time / waste / tto charts spanning full width
+
+     The iframe itself uses ``aspect-ratio: 1/1`` + ``width: min(100%,
+     70vh)`` so it stays square-shaped (the kaggle game is rendered in
+     a 100×100 square canvas) and never exceeds 70vh in either axis. */
+  .match-grid { display: grid;
+                grid-template-columns: minmax(33vw, 1fr) minmax(33vw, 1fr);
+                grid-template-rows: auto auto auto;   /* all rows natural — pane handles scroll */
+                gap: 10px; flex-shrink: 0; }
+  .replay-col, .target-col { min-width: 0; display: flex; flex-direction: column; }
+  /* Data row keeps a sensible default height so the charts don't
+     collapse on very tall replay rows; user can still scroll the
+     pane to bring them fully into view. */
+  .data-col { grid-column: 1 / -1; min-width: 0; min-height: 320px; display: flex; flex-direction: column; }
+  .scrub-row { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px;
+               padding: 6px 10px; background: var(--panel); border: 1px solid var(--border);
+               border-radius: 4px; flex-shrink: 0; }
+  .scrub-row #turnSlider { flex: 1; }
+  .scrub-row .slot-pill { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); }
+  .scrub-row .slot-pill .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.1); }
+  .scrub-row .turn-readout { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--text); min-width: 110px; text-align: right; }
+  .col-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 4px; flex-shrink: 0;
+               display: flex; align-items: center; gap: 6px; }
+  .col-label .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.1); }
+  #replay, #targetReplay {
+    /* Cap to ~45vh so the slider + data row stay visible without
+       scrolling on a standard 1080p viewport. The pane scroll handles
+       anything taller. Aspect-ratio 1:1 keeps the kaggle square shape.
+       width: min(column-width, 45vh) → on a 900px-tall viewport that
+       gives ~405px iframes; on a 1400px-tall portrait monitor, ~630px. */
+    width: min(100%, 45vh);
+    aspect-ratio: 1 / 1;
+    min-width: 0; min-height: 0;
+    border: 1px solid var(--border); border-radius: 4px; background: #000;
+    align-self: center;
+  }
+  #targetReplay { background: #0f1320; }
 
   .data-scroll { flex: 1; min-width: 0; min-height: 0; display: flex; align-items: stretch; gap: 10px; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; padding-bottom: 8px; }
   .data-scroll::-webkit-scrollbar { height: 10px; }
@@ -96,7 +139,9 @@
 
   .placeholder { color: var(--muted); font-style: italic; padding: 60px 20px; text-align: center; border: 1px dashed var(--border); border-radius: 6px; }
   @media (max-width: 900px) {
-    .match-grid { grid-template-columns: 1fr; grid-template-rows: minmax(300px, 1fr) minmax(260px, 0.85fr); }
+    .match-grid { grid-template-columns: minmax(0, 90vw);
+                   grid-template-rows: min(90vw, 90vh) min(90vw, 90vh) auto minmax(260px, 0.85fr); }
+    .data-col, .scrub-row { grid-column: auto; }
     .chart-panel { min-width: min(420px, 86vw); }
   }
 
@@ -169,12 +214,26 @@
           <button data-key="7">4x</button>
           <button data-key="9">max</button>
         </div>
+        <button id="playToggle" title="play / pause both replays">⏸ Pause</button>
       </div>
       <div id="status">ready</div>
       <div id="summary"></div>
       <div class="match-grid">
         <div class="replay-col">
+          <div class="col-label" id="replayLabel">Game replay</div>
           <iframe id="replay" src="about:blank"></iframe>
+        </div>
+        <div class="target-col">
+          <div class="col-label" id="targetLabel">
+            <span>TargetRanker scores</span>
+            <span class="slot-pill" id="targetSlotPill"></span>
+          </div>
+          <iframe id="targetReplay" src="about:blank"></iframe>
+        </div>
+        <div class="scrub-row">
+          <span class="slot-pill" id="scrubLegend"></span>
+          <input type="range" id="turnSlider" min="0" max="0" value="0" step="1" disabled>
+          <span class="turn-readout" id="turnReadout">turn 0 / 0</span>
         </div>
         <div class="data-col">
           <div class="data-scroll">
@@ -224,6 +283,12 @@ const clearBtn = document.getElementById('clear');
 const statusEl = document.getElementById('status');
 const summaryEl = document.getElementById('summary');
 const replayFrame = document.getElementById('replay');
+const targetReplayFrame = document.getElementById('targetReplay');
+const turnSlider = document.getElementById('turnSlider');
+const turnReadout = document.getElementById('turnReadout');
+const scrubLegend = document.getElementById('scrubLegend');
+const targetSlotPill = document.getElementById('targetSlotPill');
+const replayLabel = document.getElementById('replayLabel');
 const chartEl = document.getElementById('chart');
 const wasteChartEl = document.getElementById('wasteChart');
 const ttoChartEl = document.getElementById('ttoChart');
@@ -334,15 +399,36 @@ clearBtn.addEventListener('click', () => {
   renderSlots();
 });
 
+// Map kaggle replay speed keys → multipliers used by the target view.
+// The kaggle renderer encodes speed as digits 0..9; higher key = faster.
+// The mapping below matches the data-key values exposed in the toggle:
+//   3 = 0.5x, 4 = 1x, 5 = 2x, 7 = 4x, 9 = max(~10x)
+const SPEED_KEY_TO_MULT = { 3: 0.5, 4: 1.0, 5: 2.0, 7: 4.0, 9: 10.0 };
+let targetReady = false;            // set when target_view.html signals "ready"
+
+function postToTarget(msg) {
+  // postMessage is forgiving — wrap in try/catch in case the iframe
+  // hasn't loaded or is cross-origin.
+  try {
+    if (!targetReplayFrame || !targetReplayFrame.contentWindow) return;
+    targetReplayFrame.contentWindow.postMessage(msg, '*');
+  } catch (_) {}
+}
+
 function applyReplaySpeed() {
+  // Kaggle renderer responds to a global keydown of digit (keyCode 0..9).
   try {
     const w = replayFrame.contentWindow;
-    if (!w) return;
-    w.dispatchEvent(new KeyboardEvent('keydown', {
-      keyCode: replaySpeedKey + 48,
-      which: replaySpeedKey + 48,
-    }));
+    if (w) {
+      w.dispatchEvent(new KeyboardEvent('keydown', {
+        keyCode: replaySpeedKey + 48,
+        which: replaySpeedKey + 48,
+      }));
+    }
   } catch (_) {}
+  // Mirror to the target-score canvas.
+  const mult = SPEED_KEY_TO_MULT[replaySpeedKey] ?? 1.0;
+  postToTarget({ type: 'setSpeed', mult });
 }
 
 replaySpeedToggle.addEventListener('click', e => {
@@ -358,6 +444,184 @@ replaySpeedToggle.addEventListener('click', e => {
 replayFrame.addEventListener('load', () => {
   // The outer player installs its keydown listener in a setTimeout(0).
   setTimeout(applyReplaySpeed, 400);
+});
+
+// ---------- Unified play/pause across kaggle replay + target view ----------
+// The kaggle renderer toggles play with the spacebar; we mirror the same
+// click to a postMessage on the target view. State is tracked locally
+// rather than queried from either iframe so the button label stays
+// authoritative.
+let isPlaying = true;       // kaggle renderer autoplays on load
+const playToggleBtn = document.getElementById('playToggle');
+
+function applyPlayPause() {
+  // Send space to the kaggle iframe.
+  try {
+    const w = replayFrame.contentWindow;
+    if (w) {
+      w.dispatchEvent(new KeyboardEvent('keydown', {
+        keyCode: 32, which: 32, key: ' ',
+      }));
+    }
+  } catch (_) {}
+  postToTarget({ type: isPlaying ? 'play' : 'pause' });
+  if (playToggleBtn) {
+    playToggleBtn.textContent = isPlaying ? '⏸ Pause' : '▶ Play';
+  }
+}
+
+if (playToggleBtn) {
+  playToggleBtn.addEventListener('click', () => {
+    isPlaying = !isPlaying;
+    applyPlayPause();
+  });
+}
+
+// ---------- Slider scrubbing across both replays ----------
+let maxTurn = 0;
+let numPlayersInMatch = 2;
+let kaggleStepSyncing = false;
+let userScrubbing = false;       // true while user holds the slider thumb
+let scrubFreezeUntil = 0;        // ms epoch; skip auto-poll until this
+
+// Read the kaggle player's current frame index. Same-origin access via
+// contentWindow.kaggle.step (set by player.html's React state mirror).
+function readKaggleStep() {
+  try {
+    const k = replayFrame.contentWindow && replayFrame.contentWindow.kaggle;
+    if (k && typeof k.step === 'number') return k.step;
+  } catch (_) {}
+  return 0;
+}
+
+// Drive the kaggle player to a specific step by dispatching ArrowKey
+// keydowns (39 = right, 37 = left). The player advances/rewinds one
+// frame per event; we chunk into RAF bursts so a 500-step jump doesn't
+// freeze the iframe.
+function syncKaggleToStep(target) {
+  if (kaggleStepSyncing) return;        // coalesce overlapping calls
+  const w = replayFrame.contentWindow;
+  if (!w) return;
+  const cur = readKaggleStep();
+  let remaining = target - cur;
+  if (remaining === 0) return;
+  const key = remaining > 0 ? 39 : 37;
+  let left = Math.abs(remaining);
+  kaggleStepSyncing = true;
+  const CHUNK = 40;     // events per RAF tick
+  function chunk() {
+    const n = Math.min(CHUNK, left);
+    for (let i = 0; i < n; i++) {
+      w.dispatchEvent(new KeyboardEvent('keydown', { keyCode: key, which: key }));
+    }
+    left -= n;
+    if (left > 0) requestAnimationFrame(chunk);
+    else kaggleStepSyncing = false;
+  }
+  chunk();
+}
+
+// `input` event fires continuously during drag — drive target view live
+// (it's instant) but defer kaggle sync to `change` so we don't dispatch
+// hundreds of keydowns per pixel of slider motion.
+//
+// While the user has the thumb grabbed, the playback-tracking polling
+// loop below skips writing the slider value, otherwise it would yank
+// the thumb back to kaggle's current step on every poll and make the
+// scrubber feel "not controllable".
+function beginScrub() {
+  userScrubbing = true;
+  // Pause playback as soon as the user starts dragging so the slider
+  // represents an authoritative target, not a moving target.
+  if (isPlaying) {
+    isPlaying = false;
+    applyPlayPause();
+  }
+}
+function endScrub() {
+  userScrubbing = false;
+  // Freeze auto-poll for a couple seconds so the kaggle iframe has
+  // time to chew through the queued ArrowKey burst before the polling
+  // starts overwriting the slider with kaggle's (still-old) step.
+  scrubFreezeUntil = Date.now() + 2500;
+}
+
+if (turnSlider) {
+  // pointerdown/up cover mouse, touch, and pen — change is also fired
+  // when the input loses focus, which we use as a safety net.
+  turnSlider.addEventListener('pointerdown', beginScrub);
+  turnSlider.addEventListener('pointerup', endScrub);
+  turnSlider.addEventListener('keydown', () => { beginScrub(); });
+  turnSlider.addEventListener('keyup', endScrub);
+
+  turnSlider.addEventListener('input', e => {
+    const step = parseInt(e.target.value, 10);
+    postToTarget({ type: 'setStep', step });
+    turnReadout.textContent = `turn ${step} / ${maxTurn}`;
+  });
+  turnSlider.addEventListener('change', e => {
+    const step = parseInt(e.target.value, 10);
+    syncKaggleToStep(step);
+    turnReadout.textContent = `turn ${step} / ${maxTurn}`;
+    endScrub();
+  });
+}
+
+// Keep the slider/turn readout in sync as kaggle and target advance
+// during normal playback. Polled at 4 Hz; cheap.
+setInterval(() => {
+  if (!turnSlider || turnSlider.disabled) return;
+  if (userScrubbing || Date.now() < scrubFreezeUntil) return;
+  const k = readKaggleStep();
+  if (!isNaN(k) && k >= 0 && k <= maxTurn) {
+    turnSlider.value = k;
+    turnReadout.textContent = `turn ${k} / ${maxTurn}`;
+  }
+}, 250);
+
+// Build a legend "P1 / P2 (/ P3 / P4)" with player swatches.
+function renderScrubLegend(nPlayers) {
+  if (!scrubLegend) return;
+  const parts = [];
+  for (let i = 0; i < nPlayers; i++) {
+    parts.push(
+      `<span><span class="swatch" style="background:${PLAYER_COLORS[i]}"></span>P${i + 1}</span>`,
+    );
+  }
+  scrubLegend.innerHTML = parts.join(' · ');
+}
+
+function renderTargetSlotPill(slot) {
+  if (!targetSlotPill) return;
+  const c = PLAYER_COLORS[slot] || '#7a8295';
+  targetSlotPill.innerHTML =
+    `<span class="swatch" style="background:${c}"></span>seat ${slot} (P${slot + 1})`;
+}
+
+// When target_view signals it's ready, sync it to the current play
+// state + speed so the two views start aligned. We also receive the
+// match's player count so we can render the right swatches.
+window.addEventListener('message', e => {
+  const m = e.data || {};
+  if (m && m.type === 'targetReady') {
+    targetReady = true;
+    const mult = SPEED_KEY_TO_MULT[replaySpeedKey] ?? 1.0;
+    postToTarget({ type: 'setSpeed', mult });
+    if (isPlaying) postToTarget({ type: 'play' });
+    if (typeof m.n_steps === 'number') {
+      maxTurn = Math.max(0, m.n_steps - 1);
+      if (turnSlider) {
+        turnSlider.max = maxTurn;
+        turnSlider.value = 0;
+        turnSlider.disabled = false;
+        turnReadout.textContent = `turn 0 / ${maxTurn}`;
+      }
+    }
+    if (typeof m.num_players === 'number') {
+      numPlayersInMatch = m.num_players;
+      renderScrubLegend(m.num_players);
+    }
+  }
 });
 
 document.getElementById('tabs').addEventListener('click', e => {
@@ -772,6 +1036,23 @@ runBtn.addEventListener('click', async () => {
             return i === msg.winner ? `<span class="winner">${label} ← winner</span>` : label;
           }).join(' · ');
           replayFrame.src = msg.replay_url;
+          // Side-by-side target-score view: point the second iframe at
+          // /target_view.html?run_id=<run>&slot=0&mode=play. Sources
+          // are read from /api/target_scores/stream at view-load (with
+          // determinate progress bar). The TargetRanker was trained
+          // from Ebi's perspective; we score slot 0 by default which
+          // makes the heatmap meaningful for whichever agent occupies
+          // that seat.
+          const targetSlot = 0;
+          targetReplayFrame.src = `/target_view.html?run_id=${encodeURIComponent(msg.run_id)}&slot=${targetSlot}&mode=play`;
+          renderTargetSlotPill(targetSlot);
+          renderScrubLegend(msg.agents.length);
+          // Color the kaggle-replay column label by P1 to match the
+          // player-color convention used everywhere else.
+          if (replayLabel) {
+            replayLabel.innerHTML =
+              `<span class="swatch" style="background:${PLAYER_COLORS[0]}"></span>Game replay`;
+          }
           lastMatch = {
             scores: streamedScores,
             agents: streamAgents,

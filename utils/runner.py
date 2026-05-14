@@ -85,10 +85,21 @@ def run_match(
 
 
 def save_replay(env, path: Path | str) -> Path:
-    """Write ``env.render(mode='html')`` to ``path`` and return it."""
+    """Write ``env.render(mode='html')`` to ``path`` and return it.
+
+    Also writes a sidecar ``.steps.json`` next to the HTML containing
+    just ``env.toJSON()['steps']`` — the per-turn raw obs the target-
+    score scorer reads. Cheap (~MB per episode) but lets the dashboard
+    drive a side-by-side TargetRanker overlay without re-running the
+    match.
+    """
+    import json as _json
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(env.render(mode="html"))
+    steps = env.toJSON().get("steps") or []
+    sidecar = path.with_suffix(".steps.json")
+    sidecar.write_text(_json.dumps(steps))
     return path
 
 
