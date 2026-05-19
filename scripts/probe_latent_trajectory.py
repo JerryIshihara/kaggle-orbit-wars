@@ -34,12 +34,12 @@ import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
-from agents.transformer_v1.encoder.planet_encoder import PlanetEncoder  # noqa: E402
-from agents.transformer_v1.pretrain.planet_encoder import (  # noqa: E402
+from agents.archive.transformer_v1.encoder.planet_encoder import PlanetEncoder  # noqa: E402
+from agents.archive.transformer_v1.pretrain.planet_encoder import (  # noqa: E402
     PlanetCsvDataset,
     _masked_traj_mse,
 )
-from agents.transformer_v1.featurizer.planet_featurizer import (  # noqa: E402
+from agents.archive.transformer_v1.featurizer.planet_featurizer import (  # noqa: E402
     N_EXTRAP_HORIZONS,
 )
 
@@ -71,7 +71,7 @@ class FatTrajectoryDecoder(nn.Module):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    from agents.transformer_v1.paths import PLANET_DATASET_DIR, PLANET_RUNS_DIR
+    from agents.archive.transformer_v1.paths import PLANET_DATASET_DIR, PLANET_RUNS_DIR
     parser.add_argument(
         "--run-dir", type=Path,
         default=PLANET_RUNS_DIR / "20260429-225920",

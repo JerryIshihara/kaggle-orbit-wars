@@ -49,7 +49,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from agents.physics_utils import F_ID, F_FROM, F_OWNER  # noqa: E402
-from agents.transformer_v1.featurizer.fleet_featurizer import _resolve_target  # noqa: E402
+from agents.archive.transformer_v1.featurizer.fleet_featurizer import _resolve_target  # noqa: E402
 
 REPLAY_DIR = REPO / "data" / "replays"
 

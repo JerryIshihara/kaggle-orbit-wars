@@ -51,67 +51,20 @@ def cmd_play(args: argparse.Namespace) -> int:
 
 
 def cmd_train(args: argparse.Namespace) -> int:
-    import torch  # noqa: F401
-
-    from agents.cnn_v1 import (
-        collect_bc_dataset,
-        default_dataset_path,
-        evaluate_agent,
-        train_bc,
-        train_ppo,
+    # The legacy cnn_v1 training pipeline that backed this command was
+    # removed alongside the package itself; the active learned-line
+    # training moved to standalone CLIs / Colab notebooks under
+    # ``agents/transformer_v2/pretrain/``. Surface a clear pointer
+    # instead of a stale ``ImportError``.
+    print(
+        "error: --mode train was tied to agents.cnn_v1, which has been "
+        "removed. Use the per-stage CLIs under "
+        "agents/transformer_v2/pretrain/ (e.g. "
+        "`python -m agents.transformer_v2.pretrain.entity_encoder ...`) "
+        "or the Colab notebooks under notebooks/.",
+        file=sys.stderr,
     )
-
-    stages = args.stages or ["ppo", "eval"]
-    dataset = None
-
-    if "collect" in stages:
-        ds_path = default_dataset_path(args.teacher, args.collect_games)
-        if ds_path.exists() and not args.force_collect:
-            print(f"dataset exists: {ds_path} (use --force-collect to rebuild)")
-            dataset = torch.load(ds_path)
-        else:
-            print(f"collecting BC dataset: {args.collect_games} games of "
-                  f"{args.teacher} vs {args.opponent}")
-            dataset = collect_bc_dataset(
-                num_games=args.collect_games,
-                teacher_id=args.teacher,
-                opponent_id=args.opponent,
-                save_to=ds_path,
-            )
-    if "bc" in stages:
-        if dataset is None:
-            ds_path = default_dataset_path(args.teacher, args.collect_games)
-            if not ds_path.exists():
-                print(f"error: no dataset at {ds_path}; run with --stages collect first",
-                      file=sys.stderr)
-                return 2
-            dataset = torch.load(ds_path)
-        print(f"training BC for {args.bc_epochs} epochs ({dataset['channels'].size(0)} samples)")
-        train_bc(dataset, epochs=args.bc_epochs, batch_size=args.batch_size)
-    if "ppo" in stages:
-        print(f"training PPO for {args.ppo_iters} iterations x {args.ppo_episodes} eps")
-        train_ppo(
-            iterations=args.ppo_iters,
-            episodes_per_iter=args.ppo_episodes,
-            opponents=args.ppo_opponents,
-            resume_from=None,  # uses the saved weights path by default
-        )
-    if "transformer-ppo" in stages:
-        from agents.transformer_v1.ppo import train_ppo as train_transformer_ppo
-        print(f"training transformer_v1 PPO: {args.ppo_iters} iters x {args.ppo_episodes} eps")
-        ckpt = train_transformer_ppo(
-            resume_action_pt=args.transformer_ppo_ckpt,
-            iterations=args.ppo_iters,
-            episodes_per_iter=args.ppo_episodes,
-            seed_start=args.seed or 0,
-        )
-        print(f"transformer_v1 PPO checkpoint: {ckpt}")
-
-    if "eval" in stages:
-        print(f"evaluating cnn_v1 vs {args.eval_opponents} ({args.eval_games} games each)")
-        evaluate_agent("cnn_v1", opponents=args.eval_opponents, games_per=args.eval_games)
-
-    return 0
+    return 2
 
 
 def cmd_pack(args: argparse.Namespace) -> int:

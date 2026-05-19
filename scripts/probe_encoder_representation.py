@@ -58,12 +58,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
-from agents.transformer_v1.aggregator import CrossEntityAttention
-from agents.transformer_v1.encoder import (
+from agents.archive.transformer_v1.aggregator import CrossEntityAttention
+from agents.archive.transformer_v1.encoder import (
     FleetEncoder, PlanetEncoder, PlanetEntityEncoder,
 )
-from agents.transformer_v1.pretrain.cross_entity import _entity_tokens_per_step
-from agents.transformer_v1.pretrain.pair_score import (
+from agents.archive.transformer_v1.pretrain.cross_entity import _entity_tokens_per_step
+from agents.archive.transformer_v1.pretrain.pair_score import (
     PairScoreHead,
     PairScoreStack,
     TargetHead,
@@ -76,7 +76,7 @@ from agents.transformer_v1.pretrain.pair_score import (
 def _build_stack_from_ckpt(ckpt_path: Path, device: str) -> PairScoreStack:
     """Reconstruct the frozen stack from a saved pair_score ckpt.
 
-    Replicates the loader in :class:`agents.transformer_v1.runner.TransformerAgent.load`
+    Replicates the loader in :class:`agents.archive.transformer_v1.runner.TransformerAgent.load`
     but stops short of doing any inference plumbing — we only need
     ``stack.cross`` / ``stack.entity_encoder`` etc. for the probe.
     """

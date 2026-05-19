@@ -34,7 +34,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 import agents  # noqa: E402  — registers all agent ids
-from agents.physical_v4.agent import LAUNCH_LOG  # noqa: E402
+from agents.heuristic.physical_v4.agent import LAUNCH_LOG  # noqa: E402
 from agents.physics_utils import (  # noqa: E402
     P_ID, P_RADIUS, P_X, P_Y,
     _build_comet_lookup,

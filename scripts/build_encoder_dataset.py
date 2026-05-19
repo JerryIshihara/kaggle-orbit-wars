@@ -40,14 +40,14 @@ from typing import Callable
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from agents.transformer_v1.featurizer import (  # noqa: E402
+from agents.archive.transformer_v1.featurizer import (  # noqa: E402
     save_episode_action_csv,
     save_episode_cross_entity_csv,
     save_episode_entity_csv,
     save_episode_fleet_csv,
     save_episode_planet_csv,
 )
-from agents.transformer_v1.paths import (  # noqa: E402
+from agents.archive.transformer_v1.paths import (  # noqa: E402
     ACTION_DATASET_DIR,
     CROSS_ENTITY_DATASET_DIR,
     ENTITY_DATASET_DIR,

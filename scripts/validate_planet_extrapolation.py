@@ -40,13 +40,13 @@ import torch
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from agents.transformer_v1.encoder.planet_encoder import PlanetEncoder  # noqa: E402
-from agents.transformer_v1.pretrain.planet_encoder import (  # noqa: E402
+from agents.archive.transformer_v1.encoder.planet_encoder import PlanetEncoder  # noqa: E402
+from agents.archive.transformer_v1.pretrain.planet_encoder import (  # noqa: E402
     StratifiedTrajectoryDecoder,
     TrajectoryDecoder,
 )
-from agents.transformer_v1.featurizer import featurize_planets  # noqa: E402
-from agents.transformer_v1.featurizer.planet_featurizer import (  # noqa: E402
+from agents.archive.transformer_v1.featurizer import featurize_planets  # noqa: E402
+from agents.archive.transformer_v1.featurizer.planet_featurizer import (  # noqa: E402
     ANCHOR_DXY_NORM,
     EXTRAP_HORIZONS,
     N_EXTRAP_HORIZONS,

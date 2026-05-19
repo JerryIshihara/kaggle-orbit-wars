@@ -35,7 +35,7 @@ from agents.physics_utils import (  # noqa: E402
     _infer_rotation_sign_raw,
     find_first_collision,
 )
-from agents.sniper_v2.agent import LAUNCH_LOG  # noqa: E402
+from agents.heuristic.sniper_v2.agent import LAUNCH_LOG  # noqa: E402
 from utils.runner import run_match  # noqa: E402
 
 

@@ -116,7 +116,7 @@ def _ensure_target_rank_stack():
             detail=f"no target_rank_best.pt under {_TARGET_RANK_RUNS_DIR}/*/. "
                    "Train a target ranker before requesting target scores.",
         )
-    from agents.transformer_v1.inference import load_target_ranker_stack
+    from agents.archive.transformer_v1.inference import load_target_ranker_stack
     stack, cfg = load_target_ranker_stack(ckpt, device="cpu")
     _TARGET_RANK_STACK = stack
     _TARGET_RANK_CFG = cfg
@@ -140,11 +140,11 @@ def _score_turns_stream(
     ``/api/target_scores/stream`` (streamed straight to the client so
     the dashboard can show progress).
     """
-    from agents.transformer_v1.inference.target_ranker_scorer import (
+    from agents.archive.transformer_v1.inference.target_ranker_scorer import (
         _ensure_label_tensors, _stack_history,
     )
-    from agents.transformer_v1.featurizer import FleetTracker
-    from agents.transformer_v1.featurizer.inference import featurize_observation
+    from agents.archive.transformer_v1.featurizer import FleetTracker
+    from agents.archive.transformer_v1.featurizer.inference import featurize_observation
     import torch
     from collections import deque
 
@@ -357,11 +357,11 @@ def target_scores_endpoint(
     stack, cfg = _ensure_target_rank_stack()
     # Reuse the cached stack; scorer logic lives in the inference module
     # but the cached stack avoids reload-per-request.
-    from agents.transformer_v1.inference.target_ranker_scorer import (
+    from agents.archive.transformer_v1.inference.target_ranker_scorer import (
         _ensure_label_tensors, _stack_history,
     )
-    from agents.transformer_v1.featurizer import FleetTracker
-    from agents.transformer_v1.featurizer.inference import featurize_observation
+    from agents.archive.transformer_v1.featurizer import FleetTracker
+    from agents.archive.transformer_v1.featurizer.inference import featurize_observation
     import torch
     from collections import deque
 

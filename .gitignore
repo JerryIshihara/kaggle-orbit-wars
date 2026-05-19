@@ -46,10 +46,24 @@ data/datasets/planet/*.csv
 data/datasets/entity/*.csv
 data/datasets/cross_entity/*.csv
 data/datasets/action/*.csv
+data/datasets/entity_comet/*.csv
 # manifests are rewritten on every build_encoder_dataset.py run
 data/datasets/*/manifest.json
 # materialized snapshot tensor cache (multi-GB, regenerable on first load)
 data/datasets/**/_snapshot_cache/
+# pair-score / BC cache (.pt files; 1-13 GB depending on player mix)
+data/datasets/_pair_cache/
+data/datasets/_bc_cache/
+data/datasets/_cache/
+# per-stage sampled subsets (regenerable via scripts/sample_diverse_*.py)
+data/datasets/comet_only_*/
+data/datasets/planet_only_*/
+data/datasets/planet_diverse_*/
+data/datasets/fleet_diverse_*/
+data/datasets/fleet_sun_*/
+
+# Colab packing dir (tarballs + ipynb mirror; pushed to GCS, not git).
+data/colab_bundle/
 
 # training run outputs (model ckpts, logs) — share via GCS instead of git.
 # Regenerable via the pretrain scripts under agents/transformer_v1/pretrain/.
