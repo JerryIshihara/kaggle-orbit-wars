@@ -156,6 +156,12 @@ def _validated_learner_launch(
 class TransformerAgent:
     """Inference wrapper around the v2 entity-pretrain PairHead policy."""
 
+    #: Valid values for ``inference_mode`` — controls how ``_predict`` turns
+    #: ``pair_logits`` into a launch list. Use ``threshold`` for the
+    #: production multi-target rule; the other two are diagnostic
+    #: alternatives wired up as separate dashboard agent ids.
+    INFERENCE_MODES = ("threshold", "row_argmax", "flat_argmax")
+
     def __init__(
         self,
         model: EntityPretrainModel,
@@ -168,7 +174,13 @@ class TransformerAgent:
         max_planets: int = 64,
         max_fleets: int = 256,
         num_players: int = 4,
+        inference_mode: str = "threshold",
+        logit_threshold: float = 2.0,
     ):
+        if inference_mode not in self.INFERENCE_MODES:
+            raise ValueError(
+                f"inference_mode={inference_mode!r} not in {self.INFERENCE_MODES}"
+            )
         self.model = model.to(device).eval()
         self.fleet_enc = fleet_enc.to(device).eval()
         self.planet_enc = planet_enc.to(device).eval()
@@ -178,6 +190,8 @@ class TransformerAgent:
         self.max_planets = max_planets
         self.max_fleets = max_fleets
         self.num_players = num_players
+        self.inference_mode = inference_mode
+        self.logit_threshold = float(logit_threshold)
         # Per-episode launch-tick state. Reset on step=0 detection.
         self._tracker = FleetTracker()
         self._last_step: int | None = None
@@ -192,6 +206,8 @@ class TransformerAgent:
         planet_run_dir: Path | None = None,
         fleet_run_dir: Path | None = None,
         comet_run_dir: Path | None = None,
+        inference_mode: str = "threshold",
+        logit_threshold: float = 2.0,
     ) -> "TransformerAgent":
         """Reconstruct the L0 frozen specialists + the trainable
         L1-L4 + PairHead stack from a v2 entity-pretrain ckpt.
@@ -265,6 +281,8 @@ class TransformerAgent:
             deterministic=deterministic,
             max_planets=cfg.get("max_planets", 64),
             max_fleets=cfg.get("max_fleets", 1024),
+            inference_mode=inference_mode,
+            logit_threshold=logit_threshold,
         )
 
     @torch.no_grad()
@@ -273,27 +291,42 @@ class TransformerAgent:
         obs: dict[str, Any],
         learner_slot: int,
         *,
-        logit_threshold: float = 2.0,
+        logit_threshold: float | None = None,
+        inference_mode: str | None = None,
     ) -> list[tuple[int, int, float]]:
-        """Return ``(source_pid, target_pid, frac)`` triples — potentially
-        MULTIPLE launches per source per turn.
+        """Return ``(source_pid, target_pid, frac)`` triples for this turn.
 
-        Decision rule: for every launchable source ``s`` and every real
-        off-diagonal target ``t``, emit a launch whenever
-        ``pair_logits[s, t] > logit_threshold`` (default 0.0, equivalent
-        to ``sigmoid > 0.5``). Each emitted launch is sized by
-        ``sigmoid(pair_frac[s, t])`` of the source's ships.
+        The decision rule is chosen by ``inference_mode``:
 
-        Self-cells (``s == t``) and padded slots are dropped because the
-        loss never supervised them — their logits are noise. The runner
-        treats this as "no diagonal action", so a source with no target
-        crossing the threshold simply produces zero launches that turn.
+          * ``threshold`` *(default — production rule)*: every legal
+            ``(s, t)`` cell whose ``pair_logits[s, t] > logit_threshold``
+            fires, producing potentially multiple launches per source.
+            Multi-target / coalition behavior falls out for free.
+          * ``row_argmax``: for each launchable source ``s``, pick the
+            single best target via ``argmax_t pair_logits[s, t]``. At most
+            one launch per launchable source per turn.
+          * ``flat_argmax``: pick the single best ``(s, t)`` over the full
+            P×P grid. At most one launch per turn (the legacy single-shot
+            rule from before the threshold rewrite).
 
-        Multi-target rows (coalition launches) are supported: when more
-        than one target's logit clears the threshold for the same source,
-        emit a launch per target. ``_target_to_moves`` then sizes each
-        independently against the source's surplus.
+        Self-cells (``s == t``) and padded slots are always dropped — the
+        diagonal was never supervised, and pad rows are uncalibrated.
+        Each emitted launch is sized by ``sigmoid(pair_frac[s, t])`` of
+        the source's ships, with per-source surplus budgeting applied in
+        ``act``.
+
+        Keyword args override the per-instance defaults; callers that
+        want to A/B inference modes on the same loaded model can pass
+        them directly rather than constructing multiple agents.
         """
+        if inference_mode is None:
+            inference_mode = self.inference_mode
+        if logit_threshold is None:
+            logit_threshold = self.logit_threshold
+        if inference_mode not in self.INFERENCE_MODES:
+            raise ValueError(
+                f"inference_mode={inference_mode!r} not in {self.INFERENCE_MODES}"
+            )
         # Reset launch-tick state at episode start.
         step = int(obs.get("step", 0) if isinstance(obs, dict) else getattr(obs, "step", 0))
         if self._last_step is None or step < self._last_step:
@@ -403,9 +436,9 @@ class TransformerAgent:
         if not src_legal.any():
             return []
 
-        # Per-cell decision: a cell (s, t) fires when its logit clears the
-        # threshold AND it's legal. Legality: source launchable, target
-        # real, t != s (diagonal was unsupervised — exclude).
+        # Build the legality mask once; all three inference modes share it.
+        # Legality: source launchable, target real, t != s (diagonal was
+        # unsupervised — exclude).
         device = pair_logits.device
         eye = torch.eye(P, dtype=torch.bool, device=device)
         cell_legal = (
@@ -413,16 +446,39 @@ class TransformerAgent:
             & real_idx.unsqueeze(0)              # (1, P) — target must be real
             & ~eye                                # exclude self-cells (off-diagonal only)
         )
-        firing = (pair_logits > logit_threshold) & cell_legal       # (P, P) bool
-        if not firing.any():
+        if not cell_legal.any():
             return []
 
-        # Convert to a list of (src, tgt, frac). For each firing cell, frac
-        # is sigmoid(pair_frac[s, t]). Multi-target rows produce multiple
-        # entries; _target_to_moves sizes each against the source's surplus
-        # independently. To keep the per-source launches well-ordered when
-        # surplus is tight, emit cells in pair_logits-descending order.
-        src_indices, tgt_indices = firing.nonzero(as_tuple=True)
+        neg_inf = torch.finfo(pair_logits.dtype).min
+        masked_logits = pair_logits.masked_fill(~cell_legal, neg_inf)
+
+        # --- Dispatch on inference_mode ---
+        if inference_mode == "flat_argmax":
+            # Single-shot: pick the highest legal cell across the full grid.
+            flat_idx = int(masked_logits.reshape(-1).argmax().item())
+            if masked_logits.reshape(-1)[flat_idx].item() == neg_inf:
+                return []
+            src_indices = torch.tensor([flat_idx // P], device=device)
+            tgt_indices = torch.tensor([flat_idx % P],  device=device)
+        elif inference_mode == "row_argmax":
+            # One launch per launchable source — argmax over its row.
+            row_best = masked_logits.argmax(dim=-1)                    # (P,)
+            keep = src_legal & (
+                masked_logits.gather(1, row_best.unsqueeze(-1)).squeeze(-1) > neg_inf
+            )
+            src_indices = torch.nonzero(keep, as_tuple=False).flatten()
+            tgt_indices = row_best[src_indices]
+        else:  # threshold
+            # Per-cell: every legal cell whose logit clears the threshold.
+            firing = (pair_logits > logit_threshold) & cell_legal
+            if not firing.any():
+                return []
+            src_indices, tgt_indices = firing.nonzero(as_tuple=True)
+
+        # Convert to a list of (src, tgt, frac). To keep the per-source
+        # launches well-ordered when surplus is tight, emit cells in
+        # pair_logits-descending order (matters for threshold mode where
+        # one source may have many firing cells competing for its ships).
         cell_logits = pair_logits[src_indices, tgt_indices]
         order = torch.argsort(cell_logits, descending=True)
         actions: list[tuple[int, int, float]] = []
@@ -718,6 +774,73 @@ if "transformer_v2_baseline" not in _registry._REGISTRY:
         "epoch 29). Use for A/B against the live transformer_v2 after a "
         "retrain. ckpt: bowEbi_pair5head_d256_h8_lr5e-05_b128_30ep_20260520-095412.",
     )(transformer_v2_baseline_agent)
+
+
+# ---- Inference-variant agents -----------------------------------------
+# Same loaded ckpt as ``transformer_v2`` (the newest under data/runs/entity/),
+# but each variant uses a different decision rule on top of pair_logits.
+# Useful in the dashboard for A/B-ing thresholds + flat / per-source argmax
+# fallbacks without retraining.
+#
+# Each variant carries its own singleton (so per-episode FleetTracker state
+# stays clean across A/B matches) at a modest memory cost (~14 MB ckpt
+# weights + ~few MB activations per slot).
+
+_VARIANT_REGISTRY: dict[str, TransformerAgent | None] = {}
+
+
+def _make_variant_agent(name: str, *, inference_mode: str, logit_threshold: float):
+    """Build a registered agent callable that lazily loads the latest
+    ckpt with the requested inference rule."""
+    def _fn(obs):
+        agent = _VARIANT_REGISTRY.get(name)
+        if agent is None:
+            agent = TransformerAgent.load(
+                inference_mode=inference_mode,
+                logit_threshold=logit_threshold,
+            )
+            _VARIANT_REGISTRY[name] = agent
+        return agent.act(obs)
+    _fn.__name__ = f"{name}_agent"
+    _fn.__doc__ = (
+        f"transformer_v2 + inference_mode={inference_mode!r}"
+        + (f", logit_threshold={logit_threshold}" if inference_mode == "threshold" else "")
+    )
+    return _fn
+
+
+_VARIANT_SPECS: tuple[tuple[str, str, float, str], ...] = (
+    (
+        "transformer_v2_thr1",
+        "threshold", 1.0,
+        "transformer_v2 with logit threshold=1.0 (aggressive — fires more pair cells; "
+        "diagnose under-launching on the threshold=2.0 default).",
+    ),
+    (
+        "transformer_v2_thr3",
+        "threshold", 3.0,
+        "transformer_v2 with logit threshold=3.0 (conservative — only highly-confident "
+        "cells fire; diagnose over-launching / wasted fleets).",
+    ),
+    (
+        "transformer_v2_rowargmax",
+        "row_argmax", 0.0,
+        "transformer_v2 with per-source argmax: each launchable source picks its "
+        "single best target, no threshold. At most one launch per source per turn.",
+    ),
+    (
+        "transformer_v2_flatargmax",
+        "flat_argmax", 0.0,
+        "transformer_v2 with flat-grid argmax: single best (src, tgt) over the full "
+        "P×P grid. At most one launch per turn — the original v2 single-shot rule.",
+    ),
+)
+
+for _name, _mode, _thr, _desc in _VARIANT_SPECS:
+    if _name not in _registry._REGISTRY:
+        _registry.register(_name, _desc)(
+            _make_variant_agent(_name, inference_mode=_mode, logit_threshold=_thr),
+        )
 
 
 def main() -> None:
