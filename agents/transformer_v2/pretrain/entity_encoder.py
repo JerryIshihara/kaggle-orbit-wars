@@ -20,7 +20,7 @@ while labels stay current-turn-only.
 Run from the repo root:
 
     python -m agents.transformer_v2.pretrain.entity_encoder \\
-        --epochs 30 --batch-size 32
+        --epochs 30 --batch-size 16
 
 Outputs (under ``data/runs/entity/<timestamp>/``):
   * ``entity_encoder_best.pt`` / ``entity_encoder_last.pt``
@@ -50,6 +50,7 @@ from ..aggregator import (
     CrossEntityAttention,
     DualRoleAttention,
     JointRoleAttention,
+    PAIR_TYPE_NUM_CLASSES,
     PairHead,
 )
 from ..encoder.entity_encoder import PlanetEntityEncoder
@@ -795,16 +796,13 @@ class EntityPretrainModel(nn.Module):
         )
 
         # Pair-score head. Consumes the L4 joint role tokens plus L2
-        # ctx_now and emits a dict of 5 logits/scores from a shared
+        # ctx_now and emits a dict of 2 logits/scores from a shared
         # trunk. With d_pair = d_model = 256 (no down-projection), the
         # trunk is: Linear(6·d_model = 1536 → trunk_hidden = d_model),
-        # GELU, Linear(d_model → d_model), GELU. Five single-Linear
-        # heads consume the trunk:
+        # GELU, Linear(d_model → d_model), GELU. Two single-Linear
+        # heads consume the FiLM-conditioned trunk:
         #   * pair_logits  (B, P, P)  per-cell source→target launch
         #   * pair_frac    (B, P, P)  fraction-of-source ships raw
-        #   * source_act   (B, P)     "this planet launches"
-        #   * target_aim   (B, P)     "this planet is targeted"
-        #   * glob_act     (B,)       snapshot-level "any action"
         # Per-head loss masking lives in :func:`compute_multi_loss`.
         self.pair_head = PairHead(
             d_model=d_model,
@@ -819,6 +817,8 @@ class EntityPretrainModel(nn.Module):
         fleet_tokens: torch.Tensor,
         routing: dict[str, torch.Tensor],
         planet_mask: torch.Tensor,
+        is_comet: torch.Tensor | None = None,
+        pair_type_ids: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         # Detect history-stacked input (B, T, P, d) vs single-frame
         # (B, P, d). The history-stacking dataset emits a leading T
@@ -867,9 +867,33 @@ class EntityPretrainModel(nn.Module):
         if is_temporal:
             ctx_now = ctx_full[:, -1]                        # (B, P, d)
             planet_mask_now = planet_mask[:, -1]             # (B, P)
+            l1_now = entity_tokens[:, -1]                    # (B, P, d)
         else:
             ctx_now = ctx_full                                # (B, P, d)
             planet_mask_now = planet_mask                     # (B, P)
+            l1_now = entity_tokens                            # (B, P, d)
+
+        # Resolve the current-step ``is_comet`` mask for the FiLM
+        # conditioner. Falls back to all-False when the caller doesn't
+        # supply it (back-compat for older test shims); the FiLM block's
+        # identity-init means missing type info just leaves the score
+        # at the trunk's prediction without an extra bias.
+        if is_comet is None:
+            is_comet_now = torch.zeros(
+                planet_mask_now.shape, dtype=torch.bool,
+                device=planet_mask_now.device,
+            )
+        elif is_comet.dim() == 3:
+            is_comet_now = is_comet[:, -1].to(torch.bool)
+        else:
+            is_comet_now = is_comet.to(torch.bool)
+
+        if pair_type_ids is not None and pair_type_ids.dim() == 4:
+            pair_type_now = pair_type_ids[:, -1].to(torch.long)
+        elif pair_type_ids is not None:
+            pair_type_now = pair_type_ids.to(torch.long)
+        else:
+            pair_type_now = None
 
         # L3: parallel source/target role-conditioned attention.
         source_aware, target_aware = self.dual_role(ctx_now, planet_mask_now)
@@ -881,8 +905,7 @@ class EntityPretrainModel(nn.Module):
 
         # Derive pair_valid from the current-step planet_mask: a pair
         # cell (s, t) is valid iff both endpoints are real planets and
-        # s != t. Lets the head's per-planet/snapshot pools mean over
-        # only the valid cells instead of polluted-by-padding rows.
+        # s != t.
         B_now, P_now = planet_mask_now.shape
         pair_valid = (
             planet_mask_now.unsqueeze(2)
@@ -891,24 +914,126 @@ class EntityPretrainModel(nn.Module):
         eye = torch.eye(P_now, dtype=torch.bool, device=pair_valid.device)
         pair_valid = pair_valid & ~eye.unsqueeze(0)
 
-        # Pair-score head returns a 5-key dict of raw logits/scores.
-        # Loss masking lives in :func:`compute_multi_loss`; the head
-        # emits raw outputs so inference (argmax / top-k / sigmoid)
-        # stays callable downstream.
+        # Pair-score head returns ``{pair_logits, pair_frac}``. L1 tokens
+        # + 27-way pair_type_ids feed the FiLM conditioner between trunk
+        # and the two heads (identity-init at start of training).
         heads = self.pair_head(
-            source_joint, target_joint, ctx_now, pair_valid=pair_valid,
+            source_joint, target_joint, ctx_now,
+            l1_tokens=l1_now,
+            is_comet=is_comet_now,
+            pair_type_ids=pair_type_now,
+            pair_valid=pair_valid,
         )
         return heads
 
 
 # ---------- Loss ----------
-# Canonical 5-head ordering. The diagonal (s == s) stays masked out of the
+# Canonical 2-head ordering. The diagonal (s == s) stays masked out of the
 # loss — every off-diagonal cell is an independent binary "should source s
 # launch to target t?" prediction. Multi-target rows (coalition launches)
-# fall out of the per-cell BCE naturally.
-_HEAD_NAMES: tuple[str, ...] = (
-    "pair_logits", "pair_frac", "source_act", "target_aim", "glob_act",
-)
+# fall out of the per-cell BCE naturally. The earlier auxiliary heads
+# (``source_act`` / ``target_aim`` / ``glob_act``) were dropped: at
+# inference only ``pair_logits`` and ``pair_frac`` are consumed.
+_HEAD_NAMES: tuple[str, ...] = ("pair_logits", "pair_frac")
+
+# Planet feature layout from ``PlanetFeaturizer.to_vector``:
+#   f000 = is_comet
+#   f001..f005 = relative owner one-hot including neutral
+#   f006 = log1p(current ships) / SHIPS_LOG_MAX
+_PLANET_SHIPS_LOG_FEATURE_IDX: int = 1 + ENTITY_N_OWNER_CLASSES
+_PLANET_IS_COMET_FEATURE_IDX: int = 0
+_PLANET_OWNER_START_IDX: int = 1
+_PLANET_OWNER_NEUTRAL_IDX: int = _PLANET_OWNER_START_IDX + ENTITY_NUM_OWNER_SLOTS
+_PLANET_ANGVEL_FEATURE_IDX: int = 17
+
+ENTITY_TYPE_STATIC = 0
+ENTITY_TYPE_ORBITAL = 1
+ENTITY_TYPE_COMET = 2
+TARGET_REL_NON_NEUTRAL = 0
+TARGET_REL_ENEMY = TARGET_REL_NON_NEUTRAL
+TARGET_REL_NEUTRAL = 1
+TARGET_REL_OWN = 2
+
+
+def _current_planet_features(
+    planet_features: torch.Tensor,
+) -> torch.Tensor:
+    """Return current-frame planet features from single or T-stacked input."""
+    if planet_features.dim() == 4:
+        return planet_features[:, -1]
+    return planet_features
+
+
+def _physical_type_from_planet_features(
+    planet_features: torch.Tensor,
+) -> torch.Tensor:
+    """Map planet features to {0=static, 1=orbital, 2=comet}."""
+    pf = _current_planet_features(planet_features)
+    is_comet = pf[..., _PLANET_IS_COMET_FEATURE_IDX] > 0.5
+    # Non-comet orbital/static is identifiable from the angular-velocity
+    # scalar. Static planets write 0; orbital planets write the env-wide
+    # angular velocity normalized by ANGVEL_NORM.
+    is_orbital = pf[..., _PLANET_ANGVEL_FEATURE_IDX].abs() > 1e-6
+    return torch.where(
+        is_comet,
+        torch.full_like(pf[..., 0], ENTITY_TYPE_COMET, dtype=torch.long),
+        torch.where(
+            is_orbital,
+            torch.full_like(pf[..., 0], ENTITY_TYPE_ORBITAL, dtype=torch.long),
+            torch.full_like(pf[..., 0], ENTITY_TYPE_STATIC, dtype=torch.long),
+        ),
+    )
+
+
+def _target_relation_from_planet_features(
+    planet_features: torch.Tensor,
+) -> torch.Tensor:
+    """Map target owner one-hot to {0=enemy, 1=neutral, 2=own}.
+
+    The FiLM type space is 27 categories:
+    ``source_type(3) × target_relation(enemy/neutral/own)(3) × target_type(3)``.
+    """
+    pf = _current_planet_features(planet_features)
+    is_own = pf[..., _PLANET_OWNER_START_IDX] > 0.5
+    is_neutral = pf[..., _PLANET_OWNER_NEUTRAL_IDX] > 0.5
+    return torch.where(
+        is_own,
+        torch.full_like(pf[..., 0], TARGET_REL_OWN, dtype=torch.long),
+        torch.where(
+            is_neutral,
+            torch.full_like(pf[..., 0], TARGET_REL_NEUTRAL, dtype=torch.long),
+            torch.full_like(pf[..., 0], TARGET_REL_ENEMY, dtype=torch.long),
+        ),
+    )
+
+
+def build_pair_type_ids(
+    planet_features: torch.Tensor,
+    planet_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Build 27-way FiLM pair-type ids from current planet features.
+
+    Category id:
+
+        ``source_type * 9 + target_relation * 3 + target_type``
+
+    where source/target physical type is ``0=static, 1=orbital, 2=comet``
+    and target relation is ``0=enemy, 1=neutral, 2=own``. The helper accepts
+    either ``(B, P, D)`` or T-stacked ``(B, T, P, D)`` features.
+    """
+    pf = _current_planet_features(planet_features)
+    physical = _physical_type_from_planet_features(pf)
+    target_rel = _target_relation_from_planet_features(pf)
+    src_type = physical.unsqueeze(2)          # (B, P_src, 1)
+    tgt_type = physical.unsqueeze(1)          # (B, 1, P_tgt)
+    tgt_rel = target_rel.unsqueeze(1)         # (B, 1, P_tgt)
+    pair_type = src_type * 9 + tgt_rel * 3 + tgt_type
+    pair_type = pair_type.clamp(min=0, max=PAIR_TYPE_NUM_CLASSES - 1)
+    if planet_mask is not None:
+        pm = planet_mask[:, -1] if planet_mask.dim() == 3 else planet_mask
+        valid = pm.unsqueeze(2) & pm.unsqueeze(1)
+        pair_type = torch.where(valid, pair_type, torch.zeros_like(pair_type))
+    return pair_type.to(torch.long)
 
 
 def _masked_bce(
@@ -935,17 +1060,53 @@ def _masked_bce(
     return (bce * mask_f).sum() / denom
 
 
+def _pair_frac_targets_from_batch(
+    batch: dict[str, torch.Tensor],
+    ships: torch.Tensor,
+) -> torch.Tensor:
+    """Return fraction-of-source-ship targets for ``pair_frac``.
+
+    ``pair_ships[b, s, t]`` stores the raw ships launched from source
+    ``s`` to target ``t`` on the current turn. The inference runner uses
+    ``sigmoid(pair_frac[s, t])`` as a fraction of the source planet's
+    current ships/surplus, so the supervised target must be:
+
+        ships_sent(s, t) / source_ships_before_launch(s)
+
+    Older/unit-test batches may omit ``planet_features``; those fall
+    back to the previous row-normalized target so callers still run, but
+    real training caches should always take the source-ship path.
+    """
+    planet_features = batch.get("planet_features")
+    if planet_features is None:
+        row_sum = ships.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        return ships / row_sum
+
+    # Training uses T=6 stacked inputs: (B, T, P, D). Labels are current
+    # turn only, so use the last history frame. Single-frame callers pass
+    # (B, P, D).
+    planet_features = _current_planet_features(planet_features)
+
+    src_ships_log = planet_features[..., _PLANET_SHIPS_LOG_FEATURE_IDX]
+    src_ships = torch.expm1(src_ships_log.clamp(min=0.0) * SHIPS_LOG_MAX)
+    denom = src_ships.clamp(min=1.0).unsqueeze(-1)
+    return (ships / denom).clamp(min=0.0, max=1.0)
+
+
 def compute_multi_loss(
     preds: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
     *,
     pair_pos_weight: float = 600.0,
-    source_act_pos_weight: float = 100.0,
-    target_aim_pos_weight: float = 100.0,
-    glob_act_pos_weight: float = 1.0,
     enabled_heads: tuple[str, ...] | None = None,
+    # Accepted-but-ignored knobs from the legacy aux-head API. Kept so the
+    # train CLI + Colab notebook can still pass them as no-ops while older
+    # launch cells/scripts are pruned.
+    source_act_pos_weight: float = 1.0,    # noqa: ARG001
+    target_aim_pos_weight: float = 1.0,    # noqa: ARG001
+    glob_act_pos_weight: float = 1.0,      # noqa: ARG001
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """5-head loss over the joint PairHead output.
+    """2-head loss over the joint PairHead output.
 
     Heads (mask & objective):
 
@@ -955,23 +1116,16 @@ def compute_multi_loss(
         (coalition launches) are handled naturally: each off-diagonal
         cell is independent, so the loss penalizes EVERY True cell
         regardless of how many other True cells share the row.
-      * ``pair_frac``     MSE on sigmoid(pair_frac) vs the row-normalized
-        ``pair_ships`` (fraction of source's ships sent to target).
+      * ``pair_frac``     MSE on sigmoid(pair_frac) vs
+        ``pair_ships / source_ships_before_launch``.
         Masked to positive cells (pair_labels & pair_valid). Skipped
         entirely when ``pair_ships`` is missing from the batch.
-      * ``source_act``    BCE vs ``pair_labels.any(dim=-1)`` masked by
-        the current-step planet_mask (planet_mask[:, -1] when temporal).
-        ``pos_weight=source_act_pos_weight``.
-      * ``target_aim``    BCE vs ``pair_labels.any(dim=-2)``, same mask
-        and ``pos_weight=target_aim_pos_weight``.
-      * ``glob_act``      BCE vs ``pair_labels.any(dim=(-1, -2))``
-        (snapshot-level); no per-cell mask. ``pos_weight=glob_act_pos_weight``.
 
     Returns ``(total_loss, per_head_dict)`` where ``per_head_dict``
     maps head name → unweighted scalar loss (for logging). The total
-    sums all enabled heads' losses (with pos_weight applied where it
-    applies). ``enabled_heads`` lets the legacy ``compute_pair_loss``
-    shim restrict the sum to ``("pair_logits",)``.
+    sums both head losses (with ``pair_pos_weight`` applied to the
+    pair-cell BCE term). ``enabled_heads`` lets the legacy
+    ``compute_pair_loss`` shim restrict the sum to ``("pair_logits",)``.
     """
     if enabled_heads is None:
         enabled_heads = _HEAD_NAMES
@@ -993,21 +1147,11 @@ def compute_multi_loss(
         per_head["pair_logits"] = float(loss_pair.detach())
         total = total + loss_pair
 
-    # planet_mask at the current step. The CachedPairDataset emits
-    # planet_mask shaped (T, P) when history is on, else (P,); the
-    # train loop collates to (B, T, P) or (B, P).
-    planet_mask = batch["planet_mask"]
-    if planet_mask.dim() == 3:
-        planet_mask_now = planet_mask[:, -1].bool()
-    else:
-        planet_mask_now = planet_mask.bool()
-
-    # 2) pair_frac — masked MSE-on-sigmoid vs row-normalized ship counts.
+    # 2) pair_frac — masked MSE-on-sigmoid vs fraction-of-source ships.
     # Skip gracefully when pair_ships is missing (older caches).
     if "pair_frac" in enabled_heads and "pair_ships" in batch:
         ships = batch["pair_ships"].float()              # (B, P, P)
-        row_sum = ships.sum(dim=-1, keepdim=True).clamp(min=1.0)
-        target_frac = ships / row_sum                     # (B, P, P)
+        target_frac = _pair_frac_targets_from_batch(batch, ships)
         pos_mask = (pair_labels & pair_valid).to(pair_logits.dtype)
         frac_sigmoid = torch.sigmoid(preds["pair_frac"])
         sq_err = (frac_sigmoid - target_frac).pow(2)
@@ -1016,37 +1160,6 @@ def compute_multi_loss(
         total = total + loss_frac
     elif "pair_frac" in enabled_heads:
         per_head["pair_frac"] = float("nan")
-
-    # 3) source_act — per-planet "this planet launches?" (any target).
-    if "source_act" in enabled_heads:
-        src_labels = pair_labels.any(dim=-1).float()      # (B, P)
-        loss_src = _masked_bce(
-            preds["source_act"], src_labels, planet_mask_now,
-            pos_weight=source_act_pos_weight,
-        )
-        per_head["source_act"] = float(loss_src.detach())
-        total = total + loss_src
-
-    # 4) target_aim — per-planet "is this planet hit by anyone?".
-    if "target_aim" in enabled_heads:
-        tgt_labels = pair_labels.any(dim=-2).float()      # (B, P)
-        loss_tgt = _masked_bce(
-            preds["target_aim"], tgt_labels, planet_mask_now,
-            pos_weight=target_aim_pos_weight,
-        )
-        per_head["target_aim"] = float(loss_tgt.detach())
-        total = total + loss_tgt
-
-    # 5) glob_act — snapshot-level "any action this turn?".
-    if "glob_act" in enabled_heads:
-        glob_labels = pair_labels.any(dim=-1).any(dim=-1).float()  # (B,)
-        ones = torch.ones_like(glob_labels)
-        loss_glob = _masked_bce(
-            preds["glob_act"], glob_labels, ones,
-            pos_weight=glob_act_pos_weight,
-        )
-        per_head["glob_act"] = float(loss_glob.detach())
-        total = total + loss_glob
 
     return total, per_head
 
@@ -1103,38 +1216,24 @@ def evaluate(
     loader: DataLoader,
     device: str,
 ) -> dict[str, dict[str, float]]:
-    """Per-head metrics over the validation set.
+    """2-head metrics over the validation set.
 
-    For each of the 5 heads we accumulate ``tp/fp/tn/fn`` (with the
-    head's natural mask) and an unweighted BCE loss. ``pair_logits``
-    additionally keeps the legacy ``recall_at_{1,5,10}`` / row-softmax
-    variants. ``pair_frac`` is regression: only its MSE is reported.
+    ``pair_logits`` reports tp/fp/tn/fn confusion + recall@k variants;
+    ``pair_frac`` reports MSE on positive cells. The auxiliary heads
+    (source_act / target_aim / glob_act) were removed from the model,
+    so they no longer appear in the summary.
     """
     model.eval()
 
-    # Per-head confusion counters. ``pair_frac`` is regression — we
-    # only track MSE for it.
-    bce_stats: dict[str, dict[str, int]] = {
-        name: {"tp": 0, "fp": 0, "tn": 0, "fn": 0}
-        for name in ("pair_logits", "source_act", "target_aim", "glob_act")
-    }
-    bce_loss_sum: dict[str, float] = {
-        name: 0.0 for name in (
-            "pair_logits", "source_act", "target_aim", "glob_act",
-        )
-    }
-    bce_denom: dict[str, int] = {
-        name: 0 for name in (
-            "pair_logits", "source_act", "target_aim", "glob_act",
-        )
-    }
+    bce_stats: dict[str, int] = {"tp": 0, "fp": 0, "tn": 0, "fn": 0}
+    bce_loss_sum = 0.0
+    bce_denom = 0
 
     # pair_frac (regression): MSE on positive cells.
     frac_se_sum = 0.0
     frac_n = 0
-    frac_n_pos = 0
 
-    # pair_logits-specific top-k accounting (kept from prior eval).
+    # pair_logits-specific top-k accounting.
     rk_hits: dict[int, int] = {1: 0, 5: 0, 10: 0}
     rk_total = 0
     pair_rk_hits: dict[int, int] = {1: 0, 5: 0, 10: 0}
@@ -1157,31 +1256,30 @@ def evaluate(
             "fleet_eta_norm": batch["fleet_eta_norm"],
             "fleet_mask": batch["fleet_mask"],
         }
-        preds = model(entity_self, fleet_tok, routing, batch["planet_mask"])
+        preds = model(
+            entity_self, fleet_tok, routing, batch["planet_mask"],
+            is_comet=batch["is_comet"],
+            pair_type_ids=build_pair_type_ids(
+                batch["planet_features"], batch["planet_mask"],
+            ),
+        )
         pair_logits = preds["pair_logits"]               # (B, P, P)
         pair_labels = batch["pair_labels"].bool()        # (B, P, P)
         pair_valid = batch["pair_valid"].bool()          # (B, P, P)
-
-        planet_mask = batch["planet_mask"]
-        if planet_mask.dim() == 3:
-            planet_mask_now = planet_mask[:, -1].bool()
-        else:
-            planet_mask_now = planet_mask.bool()
 
         # ---- pair_logits ----
         bce = F.binary_cross_entropy_with_logits(
             pair_logits, pair_labels.float(), reduction="none",
         )
         valid_f = pair_valid.float()
-        bce_loss_sum["pair_logits"] += float((bce * valid_f).sum())
-        bce_denom["pair_logits"] += int(valid_f.sum())
+        bce_loss_sum += float((bce * valid_f).sum())
+        bce_denom += int(valid_f.sum())
 
         pos_pred = pair_logits > 0
-        s = bce_stats["pair_logits"]
-        s["tp"] += int(((pos_pred & pair_labels) & pair_valid).sum())
-        s["fp"] += int(((pos_pred & ~pair_labels) & pair_valid).sum())
-        s["tn"] += int(((~pos_pred & ~pair_labels) & pair_valid).sum())
-        s["fn"] += int(((~pos_pred & pair_labels) & pair_valid).sum())
+        bce_stats["tp"] += int(((pos_pred & pair_labels) & pair_valid).sum())
+        bce_stats["fp"] += int(((pos_pred & ~pair_labels) & pair_valid).sum())
+        bce_stats["tn"] += int(((~pos_pred & ~pair_labels) & pair_valid).sum())
+        bce_stats["fn"] += int(((~pos_pred & pair_labels) & pair_valid).sum())
 
         # Recall@k over flattened P² grid (one ranking per snapshot).
         B, P, _ = pair_logits.shape
@@ -1209,109 +1307,35 @@ def evaluate(
         # ---- pair_frac (regression — MSE on positive cells) ----
         if "pair_ships" in batch:
             ships = batch["pair_ships"].float()
-            row_sum = ships.sum(dim=-1, keepdim=True).clamp(min=1.0)
-            target_frac = ships / row_sum
+            target_frac = _pair_frac_targets_from_batch(batch, ships)
             pos_mask = (pair_labels & pair_valid).float()
             frac_sig = torch.sigmoid(preds["pair_frac"])
             sq = (frac_sig - target_frac).pow(2)
             frac_se_sum += float((sq * pos_mask).sum())
             frac_n += int(pos_mask.sum())
-            frac_n_pos += int(pos_mask.sum())
 
-        # ---- source_act ----
-        src_labels = pair_labels.any(dim=-1)             # (B, P) bool
-        src_logits = preds["source_act"]                 # (B, P)
-        bce_src = F.binary_cross_entropy_with_logits(
-            src_logits, src_labels.float(), reduction="none",
-        )
-        mask_f = planet_mask_now.float()
-        bce_loss_sum["source_act"] += float((bce_src * mask_f).sum())
-        bce_denom["source_act"] += int(mask_f.sum())
+    pos = bce_stats["tp"] + bce_stats["fn"]
+    neg = bce_stats["tn"] + bce_stats["fp"]
+    total_cells = max(1, pos + neg)
+    pair_entry: dict[str, float] = {
+        "loss": bce_loss_sum / max(1, bce_denom),
+        "recall_true":  bce_stats["tp"] / max(1, pos),
+        "recall_false": bce_stats["tn"] / max(1, neg),
+        "n_pos": float(pos),
+        "n_neg": float(neg),
+        "pos_frac": pos / total_cells,
+    }
+    for k, hits in rk_hits.items():
+        pair_entry[f"recall_at_{k}"] = hits / max(1, rk_total)
+        pair_entry[f"pair_recall_at_{k}"] = pair_rk_hits[k] / max(1, pos_total)
+        pair_entry[f"row_recall_at_{k}"] = row_rk_hits[k] / max(1, pos_total)
 
-        pred_src = src_logits > 0
-        s = bce_stats["source_act"]
-        s["tp"] += int(((pred_src & src_labels) & planet_mask_now).sum())
-        s["fp"] += int(((pred_src & ~src_labels) & planet_mask_now).sum())
-        s["tn"] += int(((~pred_src & ~src_labels) & planet_mask_now).sum())
-        s["fn"] += int(((~pred_src & src_labels) & planet_mask_now).sum())
-
-        # ---- target_aim ----
-        tgt_labels = pair_labels.any(dim=-2)             # (B, P) bool
-        tgt_logits = preds["target_aim"]                 # (B, P)
-        bce_tgt = F.binary_cross_entropy_with_logits(
-            tgt_logits, tgt_labels.float(), reduction="none",
-        )
-        bce_loss_sum["target_aim"] += float((bce_tgt * mask_f).sum())
-        bce_denom["target_aim"] += int(mask_f.sum())
-
-        pred_tgt = tgt_logits > 0
-        s = bce_stats["target_aim"]
-        s["tp"] += int(((pred_tgt & tgt_labels) & planet_mask_now).sum())
-        s["fp"] += int(((pred_tgt & ~tgt_labels) & planet_mask_now).sum())
-        s["tn"] += int(((~pred_tgt & ~tgt_labels) & planet_mask_now).sum())
-        s["fn"] += int(((~pred_tgt & tgt_labels) & planet_mask_now).sum())
-
-        # ---- glob_act ----
-        glob_labels = pair_labels.any(dim=-1).any(dim=-1)  # (B,) bool
-        glob_logits = preds["glob_act"]                    # (B,)
-        bce_glob = F.binary_cross_entropy_with_logits(
-            glob_logits, glob_labels.float(), reduction="none",
-        )
-        bce_loss_sum["glob_act"] += float(bce_glob.sum())
-        bce_denom["glob_act"] += int(glob_labels.numel())
-
-        pred_glob = glob_logits > 0
-        s = bce_stats["glob_act"]
-        s["tp"] += int((pred_glob & glob_labels).sum())
-        s["fp"] += int((pred_glob & ~glob_labels).sum())
-        s["tn"] += int((~pred_glob & ~glob_labels).sum())
-        s["fn"] += int((~pred_glob & glob_labels).sum())
-
-    summary: dict[str, dict[str, float]] = {}
-
-    # 5-head rows. Build pair_logits first so the table order matches
-    # ``_HEAD_NAMES``.
-    for name in ("pair_logits", "source_act", "target_aim", "glob_act"):
-        s = bce_stats[name]
-        pos = s["tp"] + s["fn"]
-        neg = s["tn"] + s["fp"]
-        total_cells = max(1, pos + neg)
-        entry: dict[str, float] = {
-            "loss": bce_loss_sum[name] / max(1, bce_denom[name]),
-            "recall_true":  s["tp"] / max(1, pos),
-            "recall_false": s["tn"] / max(1, neg),
-            "n_pos": float(pos),
-            "n_neg": float(neg),
-            "pos_frac": pos / total_cells,
-        }
-        if name == "pair_logits":
-            for k, hits in rk_hits.items():
-                entry[f"recall_at_{k}"] = hits / max(1, rk_total)
-                entry[f"pair_recall_at_{k}"] = (
-                    pair_rk_hits[k] / max(1, pos_total)
-                )
-                entry[f"row_recall_at_{k}"] = (
-                    row_rk_hits[k] / max(1, pos_total)
-                )
-        summary[name] = entry
-
-    # pair_frac row — regression, MSE only. Placed between pair_logits
-    # and source_act so the print order matches ``_HEAD_NAMES``.
     if frac_n > 0:
-        frac_entry = {
-            "loss": frac_se_sum / max(1, frac_n),
-            "n_pos": float(frac_n_pos),
-        }
+        frac_entry = {"loss": frac_se_sum / max(1, frac_n), "n_pos": float(frac_n)}
     else:
-        # No pair_ships in batch — emit a row so the table is uniform,
-        # but mark loss NaN so the printer shows "—".
         frac_entry = {"loss": float("nan"), "n_pos": 0.0}
-    summary["pair_frac"] = frac_entry
 
-    # Reorder summary to match _HEAD_NAMES so callers iterating
-    # ``summary.items()`` get the canonical row sequence.
-    ordered = {name: summary[name] for name in _HEAD_NAMES if name in summary}
-
+    ordered = {"pair_logits": pair_entry, "pair_frac": frac_entry}
     model.train()
     return ordered
 
@@ -1536,7 +1560,7 @@ def train(
     cross_n_heads: int = 8,
     cross_n_layers: int = 2,
     dual_n_heads: int = 8,
-    batch_size: int = 128,
+    batch_size: int = 16,
     epochs: int = 30,
     lr: float = 5e-5,
     weight_decay: float = 1e-4,
@@ -1747,6 +1771,7 @@ def train(
         "comet_run_dir": str(comet_run_dir),
         "pair_cache_path": str(pair_cache_path),
         "pair_pos_weight": pair_pos_weight,
+        "pair_type_num_classes": PAIR_TYPE_NUM_CLASSES,
         "source_act_pos_weight": source_act_pos_weight,
         "target_aim_pos_weight": target_aim_pos_weight,
         "glob_act_pos_weight": glob_act_pos_weight,
@@ -1798,7 +1823,13 @@ def train(
                 "fleet_eta_norm": batch["fleet_eta_norm"],
                 "fleet_mask": batch["fleet_mask"],
             }
-            preds = model(entity_self, fleet_tok, routing, batch["planet_mask"])
+            preds = model(
+                entity_self, fleet_tok, routing, batch["planet_mask"],
+                is_comet=batch["is_comet"],
+                pair_type_ids=build_pair_type_ids(
+                    batch["planet_features"], batch["planet_mask"],
+                ),
+            )
             total_loss, per_head = compute_multi_loss(
                 preds, batch,
                 pair_pos_weight=pair_pos_weight,
@@ -1925,7 +1956,12 @@ def main() -> None:
         help="Shared head count for L3 DualRoleAttention and L4 "
              "JointRoleAttention (default 8).",
     )
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument(
+        "--batch-size", type=int, default=16,
+        help="Training batch size. Default 16 is conservative for "
+             "d_model=d_pair=256, T=6, max_planets=64, max_fleets=1024 "
+             "and the pairwise FiLM conditioner.",
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)

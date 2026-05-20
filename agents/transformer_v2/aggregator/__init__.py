@@ -12,11 +12,13 @@ See ``README.md`` for design + label rationale.
 from .cross_entity import CrossEntityAttention
 from .dual_role_attention import DualRoleAttention
 from .joint_role_attention import JointRoleAttention
-from .pair_head import PairHead
+from .pair_head import PAIR_TYPE_EMBED_DIM, PAIR_TYPE_NUM_CLASSES, PairHead
 
 __all__ = [
     "CrossEntityAttention",
     "DualRoleAttention",
     "JointRoleAttention",
+    "PAIR_TYPE_EMBED_DIM",
+    "PAIR_TYPE_NUM_CLASSES",
     "PairHead",
 ]

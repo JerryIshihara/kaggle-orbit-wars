@@ -26,26 +26,26 @@ Live punch list of observed failures and gaps. Add new items as they're found; s
 
 1. **Fleets miss the target and waste resources** — happens most often on comet targets, but also static planets near the board edge. The lead-aim estimate puts the fleet on a path that misses the moving target by more than its radius, so the fleet flies past, exits the board, and gets removed. Each miss spends the source's surplus for no return. Likely contributors: (a) `_lead_aim_comet` falls back to the comet's current position when the iterative ETA outruns the path window; (b) for fast-moving sources/targets the integer step rounding compounds; (c) the multi-target inference rule (`pair_logits > 2.0`) can fire low-confidence cells whose trajectories were never validated by `plan_launch`. Need to add a per-launch validation gate in `_target_to_moves` that hard-rejects when `plan_launch.ok=False` instead of falling back to a learned-frac launch.
 2. **Comet-borne garrisons carried out of the map** — when a comet's path runs off the board, ships sitting on that comet at expiry vanish with it. The agent doesn't pre-emptively evacuate / launch from a comet whose path is about to end, so any garrison the agent built up there (or any planet captured *via* a comet) is lost the moment the comet expires. Fix candidates: (a) feature the comet's remaining-path-length and tail-distance-to-edge in `comet_features`; (b) add an evacuation rule in the runner that forces a launch from any comet within K turns of expiry; (c) penalize stationing ships on short-lived comets at the policy / scoring level.
-3. **Agent ignores simple targets** — undefended neutrals or weakly-held enemies adjacent to the agent's own planets sometimes get no launch even though `physical_v4` would grab them every time. Suspected causes: `pair_logits > 2.0` threshold is calibrated for the average snapshot density and may suppress confident-but-not-extreme cells in low-action turns; `source_act` head isn't gating inference (it's trained but unused at runtime); the model was trained on bow+Ebi who play a tighter style than physical_v4. Could fix by lowering the threshold late-game, or by adding a "must-fire" fallback when `glob_act` is high but the threshold-filtered cells are empty (use top-K instead).
+3. **Agent ignores simple targets** — undefended neutrals or weakly-held enemies adjacent to the agent's own planets sometimes get no launch even though `physical_v4` would grab them every time. Suspected causes: `pair_logits > 2.0` threshold is calibrated for the average snapshot density and may suppress confident-but-not-extreme cells in low-action turns; the model was trained on bow+Ebi who play a tighter style than physical_v4. Could fix by lowering the threshold late-game, or by adding a "must-fire" fallback when no cells clear the threshold (e.g., fall back to top-1 per source, or to the flat-`argmax(P²)` cell if its logit exceeds a softer threshold).
 4. **Model can't recognize blocking planets on the launch path** — the agent picks a (source, target) pair whose straight-line trajectory passes through an intervening planet (own, neutral, or enemy). The intercepting body absorbs the fleet, so the intended target is never reached and the source's ships are spent on the wrong planet. Today the runner relies on `plan_launch` *after* the model picks the pair, but the LEARNED scorer has no feature describing "is there a planet sitting on the ray from src to tgt?". The relation tokens at L1 are `[fleet_tok ‖ src_planet ‖ tgt_planet]` — they don't include third-party planets that geometrically sit between the pair. Fix candidates: (a) add a per-(s, t) geometric feature (count / nearest-distance / soonest-blocker-arrival) and feed it into PairHead via `pair_scalars`; (b) at training time, mask out or down-weight cells where `plan_launch.reason == "wrong_planet_*"` so the model learns to score them low rather than just being rejected at inference.
 5. ~~**Miss-rate calculation diverges from env's actual outcomes**~~ — fixed in `utils/logger.py:trace_launch_motion` (2026-05-20). The aggregator now consumes `trace_fleets` outcomes directly (the env's ground-truth fleet lifecycle) instead of re-simulating physics. Mapping: `captured`/`reinforced`/`annihilated` → `ok`; `destroyed_sun` → `sun`; `out_of_map` → `boundary`; `unknown` → `unknown`. Multi-target moves the env rejected (running ship pool exhausted) produce no record now (FIFO match against fleets via `(owner, launch_step, from_id)`). Verified on seed=1729 transformer_v2 vs physical_v4: analyzer reports `boundary=44, sun=11` matching env's `out_of_map=44, destroyed_sun=11` exactly. `_first_collision_for_launch` is no longer called — kept as an optional diagnostic helper. (The original symptom was 0% reported miss rate vs ~15% real — caused by cumulative orbital-rotation drift between the local simulator and the env's absolute-angle planet positions.)
 6. **Performance degrades on large maps** — agent plays competently on seeds with fewer planets (~16-24 real planets, common static-heavy generations) but stops scaling on maps with the maximum number of planet groups (~40 planets, multiple orbital rings + comet spawns). Hypotheses: (a) **training distribution skew** — bow+Ebi's 555 replays may under-represent maximal-planet seeds, so the model never learned how to spread surplus across many fronts; (b) **per-cell pair_logits calibration shifts with P** — with `pos_weight=600` BCE trained against an average of ~30 valid cells per source, the absolute logit magnitude depends on local pair density, so the `> 2.0` inference threshold may be miscalibrated when the planet count doubles (more competing targets dilute confidence); (c) **L2/L4 attention saturation** — the planet↔planet self-attention sees 40+ tokens (vs ~16-20 typical) and may not have learned to allocate attention budget across that many entities cleanly; the model was trained with `max_planets=64` padding but the *actual* P distribution in training data is skewed low; (d) **action-budget mismatch** — the multi-target threshold rule scales linearly with active source count, so a 40-planet map can issue 10+ launches/turn while bow+Ebi typically issued 2-3; the model never saw rollouts with that launch density. Investigation candidates: bucket the eval-seed panel by P and report win rate per bucket; histogram pair_logits by snapshot P at val time to confirm the calibration shift; check whether physical_v4 also degrades on large maps (if yes, it's an env-difficulty axis; if no, it's a learning gap).
 
 
 
-Active learned line lives under [`agents/transformer_v2/`](agents/transformer_v2/README.md). It's a 4-layer transformer stack on top of 3 frozen per-entity specialist encoders, capped by a shared 2-layer trunk that feeds 5 simultaneous output heads. Heuristic and legacy agents are kept in [`agents/heuristic/`](agents/heuristic/) and [`agents/archive/`](agents/archive/) respectively.
+Active learned line lives under [`agents/transformer_v2/`](agents/transformer_v2/README.md). It's a 4-layer transformer stack on top of 3 frozen per-entity specialist encoders, capped by a shared 2-layer trunk that feeds **2 output heads** through an L1-conditioned FiLM modulation block. Heuristic and legacy agents are kept in [`agents/heuristic/`](agents/heuristic/) and [`agents/archive/`](agents/archive/) respectively.
 
 ### Architecture
 
 ```
 L0 (frozen, per-entity MLP specialists, ~374k params)
    ├─ PlanetEncoder       (18 → 256)
-   ├─ CometPastModel      (123 → 256)   ─► where(is_comet, ...) ─► entity_self (B, T=6, P, 256)
+   ├─ CometEncoder        (123 → 256)   ─► where(is_comet, ...) ─► entity_self (B, T=6, P, 256)
    └─ FleetEncoder        (24 → 256)                                            │
                                                                                 ▼
 L1 PlanetEntityEncoder       cross-attn: planets ←→ relation-aware fleets       (658k)
                               ([fleet_tok ‖ source_planet_tok ‖ target_planet_tok])
-                                                                                ▼
+                                                                                ▼ entity_tokens (B, T, P, 256)
 L2 CrossEntityAttention      planet ↔ planet self-attention, multi-step over T=6,
                               learned CLS, 2-layer Pre-LN encoder                (1.05M)
                                                                                 ▼ ctx_now (B, P, 256)
@@ -53,19 +53,23 @@ L3 DualRoleAttention         parallel source→target / target→source branches
                                                                                 ▼ source_aware, target_aware
 L4 JointRoleAttention        concat 2P, 1-layer self-attn, split back           (528k)
                                                                                 ▼ source_joint, target_joint
-PairHead                     2-layer shared trunk → 5 single-Linear heads       (658k)
-                              Linear(1536 → 256) → GELU → Linear(256 → 256) → GELU
-                              (d_pair = d_model = 256 by default — no down-projection;
-                               pass --d-pair 128 to reproduce the legacy narrowed layout)
+PairHead                     2-layer shared trunk → FiLM conditioner → 2 heads  (929k)
+                              Linear(1536 → 256) → GELU → Linear(256 → 256) → GELU     ← trunk
                                                   │
-        ┌───────────────────┬─────────┴─────────┬─────────────────────┬───────────────────┐
-        ▼                   ▼                   ▼                     ▼                   ▼
-  pair_logits          pair_frac            source_act          target_aim            glob_act
-   (B, P, P)            (B, P, P)            (B, P)              (B, P)               (B,)
-   BCE pw=600           MSE on sigmoid       BCE pw=100          BCE pw=100           BCE pw=1
+                                                  ▼  h[s, t] (B, P, P, 256)
+                              FiLM:  γ, β = MLP([L1_src ‖ L1_tgt ‖ pair_type_emb])
+                                     h_film = h + α · (γ · h + β)        ← γ, β init=0; α=1 (identity)
+                                                  │
+                                          ┌───────┴───────┐
+                                          ▼               ▼
+                                    pair_logits        pair_frac
+                                    (B, P, P)          (B, P, P)
+                                    BCE pw=600         MSE on sigmoid
+                                    (loss masked      (loss masked to
+                                     by pair_valid)    positive cells)
 ```
 
-**Total trainable params: ~3.43M.** Loss is the sum of all 5 head losses, each masked appropriately (`pair_valid` for the cell heads, `planet_mask` for the per-planet heads, no mask for the snapshot head).
+**Total trainable params: ~3.70M.** Loss is the sum of two terms: per-cell BCE on `pair_logits` (masked by `pair_valid`, `pos_weight=600`) + MSE-on-sigmoid for `pair_frac` (masked to positive cells where `pair_ships > 0`). The earlier auxiliary heads (`source_act` / `target_aim` / `glob_act`) were removed in 2026-05-20 — at inference the runner only consumes `pair_logits` + `pair_frac`, and the aux heads were fighting the joint optimizer for capacity without affecting actions.
 
 ### Per-layer features and pretrain tasks
 
@@ -78,7 +82,7 @@ PairHead                     2-layer shared trunk → 5 single-Linear heads     
 | **L2 CrossEntityAttention** | `entity_tokens` over **T=6 timesteps** + learned CLS + additive `step_embed[t]` | `ctx_now (P, 256)` + `glob (256)` (CLS) | jointly trained | Planet↔planet self-attention with step-position awareness; CLS pools the whole snapshot |
 | **L3 DualRoleAttention** | `ctx_now + source_role` (branch A) / `ctx_now + target_role` (branch B) | `source_aware (P, 256)`, `target_aware (P, 256)` | jointly trained | Parallel cross-attn: A asks "which target does each source pick?", B asks "which sources might target each target?" |
 | **L4 JointRoleAttention** | `concat[source_aware + source_role_l4, target_aware + target_role_l4]` as a 2P-token sequence | `source_joint (P, 256)`, `target_joint (P, 256)` | jointly trained | One self-attention pass over the 2P sequence, then split halves back — lets source and target halves cross-condition on the same matchup |
-| **PairHead** | `source_joint`, `target_joint`, **`ctx_now`** (skip from L2) | 5 heads (see "What each head predicts") | jointly trained, multi-task loss sum | Broadcasts trios to (P, P), runs the shared 2-layer trunk, then 5 single-Linear heads |
+| **PairHead** | `source_joint`, `target_joint`, **`ctx_now`** (skip from L2), **`l1_tokens`** (skip from L1, FiLM cond), `pair_type_ids` (27-way source/target type) | `pair_logits (B, P, P)`, `pair_frac (B, P, P)` | jointly trained, 2-term loss | Broadcasts trios to (P, P), runs the shared 2-layer trunk, applies L1-conditioned FiLM (`h_film = h + α·(γ·h + β)`, identity-init), then 2 single-Linear heads |
 
 ### Layer-to-layer signal flow
 
@@ -90,10 +94,11 @@ PairHead                     2-layer shared trunk → 5 single-Linear heads     
 | L3 → L4 | `source_aware`, `target_aware` | (P, 256) × 2 | Pre-concat into 2P-token sequence with fresh role embeddings |
 | L4 → Head | `source_joint`, `target_joint` | (P, 256) × 2 | Split halves back from the 2P self-attn output |
 | **L2 → Head (skip L3 + L4)** | **`ctx_now`** | **(P, 256)** | **Layer-skipping signal: direct `Linear(ctx_now)` into PairHead's 6-way concat — bypasses both L3 and L4** |
+| **L1 → Head (skip L2 + L3 + L4)** | **`l1_now`** (entity_tokens at current step) + **27-way `pair_type_ids`** | **(P, 256) + (P, P)** | **FiLM conditioner: L1_src ‖ L1_tgt ‖ pair_type_emb → γ, β. Modulates the post-trunk `h[s, t]`. Bypasses L2/L3/L4 to carry L1's local-tactical-state directly to the score.** |
 
 ### Layer-skipping residuals (signals that bypass layers)
 
-The standard ⊕-residuals listed in the per-layer table below stay within a single layer (around an MHA or FFN sub-block). Two **layer-skipping** signals are also load-bearing — they're concat-fed *into* downstream layers, but their effect is the same: gradient flow and feature preservation across the bypassed layers.
+The standard ⊕-residuals listed in the per-layer table below stay within a single layer (around an MHA or FFN sub-block). Three **layer-skipping** signals are also load-bearing — they're concat-fed (or FiLM-fed) *into* downstream layers, but their effect is the same: gradient flow and feature preservation across the bypassed layers.
 
 1. **`entity_self` → L1 fuse** *(skips L1's cross-attention)*. L0's per-entity token is `concat`-fused with L1's MHA output before the 2-Linear fuse MLP. Without this, L1's pure attention output would have to re-derive each planet's identity from the cross-attention residue alone. Acts like a soft residual through L1.
 
@@ -109,7 +114,22 @@ The standard ⊕-residuals listed in the per-layer table below stay within a sin
             L4 JointRoleAttention ──► source_joint / target_joint ──┘
    ```
 
-   Rationale: L3 and L4 produce **role-specialized** (source-vs-target) tokens that drop some of the symmetric planet-context information L2 had. By preserving `ctx_now`, PairHead's trunk sees both views — role-aware (from L4) and role-agnostic (from L2) — when scoring pair compatibility. The 6-way concat is `[src_r, ctx_r, tgt_r, ctx_r, src_r⊙tgt_r, ctx_r⊙ctx_r]` (see `agents/transformer_v2/aggregator/pair_head.py:153–164`).
+   Rationale: L3 and L4 produce **role-specialized** (source-vs-target) tokens that drop some of the symmetric planet-context information L2 had. By preserving `ctx_now`, PairHead's trunk sees both views — role-aware (from L4) and role-agnostic (from L2) — when scoring pair compatibility. The 6-way concat is `[src_r, ctx_r, tgt_r, ctx_r, src_r⊙tgt_r, ctx_r⊙ctx_r]` (see `agents/transformer_v2/aggregator/pair_head.py`).
+
+3. **`l1_tokens` → PairHead FiLM** *(skips L2, L3, and L4 entirely)*. L1's per-planet token — which fuses L0 entity self-encoding with the **fleet relation context** (inbound/outbound fleets, ship counts, ETAs) — feeds the FiLM conditioner between trunk and the two heads:
+
+   ```
+   L1 ─ l1_tokens ───────────────────────────────────────────►  PairHead.film_proj
+              │       (broadcast across (P, P), concat with 27-way pair type embedding)
+              ▼                                                     ▲
+            L2 ─ ctx_now ─► L3 ─► L4 ─► trunk ─► h[s, t] ──────────┘
+                                                                    │
+                                          γ, β = chunk(film_proj(cond))
+                                          h_film = h + α · (γ · h + β)
+                                          α: learnable scalar scale, init=1
+   ```
+
+   Rationale: the trunk's role-aware representation (from L4) and role-agnostic context (from L2) capture **strategic** state — "is this a good source–target geometry?", "are the rest of the planets aligned to support this move?". L1 carries **tactical** state that's already been compressed by the time it reaches L2 — "this source already has outgoing fleets", "this target has an enemy inbound", "this planet is being contested". FiLM lets the head tilt scores per-(s, t) based on that local state without disrupting the trunk's pre-trained pathway. The identity init (`γ = β = 0` at step 0, so `h_film = h` exactly) means FiLM behaves as a no-op initially; `α` starts at 1 so the conditioner still receives gradients from the first backward pass while legacy ckpt behavior remains bit-stable.
 
 ### Detailed flow with explicit residuals
 
@@ -213,7 +233,7 @@ L4 — JointRoleAttention  (concat 2P → self-attn → split)
   target_joint = out[:, P: ]                             (B, P, 256)
 
 ═══════════════════════════════════════════════════════════════════════════════
-PairHead — shared 2-layer trunk + 5 single-Linear heads
+PairHead — shared 2-layer trunk + L1-conditioned FiLM + 2 single-Linear heads
 ═══════════════════════════════════════════════════════════════════════════════
   Project to d_pair=d_model=256 (no down-projection by default; pass --d-pair 128
   to reproduce the legacy layout):
@@ -225,14 +245,24 @@ PairHead — shared 2-layer trunk + 5 single-Linear heads
     pair_feat = concat[src_r, ctx_r, tgt_r, ctx_r, src_r⊙tgt_r, ctx_r⊙ctx_r]  (B,P,P,1536)
 
   Shared trunk (no residual — purely sequential):
-    Linear(1536 → 256) → GELU → Linear(256 → 256) → GELU     ─▶ trunk (B, P, P, 256)
+    Linear(1536 → 256) → GELU → Linear(256 → 256) → GELU     ─▶ h (B, P, P, 256)
 
-  5 heads (each Linear(256 → 1) on the trunk, no residual):
-    pair_head        : trunk[s,t]                    → pair_logits  (B, P, P)
-    pair_frac_head   : trunk[s,t]                    → pair_frac    (B, P, P) sigmoid
-    source_act_head  : masked_mean(trunk, dim=tgt)    → source_act   (B, P)
-    target_aim_head  : masked_mean(trunk, dim=src)    → target_aim   (B, P)
-    glob_act_head    : masked_mean(trunk, dim=(s,t))  → glob_act     (B,)
+  FiLM conditioner (skip-from-L1 + 27-way source/target type embedding):
+    pair_type[s,t] = source_type[s] * 9 + target_relation[t] * 3 + target_type[t]
+      source_type, target_type ∈ {0=static, 1=orbital, 2=comet}
+      target_relation ∈ {0=enemy, 1=neutral, 2=own}
+    cond[s,t] = concat[L1_src, L1_tgt, Embed27(pair_type[s,t])]   (B,P,P, 2·256 + 32)
+    γ, β      = chunk(Linear(544 → 256) → GELU → Linear(256 → 512)(cond), 2, dim=-1)
+    h_film    = h + α · (γ · h + β)                                  α: scalar Param, init=1
+
+    At init γ, β = 0 (film_proj output Linear is zero-init), so h_film = h
+    exactly. Alpha is non-zero so gradients flow into the conditioner; this
+    keeps the trunk's pre-trained pathway intact when legacy ckpts load while
+    making FiLM trainable immediately.
+
+  2 heads (each Linear(256 → 1) on h_film, no residual):
+    pair_head       : h_film[s,t]  → pair_logits  (B, P, P)
+    pair_frac_head  : h_film[s,t]  → pair_frac    (B, P, P) raw logit, loss sigmoids
 ```
 
 #### Residuals summary
@@ -246,7 +276,9 @@ PairHead — shared 2-layer trunk + 5 single-Linear heads
 | L2 TransformerEncoderLayer × 2 | **Yes ⊕** | Standard Pre-LN: residual around MHA + residual around FFN |
 | L3 DualRoleAttention (each branch) | **Yes ⊕** | `LayerNorm(role_tok + attn_out)` |
 | L4 TransformerEncoderLayer × 1 | **Yes ⊕** | Same Pre-LN block as L2 |
-| PairHead trunk + 5 heads | No | Purely sequential MLP + per-head Linear |
+| PairHead trunk | No | Purely sequential MLP |
+| **PairHead FiLM gate** | **Yes ⊕** | `h_film = h + α · (γ · h + β)`; `γ, β` zero-init and `α=1` — identity at start, trainable immediately |
+| PairHead pair_head / pair_frac_head | No | Per-head Linear on h_film |
 
 #### Additive embeddings (NOT residuals — additive type/position signals)
 
@@ -261,10 +293,9 @@ PairHead — shared 2-layer trunk + 5 single-Linear heads
 | Head | Output | Supervision |
 |---|---|---|
 | `pair_logits`   | per (source, target) compatibility logit | expert pair-set: `[s, t] = True` if expert launched ≥1 fleet from `s` to `t` |
-| `pair_frac`     | sigmoid → fraction of source's ships sent to target | `pair_ships[s, t] / row_sum`; masked to positive cells only |
-| `source_act`    | per-planet binary "this planet launches a fleet" | `pair_labels.any(dim=-1)` |
-| `target_aim`    | per-planet binary "this planet is targeted" | `pair_labels.any(dim=-2)` |
-| `glob_act`      | per-snapshot binary "any action this turn" | `pair_labels.any(dim=(-1, -2))` |
+| `pair_frac`     | raw logit; sigmoid → fraction of source's ships sent to target | `pair_ships[s, t] / source_ships_before_launch[s]`; masked to positive cells only |
+
+The runner consumes both at inference: pair_logits chooses the (s, t) cells to fire on (currently `pair_logits > 2.0` threshold, multi-target per source), and `sigmoid(pair_frac)` sizes each launch as a fraction of the source's ships.
 
 ### Supervision pipeline
 
@@ -302,15 +333,12 @@ Current default cache: **bowwowforeach + Ebi** mixed (rank #1 and #3 on the lead
 ```bash
 python -m agents.transformer_v2.pretrain.entity_encoder \
     --pair-cache-path data/datasets/_pair_cache/bowwowforeach_Ebi_T6/bowwowforeach_Ebi_T6_p64_f1024_all.pt \
-    --d-model 256 --batch-size 128 --epochs 30 --lr 5e-5 \
+    --d-model 256 --batch-size 16 --epochs 30 --lr 5e-5 \
     --pair-pos-weight 600 \
-    --source-act-pos-weight 100 \
-    --target-aim-pos-weight 100 \
-    --glob-act-pos-weight 1.0 \
     --device cuda
 ```
 
-Per-epoch logging prints a 5-row table covering each head's train/val loss, `recall_true`, `recall_false`, `pos_frac`, and (for `pair_logits`) `recall_at_{1, 5, 10}`. See [`notebooks/train_entity_encoder_colab.ipynb`](notebooks/train_entity_encoder_colab.ipynb) for the Colab variant — the bundle lives at `gs://orbit-wars-shipping/entity/`.
+Per-epoch logging prints the two active heads (`pair_logits`, `pair_frac`) with train/val loss, `recall_true`, `recall_false`, `pos_frac`, and pair-ranking metrics (`recall_at_{1, 5, 10}`, `pair_recall_at_{1, 5, 10}`, `row_recall_at_{1, 5, 10}`). See [`notebooks/train_entity_encoder_colab.ipynb`](notebooks/train_entity_encoder_colab.ipynb) for the Colab variant — the bundle lives at `gs://orbit-wars-shipping/entity/`.
 
 ### Frozen L0 ckpts
 

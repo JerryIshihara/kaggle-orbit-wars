@@ -1,4 +1,4 @@
-"""UI-runnable agent: pair-head + 5-output stack loaded from a v2 entity-pretrain ckpt.
+"""UI-runnable agent: 2-head PairHead stack loaded from a v2 entity-pretrain ckpt.
 
 Loads an ``entity_encoder_best.pt`` produced by
 ``agents/transformer_v2/pretrain/entity_encoder.py``, instantiates the
@@ -10,12 +10,15 @@ full L1-L4 + PairHead stack, and runs inference per tick:
   2. Run L0 frozen specialists on the raw features → ``planet_tok``,
      ``comet_tok``, ``fleet_tok``.
   3. ``where(is_comet, comet_tok, planet_tok)`` → ``entity_self``.
-  4. Forward through :class:`EntityPretrainModel` → 5-head dict.
+  4. Forward through :class:`EntityPretrainModel` → ``pair_logits`` and
+     ``pair_frac``.
   5. Mask ``pair_logits`` by per-row source-launchability and per-column
-     target-validity (target ≠ own); ``argmax`` the flat ``(P, P)`` grid.
-  6. Use ``sigmoid(pair_frac[src, tgt])`` to size the fleet; fall back
-     to ``physical_v4``'s surplus-based sizing if the frac is implausible.
-  7. Validate the chosen pair through :func:`physics_utils.plan_launch`
+     target-validity; emit every off-diagonal cell whose logit clears
+     the configured threshold.
+  6. Use ``sigmoid(pair_frac[src, tgt])`` as a fraction of the source
+     planet's ships, with a per-source budget so multi-target rows do
+     not double-spend.
+  7. Validate each chosen pair through :func:`physics_utils.plan_launch`
      before emitting the move, so wrong-planet / sun / boundary launches
      are dropped instead of sent to the env.
 
@@ -55,6 +58,7 @@ from .pretrain.entity_encoder import (
     EntityPretrainModel,
     _build_entity_self_tokens,
     _load_encoders,
+    build_pair_type_ids,
 )
 
 
@@ -243,7 +247,14 @@ class TransformerAgent:
             cross_n_layers=cross_n_layers,
             dual_n_heads=dual_n_heads,
         )
-        model.load_state_dict(ckpt["model"])
+        # ``strict=False`` so legacy 5-head ckpts (with ``source_act_head`` /
+        # ``target_aim_head`` / ``glob_act_head`` keys and no ``film_proj`` /
+        # ``film_alpha`` keys) still load. The unexpected legacy aux-head
+        # weights are dropped; missing FiLM keys fall back to the
+        # identity-init defaults (γ=β=0, film_alpha=1 → FiLM is a no-op
+        # at start, but trainable immediately; old ckpt behavior is
+        # preserved bit-for-bit on the pair_logits / pair_frac heads).
+        model.load_state_dict(ckpt["model"], strict=False)
 
         return cls(
             model,
@@ -339,7 +350,13 @@ class TransformerAgent:
             "fleet_eta_norm": batch["fleet_eta_norm"],
             "fleet_mask": batch["fleet_mask"],
         }
-        preds = self.model(entity_self, fleet_tok, routing, batch["planet_mask"])
+        preds = self.model(
+            entity_self, fleet_tok, routing, batch["planet_mask"],
+            is_comet=is_comet,
+            pair_type_ids=build_pair_type_ids(
+                batch["planet_features"], batch["planet_mask"],
+            ),
+        )
 
         pair_logits = preds["pair_logits"].squeeze(0)               # (P, P)
         pair_frac_raw = preds["pair_frac"].squeeze(0)               # (P, P) raw logit
@@ -646,8 +663,8 @@ from .. import registry as _registry  # noqa: E402
 if "transformer_v2" not in _registry._REGISTRY:
     _registry.register(
         "transformer_v2",
-        "v2 entity-pretrain PairHead policy: L0 specialists + L1-L4 + 5-head "
-        "PairHead, pair-score argmax + pair_frac sizing, fallback to physical_v4.",
+        "v2 entity-pretrain PairHead policy: L0 specialists + L1-L4 + 2-head "
+        "FiLM PairHead, thresholded pair-score cells + pair_frac sizing.",
     )(transformer_v2_agent)
 
 

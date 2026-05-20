@@ -1,32 +1,37 @@
 # `transformer_v2/` — current learned line
 
-Pair-score policy for Orbit Wars. Three frozen L0 specialist encoders feed a four-layer trainable stack (L1 → L2 → L3 → L4), capped by a single `PairHead` that emits `(B, P, P)` source→target compatibility logits. Supervised by expert pair-set labels behavior-cloned from one player's replays (Orbital Occle by default), with a T=6 history window on the inputs.
+Pair-score policy for Orbit Wars. Three frozen L0 specialist encoders feed a four-layer trainable stack (L1 → L2 → L3 → L4), capped by a `PairHead` that emits two `(B, P, P)` outputs through an L1-conditioned FiLM block: `pair_logits` (source→target compatibility) and `pair_frac` (fraction of source's ships to send). Behavior-cloned on top-leaderboard replays with a T=6 history window.
 
 ## TL;DR
 
 ```
 L0 (frozen, per-entity MLP encoders)
    ├─ PlanetEncoder    (18 → 256)
-   ├─ CometPastModel   (123 → 256)         ─► where(is_comet, ...) ─► entity_self (B, T, P, 256)
+   ├─ CometEncoder     (123 → 256)         ─► where(is_comet, ...) ─► entity_self (B, T, P, 256)
    └─ FleetEncoder     (24 → 256)                                                    │
                                                                                      ▼
 L1 PlanetEntityEncoder  (cross-attn: planets ←→ relation-aware fleet tokens)
-                                                                                     ▼
+                                                                                     ▼ entity_tokens (B, T, P, 256)
 L2 CrossEntityAttention (planet ↔ planet, multi-step Pre-LN encoder + CLS)
                                                                                      ▼ ctx_now (B, P, 256)
 L3 DualRoleAttention    (parallel source-to-target / target-to-source branches)
                                                                                      ▼ source_aware, target_aware
 L4 JointRoleAttention   (concat both, self-attn on 2P sequence, split back)
                                                                                      ▼ source_joint, target_joint
-PairHead                ([src_r, ctx_r, tgt_r, ctx_r, src⊙tgt, ctx⊙ctx] → MLP → 1 logit)
+PairHead                ([src_r, ctx_r, tgt_r, ctx_r, src⊙tgt, ctx⊙ctx] → trunk h[s,t])
+                              ↑ FiLM cond: [L1_src ‖ L1_tgt ‖ pair_type_emb]
+                                 h_film = h + α · (γ · h + β)        (γ, β init=0; α=1 → identity)
                                                                                      ▼
-                                                pair_logits (B, P, P)
-                                                                                     ▼
-                                            BCE-with-logits, masked by pair_valid,
-                                              pos_weight = 600 (counter ~0.16% rate)
+                                                ┌───────────────┐
+                                                ▼               ▼
+                                          pair_logits        pair_frac
+                                          (B, P, P)          (B, P, P, raw)
+                                          BCE pw=600         MSE on sigmoid
+                                          masked by          masked to positive
+                                          pair_valid         cells only
 ```
 
-**Trainable:** ~3.1M params. **Frozen L0:** 374k params.
+**Trainable:** ~3.70M params (L1: 658k, L2: 1.05M, L3: 528k, L4: 528k, PairHead: 929k incl. FiLM). **Frozen L0:** 374k params.
 
 ## Architecture details
 
@@ -37,7 +42,7 @@ Each L0 specialist is a 3-Linear MLP + LayerNorm, pretrained independently again
 | Encoder | Input | Output | Best ckpt dir |
 |---|---|---|---|
 | `PlanetEncoder` | 18 scalars (sun-relative geom + owner one-hot + garrison log) | (B, T, P, 256) | `specialist_planet_d256_no_traj_branch_40k_lr1e4_120ep` |
-| `CometPastModel.encoder` | 18 scalars + 35 path slots × (dx, dy, valid) = 123 dims | (B, T, P, 256) | `fullpath_scalar_multitask_d256_40k_lr1e4_120ep` |
+| `CometEncoder` | 18 scalars + 35 path slots × (dx, dy, valid) = 123 dims | (B, T, P, 256) | `fullpath_scalar_multitask_d256_40k_lr1e4_120ep` |
 | `FleetEncoder` | 24 dims (mission, target rel, ships, ETA, heading, ...) | (B, T, F, 256) | `specialist_fleet_d256_40k_lr1e4_120ep` |
 
 The unified per-entity `entity_self (B, T, P, 256)` stream is built by `torch.where(is_comet[..., None], comet_tok, planet_tok)` — same `d_model` everywhere so no projection bridge is needed.
@@ -94,31 +99,54 @@ source_joint = out[:, :P]    target_joint = out[:, P:]
 
 ### PairHead (`aggregator/pair_head.py`)
 
-Per-`(source, target)` compatibility scorer. Projects role and context tokens to `d_pair=128`, broadcasts to `(B, P, P, 6·d_pair)`, runs a 3-Linear MLP → 1 logit:
+Per-`(source, target)` compatibility scorer + ship-size regressor. Projects role and context tokens to `d_pair=d_model=256` (no down-projection by default), broadcasts to `(B, P, P, 6·d_pair=1536)`, runs a 2-Linear MLP trunk → `h`, then **L1-conditioned FiLM** → 2 heads:
 
 ```python
-src_r = src_proj(source_joint)   # (B, P, 128)
+src_r = src_proj(source_joint)   # (B, P, 256)
 tgt_r = tgt_proj(target_joint)
 ctx_r = ctx_proj(ctx_now)
 pair_feat[s, t] = concat[src_r[s], ctx_r[s], tgt_r[t], ctx_r[t],
                           src_r[s] ⊙ tgt_r[t], ctx_r[s] ⊙ ctx_r[t]]
-pair_logits = scorer(pair_feat).squeeze(-1)         # (B, P, P)
+h = trunk(pair_feat)                                   # (B, P, P, 256)
+
+# FiLM conditioner — uses the L1 tokens (skip from L1, bypassing L2/L3/L4)
+# + a 27-way source/target type embedding. Identity-init: γ=β=0 and α=1,
+# so h_film = h on the first forward while the conditioner receives gradients.
+pair_type[s, t] = source_type[s] * 9 + target_relation[t] * 3 + target_type[t]
+cond[s, t] = concat[L1_src[s], L1_tgt[t], Embed27(pair_type[s, t])]
+γ, β = chunk(film_proj(cond), 2, dim=-1)               # (B, P, P, 256) each
+h_film = h + α * (γ * h + β)                           # α: learnable scalar, init=1
+
+pair_logits = pair_head(h_film).squeeze(-1)            # (B, P, P)
+pair_frac   = pair_frac_head(h_film).squeeze(-1)       # (B, P, P) raw logit
 ```
 
-Returns raw logits — caller masks invalid pairs (`pair_valid`). 362k params.
+929k params total (trunk 460k + film_proj 271k + 3 input projections 197k + 2 heads ~0.5k + film_alpha 1).
+
+**Why FiLM from L1?** The trunk's role-aware tokens (from L4) and role-agnostic context (from L2) capture **strategic** state. L1 carries **tactical** state — "this source already has outgoing fleets", "this target has an enemy inbound", "this planet is being contested" — which gets compressed by the time it reaches L2. The FiLM block lets the head tilt scores per-(s, t) on local tactical state without disrupting the trunk's pre-trained pathway. The identity-init means a legacy pre-FiLM ckpt loaded into the new module behaves bit-identically to its trained behavior; because `α` starts non-zero, the new conditioner is trainable from the first backward pass.
 
 ### Loss & metrics
 
 ```python
-loss = BCE-with-logits(pair_logits, pair_labels, pos_weight=600, reduction='none')
-loss = (loss * pair_valid).sum() / pair_valid.sum()
+# pair_logits — per-cell BCE
+loss_pair = BCE-with-logits(pair_logits, pair_labels, pos_weight=600, reduction='none')
+loss_pair = (loss_pair * pair_valid).sum() / pair_valid.sum()
+
+# pair_frac — MSE on sigmoid vs fraction of source ships (positive cells only)
+source_ships = expm1(planet_features[:, -1, :, f006] * SHIPS_LOG_MAX)  # f006 = ships log
+target_frac = pair_ships / source_ships.clamp(min=1).unsqueeze(-1)
+loss_frac = ((sigmoid(pair_frac) - target_frac) ** 2 * pos_mask).sum() / pos_mask.sum()
+
+total = loss_pair + loss_frac
 ```
 
-`pos_weight=600` counters the ~0.16% positive cell rate (observed `n_neg / n_pos ≈ 600` on the Orbital Occle cache). **Many-to-one supported natively**: BCE-per-cell handles coalition launches (one target, multiple sources) without information loss.
+`pos_weight=600` counters the ~0.16% positive cell rate (observed `n_neg / n_pos ≈ 600` on the bow+Ebi cache). **Many-to-one supported natively**: BCE-per-cell handles coalition launches (one target, multiple sources) without information loss.
 
 Per-epoch eval prints:
-- `loss`, `recall_true` (per-cell), `recall_false` (per-cell)
-- `recall_at_{1,5,10}` (per snapshot — does any true pair fall in the top-k?)
+- `pair_logits.loss`, `recall_true` (per-cell), `recall_false` (per-cell)
+- `recall_at_{1,5,10}` (per snapshot — does any true pair fall in the top-k of the flat P² grid?)
+- `row_recall_at_{1,5,10}` (per row — does any true target for this source fall in its top-k?)
+- `pair_frac.loss` — MSE on positive cells
 - `n_pos`, `n_neg`, `pos_frac`
 
 ## Code layout
@@ -269,7 +297,7 @@ python scripts/build_pair_dataset_orbital_occle.py
 
 # 5. Run the PairHead pretrain
 python -m agents.transformer_v2.pretrain.entity_encoder \
-    --d-model 256 --batch-size 32 --epochs 30 --lr 1e-4 \
+    --d-model 256 --batch-size 16 --epochs 30 --lr 1e-4 \
     --pair-pos-weight 600.0 --device mps
 ```
 
@@ -316,6 +344,6 @@ actions that the launcher silently drops.
 ## Memory & runtime notes
 
 - **Cache size:** 3.8 GB single-file `.pt`. Loads in ~3 min on first access (one-time cost; subsequent epochs reuse the in-memory snapshots).
-- **Per-batch memory:** the PairHead's `(B, P, P, 6·d_pair)` intermediate is 32·64·64·768·4 B ≈ 400 MB at fp32. Halve batch size on Colab GPUs without much headroom.
+- **Per-batch memory:** with `d_pair=256`, PairHead's `(B, P, P, 6·d_pair)` feature tensor is `B·64·64·1536·4` bytes: ≈805 MB at `B=32` fp32 before backward. FiLM adds pairwise conditioner/output activations (`2d+type_emb=544`, then `2·hidden=512`). Use `BATCH_SIZE=16` as the safe Colab default; increase only after checking peak memory.
 - **Per-epoch time:** ~3-4 min/epoch on MPS (M2/M3, batch=32), ~30 s/epoch on a Colab T4.
 - **T=6 cost:** ~1.5-2× the L1 cross-attn FLOPs vs single-frame, plus ~6× the L2 sequence length. Worth it for the temporal context on fleet movement.
