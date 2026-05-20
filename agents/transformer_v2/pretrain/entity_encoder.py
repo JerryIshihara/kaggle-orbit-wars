@@ -748,6 +748,8 @@ class EntityPretrainModel(nn.Module):
         dropout: float = 0.0,
         n_steps: int = 1,
         d_pair: int | None = None,
+        conditioner_n_layers: int = 1,
+        head_n_layers: int = 1,
     ):
         super().__init__()
         self.d_model = d_model
@@ -764,6 +766,17 @@ class EntityPretrainModel(nn.Module):
         # (no down-projection). Pass an explicit smaller value to reproduce
         # the legacy 128-wide layout for ablation.
         self.d_pair = int(d_pair) if d_pair is not None else int(d_model)
+        # ``conditioner_n_layers`` = number of hidden layers in the FiLM
+        # conditioner MLP. Default 1 reproduces the original 2-Linear
+        # (Linear→GELU→Linear) layout; pass 2-3 when training only the head
+        # to give the conditioner more capacity (perception is frozen, so
+        # the trunk+FiLM is now the only adaptation surface).
+        self.conditioner_n_layers = int(conditioner_n_layers)
+        # ``head_n_layers`` = depth of each per-head decoder MLP.
+        # Default 1 reproduces the original single Linear(trunk_h → 1);
+        # 2-3 turns each head into a small MLP, useful when training only
+        # the head side of the model.
+        self.head_n_layers = int(head_n_layers)
         self.entity = PlanetEntityEncoder(
             d_model=d_model, n_heads=self.entity_n_heads,
         )
@@ -808,8 +821,40 @@ class EntityPretrainModel(nn.Module):
             d_model=d_model,
             d_pair=self.d_pair,       # default = d_model (full-width, no down-projection)
             trunk_hidden=d_model,
+            conditioner_n_layers=self.conditioner_n_layers,
+            head_n_layers=self.head_n_layers,
             dropout=dropout,
         )
+
+    # ------------------------------------------------------------------ #
+    # Freeze / unfreeze helpers                                          #
+    # ------------------------------------------------------------------ #
+    def freeze_perception(self) -> dict[str, int]:
+        """Freeze L1–L4 perception so only the PairHead trains.
+
+        L0 specialists are already frozen by ``_load_encoders`` (they live
+        outside the EntityPretrainModel). This zeros out the parameter
+        budget for the entity / cross / dual_role / joint_role submodules.
+        Returns ``{layer: param_count_frozen}`` for the build log.
+
+        Caller convention: invoke right after model construction, before
+        the optimizer is built, so only PairHead params end up in
+        ``model.parameters()`` for the optimizer to update.
+        """
+        frozen = {}
+        for name, module in (
+            ("L1_entity", self.entity),
+            ("L2_cross", self.cross),
+            ("L3_dual_role", self.dual_role),
+            ("L4_joint_role", self.joint_role),
+        ):
+            count = 0
+            for p in module.parameters():
+                if p.requires_grad:
+                    p.requires_grad_(False)
+                    count += p.numel()
+            frozen[name] = count
+        return frozen
 
     def forward(
         self,
@@ -1560,6 +1605,10 @@ def train(
     cross_n_heads: int = 8,
     cross_n_layers: int = 2,
     dual_n_heads: int = 8,
+    conditioner_n_layers: int = 1,
+    head_n_layers: int = 1,
+    freeze_perception: bool = False,
+    init_from_entity_ckpt: Path | None = None,
     batch_size: int = 16,
     epochs: int = 30,
     lr: float = 5e-5,
@@ -1572,8 +1621,8 @@ def train(
     seed: int = 0,
     pair_cache_path: Path = DATASETS_ROOT / "_pair_cache" / "bowwowforeach_Ebi_T6" / "bowwowforeach_Ebi_T6_p64_f1024_all.pt",
     pair_pos_weight: float = 600.0,
-    source_act_pos_weight: float = 100.0,
-    target_aim_pos_weight: float = 100.0,
+    source_act_pos_weight: float = 1.0,
+    target_aim_pos_weight: float = 1.0,
     glob_act_pos_weight: float = 1.0,
     val_frac: float = 0.10,
     test_frac: float = 0.10,
@@ -1746,17 +1795,76 @@ def train(
         cross_n_heads=cross_n_heads,
         cross_n_layers=cross_n_layers,
         dual_n_heads=dual_n_heads,
+        conditioner_n_layers=conditioner_n_layers,
+        head_n_layers=head_n_layers,
     ).to(device)
     print(
         f"  entity model params: "
         f"{sum(p.numel() for p in model.parameters()):,}  "
         f"(n_steps={n_steps}, d_pair={effective_d_pair}, "
         f"heads: L1={entity_n_heads} L2={cross_n_heads}×{cross_n_layers}L "
-        f"L3=L4={dual_n_heads})"
+        f"L3=L4={dual_n_heads}, "
+        f"film conditioner hidden layers={conditioner_n_layers}, "
+        f"per-head MLP layers={head_n_layers})"
     )
-    opt = torch.optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=weight_decay,
+
+    # Optional warm-start from a prior entity_encoder_best.pt. Required
+    # when ``freeze_perception=True`` — otherwise we'd be freezing random
+    # init. ``strict=False`` so the depth-mismatch shim in PairHead can
+    # drop the FiLM branch when the new depth differs (or the ckpt is
+    # pre-FiLM), and the missing keys fall back to identity-init FiLM.
+    if init_from_entity_ckpt is not None:
+        init_path = Path(init_from_entity_ckpt)
+        if not init_path.exists():
+            raise FileNotFoundError(
+                f"--init-from-entity-ckpt: {init_path} does not exist"
+            )
+        print(f"[entity-pretrain] warm-start from {init_path}")
+        ckpt_init = torch.load(init_path, map_location=device, weights_only=False)
+        load_result = model.load_state_dict(ckpt_init["model"], strict=False)
+        # The PairHead shim has already deleted incompatible keys; what
+        # remains in ``missing`` is the genuinely-untouched parameters
+        # (e.g. deeper film_proj layers when growing depth).
+        missing_film = [k for k in load_result.missing_keys if "film_proj." in k or "pair_type_embed" in k]
+        missing_other = [k for k in load_result.missing_keys if k not in missing_film]
+        print(
+            f"  loaded ckpt; missing={len(load_result.missing_keys)} "
+            f"(film/pair_type: {len(missing_film)}, other: {len(missing_other)}), "
+            f"unexpected={len(load_result.unexpected_keys)}"
+        )
+        if missing_film:
+            print(f"    FiLM branch kept at identity init ({len(missing_film)} keys re-init).")
+        if missing_other and freeze_perception:
+            # Anything missing OUTSIDE film_proj/pair_type_embed when we're
+            # about to freeze perception is a real problem — we'd freeze
+            # random init for those weights.
+            print(
+                f"    WARNING: {len(missing_other)} non-FiLM keys are at random "
+                f"init AND will be frozen below. First few: {missing_other[:5]}"
+            )
+
+    if freeze_perception:
+        frozen = model.freeze_perception()
+        n_frozen = sum(frozen.values())
+        print(
+            f"[entity-pretrain] freeze_perception=True  →  L1-L4 frozen "
+            f"({n_frozen:,} params; only PairHead trains)"
+        )
+        for layer, count in frozen.items():
+            print(f"    {layer:<14s} frozen: {count:,} params")
+
+    # Only optimize parameters that still require grad. With
+    # ``freeze_perception=True`` this collapses the optimizer to the
+    # PairHead's parameters (trunk + film_proj + pair_type_embed +
+    # film_alpha + 2 output heads + 3 input projections); without it,
+    # this is equivalent to ``model.parameters()``.
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    n_trainable = sum(p.numel() for p in trainable_params)
+    print(
+        f"  optimizer sees {n_trainable:,} trainable params "
+        f"({100*n_trainable/sum(p.numel() for p in model.parameters()):.1f}% of model)"
     )
+    opt = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
 
     config = {
         "d_model": d_model, "d_pair": effective_d_pair,
@@ -1764,6 +1872,10 @@ def train(
         "cross_n_heads": cross_n_heads,
         "cross_n_layers": cross_n_layers,
         "dual_n_heads": dual_n_heads,
+        "conditioner_n_layers": conditioner_n_layers,
+        "head_n_layers": head_n_layers,
+        "freeze_perception": bool(freeze_perception),
+        "init_from_entity_ckpt": str(init_from_entity_ckpt) if init_from_entity_ckpt else None,
         "lr": lr, "weight_decay": weight_decay,
         "batch_size": batch_size, "epochs": epochs,
         "fleet_run_dir": str(fleet_run_dir),
@@ -1772,9 +1884,6 @@ def train(
         "pair_cache_path": str(pair_cache_path),
         "pair_pos_weight": pair_pos_weight,
         "pair_type_num_classes": PAIR_TYPE_NUM_CLASSES,
-        "source_act_pos_weight": source_act_pos_weight,
-        "target_aim_pos_weight": target_aim_pos_weight,
-        "glob_act_pos_weight": glob_act_pos_weight,
         "history_offsets": list(history_offsets) if history_offsets is not None else None,
         "n_steps": n_steps,
     }
@@ -1788,13 +1897,6 @@ def train(
             f"[entity-pretrain] pair-BCE pos_weight = {pair_pos_weight} "
             f"(applied to train loss; val/test loss stays unweighted)"
         )
-    print(
-        f"[entity-pretrain] head pos_weights: "
-        f"source_act={source_act_pos_weight}, "
-        f"target_aim={target_aim_pos_weight}, "
-        f"glob_act={glob_act_pos_weight}"
-    )
-
     log: list[dict[str, Any]] = []
     best_val = float("inf")
     best_path = out_dir / "entity_encoder_best.pt"
@@ -1957,6 +2059,42 @@ def main() -> None:
              "JointRoleAttention (default 8).",
     )
     parser.add_argument(
+        "--conditioner-n-layers", type=int, default=1,
+        help="Number of hidden Linear+GELU layers in the FiLM "
+             "conditioner. Default 1 keeps the original 2-Linear "
+             "(Linear→GELU→Linear) layout. Pass 2-3 when training only "
+             "the head — the conditioner becomes the main capacity sink "
+             "and benefits from extra depth.",
+    )
+    parser.add_argument(
+        "--head-n-layers", type=int, default=1,
+        help="Depth of each per-head decoder MLP (pair_logits and "
+             "pair_frac). Default 1 = single Linear(trunk_h → 1). "
+             "Pass 2-3 to make each head an MLP with (n-1) hidden "
+             "Linear+GELU layers and a final Linear → 1 projection.",
+    )
+    parser.add_argument(
+        "--freeze-perception", action="store_true",
+        help="Freeze L1-L4 (entity / cross / dual_role / joint_role) so "
+             "only the PairHead (trunk + FiLM + 2 output heads + input "
+             "projections) trains. Useful when the perception stack has "
+             "already learned good representations and only the action "
+             "head needs to adapt — e.g. when bringing in a new pair "
+             "cache or trying a deeper conditioner. **Pair with "
+             "--init-from-entity-ckpt** — otherwise you'd freeze L1-L4 "
+             "at random init.",
+    )
+    parser.add_argument(
+        "--init-from-entity-ckpt", type=Path, default=None,
+        help="Path to a prior ``entity_encoder_best.pt`` whose L1-L4 "
+             "(and optionally PairHead trunk + pair_type_embed) weights "
+             "should be loaded before training. Used with "
+             "--freeze-perception to keep the perception stack from a "
+             "good prior run while retraining a deeper FiLM head. The "
+             "FiLM branch is automatically dropped when its depth "
+             "differs from the new instantiation (kept at identity init).",
+    )
+    parser.add_argument(
         "--batch-size", type=int, default=16,
         help="Training batch size. Default 16 is conservative for "
              "d_model=d_pair=256, T=6, max_planets=64, max_fleets=1024 "
@@ -1993,19 +2131,19 @@ def main() -> None:
              "Set to 1.0 to disable.",
     )
     parser.add_argument(
-        "--source-act-pos-weight", type=float, default=100.0,
-        help="pos_weight for the per-source 'launches?' head (matches "
-             "the prior src_pos_weight default of 100).",
+        "--source-act-pos-weight", type=float, default=1.0,
+        help="Legacy no-op retained for old launch cells/scripts. "
+             "The current 2-head model has no source_act head.",
     )
     parser.add_argument(
-        "--target-aim-pos-weight", type=float, default=100.0,
-        help="pos_weight for the per-target 'is targeted?' head.",
+        "--target-aim-pos-weight", type=float, default=1.0,
+        help="Legacy no-op retained for old launch cells/scripts. "
+             "The current 2-head model has no target_aim head.",
     )
     parser.add_argument(
         "--glob-act-pos-weight", type=float, default=1.0,
-        help="pos_weight for the snapshot-level 'any action?' head. "
-             "Default 1.0 since the mixed-acted cache balances the "
-             "class. Bump if you train on acted-only.",
+        help="Legacy no-op retained for old launch cells/scripts. "
+             "The current 2-head model has no glob_act head.",
     )
     parser.add_argument(
         "--val-frac", type=float, default=0.10,
@@ -2030,6 +2168,10 @@ def main() -> None:
         cross_n_heads=args.cross_n_heads,
         cross_n_layers=args.cross_n_layers,
         dual_n_heads=args.dual_n_heads,
+        conditioner_n_layers=args.conditioner_n_layers,
+        head_n_layers=args.head_n_layers,
+        freeze_perception=args.freeze_perception,
+        init_from_entity_ckpt=args.init_from_entity_ckpt,
         batch_size=args.batch_size,
         epochs=args.epochs,
         lr=args.lr,

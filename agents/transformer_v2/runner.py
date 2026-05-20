@@ -246,6 +246,19 @@ class TransformerAgent:
         cross_n_heads = int(cfg.get("cross_n_heads", 8))
         cross_n_layers = int(cfg.get("cross_n_layers", 2))
         dual_n_heads = int(cfg["dual_n_heads"]) if "dual_n_heads" in cfg else 4
+        # FiLM conditioner depth. Pre-deepening ckpts saved no field;
+        # fall back to 1 (the original 2-Linear conditioner). The shim
+        # in PairHead._prune_legacy_state_dict will drop the film_proj
+        # weights if depth changed, so an old-depth ckpt loaded into a
+        # new-depth module degrades to identity-init FiLM rather than
+        # blowing up on key-shape mismatch.
+        conditioner_n_layers = int(cfg.get("conditioner_n_layers", 1))
+        # Per-head decoder MLP depth. Default 1 = legacy single Linear.
+        # The shim in PairHead._prune_legacy_state_dict drops the head
+        # weights if the saved depth doesn't match the new instantiation,
+        # so old single-Linear ckpts loaded into a deeper-MLP module
+        # leave the heads at random init rather than mid-loading shapes.
+        head_n_layers = int(cfg.get("head_n_layers", 1))
 
         # Load L0 frozen specialists by their run dirs. _load_encoders
         # reads each ckpt's config for d_model + use_traj_branch.
@@ -262,6 +275,8 @@ class TransformerAgent:
             cross_n_heads=cross_n_heads,
             cross_n_layers=cross_n_layers,
             dual_n_heads=dual_n_heads,
+            conditioner_n_layers=conditioner_n_layers,
+            head_n_layers=head_n_layers,
         )
         # ``strict=False`` so legacy 5-head ckpts (with ``source_act_head`` /
         # ``target_aim_head`` / ``glob_act_head`` keys and no ``film_proj`` /

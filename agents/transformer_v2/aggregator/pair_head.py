@@ -109,6 +109,8 @@ class PairHead(nn.Module):
         d_pair: int | None = None,
         trunk_hidden: int = 256,
         conditioner_hidden: int = 256,
+        conditioner_n_layers: int = 1,
+        head_n_layers: int = 1,
         pair_type_num_classes: int = PAIR_TYPE_NUM_CLASSES,
         pair_type_embed_dim: int = PAIR_TYPE_EMBED_DIM,
         c_scalars: int = 0,
@@ -117,10 +119,20 @@ class PairHead(nn.Module):
         super().__init__()
         if d_pair is None:
             d_pair = d_model
+        if conditioner_n_layers < 1:
+            raise ValueError(
+                f"conditioner_n_layers must be >= 1; got {conditioner_n_layers}"
+            )
+        if head_n_layers < 1:
+            raise ValueError(
+                f"head_n_layers must be >= 1; got {head_n_layers}"
+            )
         self.d_model = d_model
         self.d_pair = d_pair
         self.trunk_hidden = trunk_hidden
         self.conditioner_hidden = conditioner_hidden
+        self.conditioner_n_layers = int(conditioner_n_layers)
+        self.head_n_layers = int(head_n_layers)
         self.pair_type_num_classes = pair_type_num_classes
         self.pair_type_embed_dim = pair_type_embed_dim
         self.c_scalars = c_scalars
@@ -145,16 +157,32 @@ class PairHead(nn.Module):
         # ---- FiLM conditioner -------------------------------------------------
         # Inputs per (s, t): L1_src ‖ L1_tgt ‖ pair_type_emb.
         # ``pair_type_emb`` is the 27-way source/target category described
-        # by ``PAIR_TYPE_NUM_CLASSES`` above.
+        # by ``PAIR_TYPE_NUM_CLASSES`` above. Depth is parametrized by
+        # ``conditioner_n_layers`` (number of hidden layers):
+        #
+        #   n=1 (default):  Linear(cond_in → H) → GELU → Linear(H → 2·trunk_h)
+        #   n=2:            …+ extra Linear(H → H) → GELU before final
+        #   n=k:            k hidden layers then final 2·trunk_h projection
+        #
+        # The final Linear is zero-init so γ=β=0 at start regardless of depth.
         self.pair_type_embed = nn.Embedding(
             pair_type_num_classes, pair_type_embed_dim,
         )
-        cond_in = 2 * d_model + pair_type_embed_dim
-        self.film_proj = nn.Sequential(
-            nn.Linear(cond_in, conditioner_hidden),
-            nn.GELU(),
-            nn.Linear(conditioner_hidden, 2 * trunk_hidden),  # γ + β
-        )
+        cond_in_dim = 2 * d_model + pair_type_embed_dim
+        film_layers: list[nn.Module] = [
+            nn.Linear(cond_in_dim, conditioner_hidden), nn.GELU(),
+        ]
+        if dropout > 0:
+            film_layers.append(nn.Dropout(dropout))
+        for _ in range(self.conditioner_n_layers - 1):
+            film_layers += [
+                nn.Linear(conditioner_hidden, conditioner_hidden), nn.GELU(),
+            ]
+            if dropout > 0:
+                film_layers.append(nn.Dropout(dropout))
+        film_layers.append(nn.Linear(conditioner_hidden, 2 * trunk_hidden))  # γ + β
+        self.film_proj = nn.Sequential(*film_layers)
+
         # Identity-init the FiLM output: final Linear weights + biases at 0
         # so γ ~ 0, β ~ 0 at the very first forward.
         nn.init.zeros_(self.film_proj[-1].weight)
@@ -169,11 +197,31 @@ class PairHead(nn.Module):
         )
 
         # ---- Two heads --------------------------------------------------------
-        self.pair_head = nn.Linear(trunk_hidden, 1)
-        self.pair_frac_head = nn.Linear(trunk_hidden, 1)
-        for h in (self.pair_head, self.pair_frac_head):
-            nn.init.zeros_(h.bias)
-            nn.init.normal_(h.weight, std=0.02)
+        # ``head_n_layers`` controls depth of each per-head decoder MLP:
+        #   n=1 (default): single Linear(trunk_hidden → 1) — backward-compat
+        #   n=k: (k-1) × [Linear(H → H) → GELU (→ Dropout)] + Linear(H → 1)
+        # The final Linear keeps the same small-std init as the n=1 path so
+        # initial pair_logits are roughly chance.
+        self.pair_head = self._build_head(trunk_hidden, head_n_layers, dropout)
+        self.pair_frac_head = self._build_head(trunk_hidden, head_n_layers, dropout)
+        for head in (self.pair_head, self.pair_frac_head):
+            final = head if isinstance(head, nn.Linear) else head[-1]
+            nn.init.zeros_(final.bias)
+            nn.init.normal_(final.weight, std=0.02)
+
+    @staticmethod
+    def _build_head(
+        hidden: int, n_layers: int, dropout: float,
+    ) -> nn.Module:
+        if n_layers == 1:
+            return nn.Linear(hidden, 1)
+        layers: list[nn.Module] = []
+        for _ in range(n_layers - 1):
+            layers += [nn.Linear(hidden, hidden), nn.GELU()]
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+        layers.append(nn.Linear(hidden, 1))
+        return nn.Sequential(*layers)
 
     def forward(
         self,
@@ -276,6 +324,15 @@ class PairHead(nn.Module):
             if any(local.startswith(p) for p in legacy_prefixes):
                 del state_dict[key]
 
+        def drop_film_branch() -> None:
+            for key in list(state_dict.keys()):
+                if (
+                    key.startswith(prefix + "film_proj.")
+                    or key == prefix + "film_alpha"
+                    or key == prefix + "pair_type_embed.weight"
+                ):
+                    del state_dict[key]
+
         # The pair-type embedding changes film_proj.0 input width
         # versus the older is_comet-bit conditioner. If that old tensor is
         # present, drop the whole FiLM branch so it reverts to identity-init
@@ -287,9 +344,7 @@ class PairHead(nn.Module):
             and tuple(state_dict[first_weight_key].shape)
             != tuple(self.film_proj[0].weight.shape)
         ):
-            for key in list(state_dict.keys()):
-                if key.startswith(prefix + "film_proj.") or key == prefix + "film_alpha":
-                    del state_dict[key]
+            drop_film_branch()
 
         emb_key = prefix + "pair_type_embed.weight"
         if (
@@ -297,7 +352,75 @@ class PairHead(nn.Module):
             and tuple(state_dict[emb_key].shape)
             != tuple(self.pair_type_embed.weight.shape)
         ):
-            del state_dict[emb_key]
+            # 18-way → 27-way keeps film_proj.0 at the same width because
+            # the embedding dim is unchanged, but the category semantics and
+            # table shape changed. Loading the old FiLM MLP with a fresh
+            # random embedding would produce arbitrary modulation, so reset
+            # the whole FiLM branch to identity-init.
+            drop_film_branch()
+
+        has_film_key = any(k.startswith(prefix + "film_proj.") for k in state_dict)
+        if has_film_key and emb_key not in state_dict:
+            # Defensive: a partially-saved FiLM ckpt without the type table
+            # is not semantically loadable.
+            drop_film_branch()
+
+        # Depth mismatch — when ``--conditioner-n-layers`` differs between
+        # the saved ckpt and the new instantiation, the film_proj Sequential
+        # has a different number of Linear sub-modules. Count the saved
+        # Linear weights vs the current module's; if they differ, drop the
+        # whole branch so PairHead initializes identity FiLM at the new
+        # depth instead of half-loading mismatched weights.
+        saved_film_layer_count = sum(
+            1 for k in state_dict
+            if k.startswith(prefix + "film_proj.") and k.endswith(".weight")
+        )
+        current_film_layer_count = sum(
+            1 for _ in self.film_proj if isinstance(_, nn.Linear)
+        )
+        if saved_film_layer_count and saved_film_layer_count != current_film_layer_count:
+            drop_film_branch()
+
+        # Head depth mismatch — the per-head decoders are nn.Linear when
+        # ``head_n_layers == 1`` and nn.Sequential otherwise. Going from
+        # n=1 (saved key ``pair_head.weight``) to n>=2 (saved keys
+        # ``pair_head.0.weight``, ``pair_head.2.weight`` … ) the saved key
+        # names don't match the current module's parameter names, so
+        # PyTorch's strict=False would leave the new Sequential at random
+        # init anyway. Strip the mismatched keys to keep the diagnostic
+        # output clean (no "unexpected" / "missing" noise for known cases).
+        for head_name in ("pair_head", "pair_frac_head"):
+            head_module = getattr(self, head_name, None)
+            if head_module is None:
+                continue
+            saved_keys = [
+                k for k in state_dict
+                if k.startswith(prefix + head_name + ".")
+                or k == prefix + head_name + ".weight"
+                or k == prefix + head_name + ".bias"
+            ]
+            if not saved_keys:
+                continue
+            saved_is_sequential = any(
+                k.startswith(prefix + head_name + ".") and k != prefix + head_name + ".weight"
+                and k != prefix + head_name + ".bias"
+                for k in saved_keys
+            )
+            current_is_sequential = isinstance(head_module, nn.Sequential)
+            if saved_is_sequential != current_is_sequential:
+                for k in saved_keys:
+                    del state_dict[k]
+                continue
+            if saved_is_sequential and current_is_sequential:
+                saved_linear_count = sum(
+                    1 for k in saved_keys if k.endswith(".weight")
+                )
+                current_linear_count = sum(
+                    1 for m in head_module if isinstance(m, nn.Linear)
+                )
+                if saved_linear_count != current_linear_count:
+                    for k in saved_keys:
+                        del state_dict[k]
 
     def _upgrade_dead_film_alpha_after_load(self, module, incompatible_keys) -> None:
         """Repair checkpoints saved with the dead ``alpha=0, γ=β=0`` init.
