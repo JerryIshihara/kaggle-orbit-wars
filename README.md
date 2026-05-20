@@ -20,7 +20,18 @@ python run.py --mode submit --agents sniper        # pack and submit to Kaggle
 
 ---
 
-## Current model: pair-score policy with 5 jointly-trained heads
+## Known issues / problem list
+
+Live punch list of observed failures and gaps. Add new items as they're found; strike (`~~done~~`) or remove once fixed. Cite a replay / seed when possible so we can re-check after a change.
+
+1. **Fleets miss the target and waste resources** — happens most often on comet targets, but also static planets near the board edge. The lead-aim estimate puts the fleet on a path that misses the moving target by more than its radius, so the fleet flies past, exits the board, and gets removed. Each miss spends the source's surplus for no return. Likely contributors: (a) `_lead_aim_comet` falls back to the comet's current position when the iterative ETA outruns the path window; (b) for fast-moving sources/targets the integer step rounding compounds; (c) the multi-target inference rule (`pair_logits > 2.0`) can fire low-confidence cells whose trajectories were never validated by `plan_launch`. Need to add a per-launch validation gate in `_target_to_moves` that hard-rejects when `plan_launch.ok=False` instead of falling back to a learned-frac launch.
+2. **Comet-borne garrisons carried out of the map** — when a comet's path runs off the board, ships sitting on that comet at expiry vanish with it. The agent doesn't pre-emptively evacuate / launch from a comet whose path is about to end, so any garrison the agent built up there (or any planet captured *via* a comet) is lost the moment the comet expires. Fix candidates: (a) feature the comet's remaining-path-length and tail-distance-to-edge in `comet_features`; (b) add an evacuation rule in the runner that forces a launch from any comet within K turns of expiry; (c) penalize stationing ships on short-lived comets at the policy / scoring level.
+3. **Agent ignores simple targets** — undefended neutrals or weakly-held enemies adjacent to the agent's own planets sometimes get no launch even though `physical_v4` would grab them every time. Suspected causes: `pair_logits > 2.0` threshold is calibrated for the average snapshot density and may suppress confident-but-not-extreme cells in low-action turns; `source_act` head isn't gating inference (it's trained but unused at runtime); the model was trained on bow+Ebi who play a tighter style than physical_v4. Could fix by lowering the threshold late-game, or by adding a "must-fire" fallback when `glob_act` is high but the threshold-filtered cells are empty (use top-K instead).
+4. **Model can't recognize blocking planets on the launch path** — the agent picks a (source, target) pair whose straight-line trajectory passes through an intervening planet (own, neutral, or enemy). The intercepting body absorbs the fleet, so the intended target is never reached and the source's ships are spent on the wrong planet. Today the runner relies on `plan_launch` *after* the model picks the pair, but the LEARNED scorer has no feature describing "is there a planet sitting on the ray from src to tgt?". The relation tokens at L1 are `[fleet_tok ‖ src_planet ‖ tgt_planet]` — they don't include third-party planets that geometrically sit between the pair. Fix candidates: (a) add a per-(s, t) geometric feature (count / nearest-distance / soonest-blocker-arrival) and feed it into PairHead via `pair_scalars`; (b) at training time, mask out or down-weight cells where `plan_launch.reason == "wrong_planet_*"` so the model learns to score them low rather than just being rejected at inference.
+5. ~~**Miss-rate calculation diverges from env's actual outcomes**~~ — fixed in `utils/logger.py:trace_launch_motion` (2026-05-20). The aggregator now consumes `trace_fleets` outcomes directly (the env's ground-truth fleet lifecycle) instead of re-simulating physics. Mapping: `captured`/`reinforced`/`annihilated` → `ok`; `destroyed_sun` → `sun`; `out_of_map` → `boundary`; `unknown` → `unknown`. Multi-target moves the env rejected (running ship pool exhausted) produce no record now (FIFO match against fleets via `(owner, launch_step, from_id)`). Verified on seed=1729 transformer_v2 vs physical_v4: analyzer reports `boundary=44, sun=11` matching env's `out_of_map=44, destroyed_sun=11` exactly. `_first_collision_for_launch` is no longer called — kept as an optional diagnostic helper. (The original symptom was 0% reported miss rate vs ~15% real — caused by cumulative orbital-rotation drift between the local simulator and the env's absolute-angle planet positions.)
+6. **Performance degrades on large maps** — agent plays competently on seeds with fewer planets (~16-24 real planets, common static-heavy generations) but stops scaling on maps with the maximum number of planet groups (~40 planets, multiple orbital rings + comet spawns). Hypotheses: (a) **training distribution skew** — bow+Ebi's 555 replays may under-represent maximal-planet seeds, so the model never learned how to spread surplus across many fronts; (b) **per-cell pair_logits calibration shifts with P** — with `pos_weight=600` BCE trained against an average of ~30 valid cells per source, the absolute logit magnitude depends on local pair density, so the `> 2.0` inference threshold may be miscalibrated when the planet count doubles (more competing targets dilute confidence); (c) **L2/L4 attention saturation** — the planet↔planet self-attention sees 40+ tokens (vs ~16-20 typical) and may not have learned to allocate attention budget across that many entities cleanly; the model was trained with `max_planets=64` padding but the *actual* P distribution in training data is skewed low; (d) **action-budget mismatch** — the multi-target threshold rule scales linearly with active source count, so a 40-planet map can issue 10+ launches/turn while bow+Ebi typically issued 2-3; the model never saw rollouts with that launch density. Investigation candidates: bucket the eval-seed panel by P and report win rate per bucket; histogram pair_logits by snapshot P at val time to confirm the calibration shift; check whether physical_v4 also degrades on large maps (if yes, it's an env-difficulty axis; if no, it's a learning gap).
+
+
 
 Active learned line lives under [`agents/transformer_v2/`](agents/transformer_v2/README.md). It's a 4-layer transformer stack on top of 3 frozen per-entity specialist encoders, capped by a shared 2-layer trunk that feeds 5 simultaneous output heads. Heuristic and legacy agents are kept in [`agents/heuristic/`](agents/heuristic/) and [`agents/archive/`](agents/archive/) respectively.
 
@@ -42,8 +53,10 @@ L3 DualRoleAttention         parallel source→target / target→source branches
                                                                                 ▼ source_aware, target_aware
 L4 JointRoleAttention        concat 2P, 1-layer self-attn, split back           (528k)
                                                                                 ▼ source_joint, target_joint
-PairHead                     2-layer shared trunk → 5 single-Linear heads       (362k)
-                              Linear(768 → 256) → GELU → Linear(256 → 256) → GELU
+PairHead                     2-layer shared trunk → 5 single-Linear heads       (658k)
+                              Linear(1536 → 256) → GELU → Linear(256 → 256) → GELU
+                              (d_pair = d_model = 256 by default — no down-projection;
+                               pass --d-pair 128 to reproduce the legacy narrowed layout)
                                                   │
         ┌───────────────────┬─────────┴─────────┬─────────────────────┬───────────────────┐
         ▼                   ▼                   ▼                     ▼                   ▼
@@ -52,7 +65,51 @@ PairHead                     2-layer shared trunk → 5 single-Linear heads     
    BCE pw=600           MSE on sigmoid       BCE pw=100          BCE pw=100           BCE pw=1
 ```
 
-**Total trainable params: ~3.13M.** Loss is the sum of all 5 head losses, each masked appropriately (`pair_valid` for the cell heads, `planet_mask` for the per-planet heads, no mask for the snapshot head).
+**Total trainable params: ~3.43M.** Loss is the sum of all 5 head losses, each masked appropriately (`pair_valid` for the cell heads, `planet_mask` for the per-planet heads, no mask for the snapshot head).
+
+### Per-layer features and pretrain tasks
+
+| Layer | Input features (per timestep) | Output | Pretrain task (standalone) | Role in joint stack |
+|---|---|---|---|---|
+| **L0 PlanetEncoder** | 18 sun-relative scalars per planet: `is_comet` flag, polar coords, radius, ships_log, owner one-hot (4 slots), production, angular_velocity | `planet_tok (P, 256)` | multi-horizon future-state regression: planet ships@t+K, owner@t+K, "is source"/"is target" labels at K∈{1, 3, 5, 10, 15, 20} | Frozen scalar encoder for **static + orbital** planets; comet slots are routed elsewhere |
+| **L0 CometPastModel** | 123 dims per comet planet = 18 scalars + 35 path slots × (dx, dy, valid) | `comet_tok (P, 256)` | path-aware analog: future ships/owner + trajectory interpolation supervision over the 35-step path window | Frozen encoder for **comet** planets only; selected via `where(is_comet, comet_tok, planet_tok)` |
+| **L0 FleetEncoder** | 24 dims per fleet: source/target planet routing one-hots, ships_log, eta_norm, owner one-hot, in-flight angle, board-edge clearances | `fleet_tok (F, 256)` | per-fleet supervision: owner-of-target-at-arrival, fleet-survives-the-trip, eta-bucket | Frozen per-fleet representation; consumed by L1 cross-attention |
+| **L1 PlanetEntityEncoder** | `entity_self (P, 256)` from L0 where-scatter + `fleet_tok (F, 256)` + relation routing (`fleet_source_idx`, `fleet_target_idx`, `fleet_mask`) | `entity_tokens (P, 256)` | not pretrained — trained jointly | Aggregates "what fleets are coming at / leaving from each planet" via relation-aware cross-attn; relation tokens are `[fleet_tok ‖ src_planet_tok ‖ tgt_planet_tok]` |
+| **L2 CrossEntityAttention** | `entity_tokens` over **T=6 timesteps** + learned CLS + additive `step_embed[t]` | `ctx_now (P, 256)` + `glob (256)` (CLS) | jointly trained | Planet↔planet self-attention with step-position awareness; CLS pools the whole snapshot |
+| **L3 DualRoleAttention** | `ctx_now + source_role` (branch A) / `ctx_now + target_role` (branch B) | `source_aware (P, 256)`, `target_aware (P, 256)` | jointly trained | Parallel cross-attn: A asks "which target does each source pick?", B asks "which sources might target each target?" |
+| **L4 JointRoleAttention** | `concat[source_aware + source_role_l4, target_aware + target_role_l4]` as a 2P-token sequence | `source_joint (P, 256)`, `target_joint (P, 256)` | jointly trained | One self-attention pass over the 2P sequence, then split halves back — lets source and target halves cross-condition on the same matchup |
+| **PairHead** | `source_joint`, `target_joint`, **`ctx_now`** (skip from L2) | 5 heads (see "What each head predicts") | jointly trained, multi-task loss sum | Broadcasts trios to (P, P), runs the shared 2-layer trunk, then 5 single-Linear heads |
+
+### Layer-to-layer signal flow
+
+| Hop | Signal carried | Shape | Mechanism / what gets dropped |
+|---|---|---|---|
+| L0 → L1 | `planet_tok`, `comet_tok`, `fleet_tok` | (P, 256) × 2 + (F, 256) | where-scatter merges planet/comet into `entity_self`; fleet path stays separate |
+| L1 → L2 | `entity_tokens` | (T, P, 256) | concat-fuse with `entity_self` enters via the concat side — soft residual through L1 |
+| L2 → L3 | `ctx_now` (only **current** step) | (P, 256) | T=6 past steps are dropped here; L2's CLS exits the stack (not used downstream) |
+| L3 → L4 | `source_aware`, `target_aware` | (P, 256) × 2 | Pre-concat into 2P-token sequence with fresh role embeddings |
+| L4 → Head | `source_joint`, `target_joint` | (P, 256) × 2 | Split halves back from the 2P self-attn output |
+| **L2 → Head (skip L3 + L4)** | **`ctx_now`** | **(P, 256)** | **Layer-skipping signal: direct `Linear(ctx_now)` into PairHead's 6-way concat — bypasses both L3 and L4** |
+
+### Layer-skipping residuals (signals that bypass layers)
+
+The standard ⊕-residuals listed in the per-layer table below stay within a single layer (around an MHA or FFN sub-block). Two **layer-skipping** signals are also load-bearing — they're concat-fed *into* downstream layers, but their effect is the same: gradient flow and feature preservation across the bypassed layers.
+
+1. **`entity_self` → L1 fuse** *(skips L1's cross-attention)*. L0's per-entity token is `concat`-fused with L1's MHA output before the 2-Linear fuse MLP. Without this, L1's pure attention output would have to re-derive each planet's identity from the cross-attention residue alone. Acts like a soft residual through L1.
+
+2. **`ctx_now` → PairHead** *(skips L3 and L4 entirely)*. L2's per-planet representation after planet↔planet self-attention is projected and concat'd into PairHead's 6-way feature stack alongside `source_joint`/`target_joint` from L4:
+
+   ```
+   L2 ─ ctx_now ──────────────────────────────────────────────►  PairHead
+              │                                                     ▲ ctx_proj
+              ▼                                                     │
+            L3 DualRoleAttention                                    │
+              │                                                     │
+              ▼                                                     │
+            L4 JointRoleAttention ──► source_joint / target_joint ──┘
+   ```
+
+   Rationale: L3 and L4 produce **role-specialized** (source-vs-target) tokens that drop some of the symmetric planet-context information L2 had. By preserving `ctx_now`, PairHead's trunk sees both views — role-aware (from L4) and role-agnostic (from L2) — when scoring pair compatibility. The 6-way concat is `[src_r, ctx_r, tgt_r, ctx_r, src_r⊙tgt_r, ctx_r⊙ctx_r]` (see `agents/transformer_v2/aggregator/pair_head.py:153–164`).
 
 ### Detailed flow with explicit residuals
 
@@ -158,16 +215,17 @@ L4 — JointRoleAttention  (concat 2P → self-attn → split)
 ═══════════════════════════════════════════════════════════════════════════════
 PairHead — shared 2-layer trunk + 5 single-Linear heads
 ═══════════════════════════════════════════════════════════════════════════════
-  Project to d_pair=128:
-    src_r = Linear(256→128)(source_joint)                (B, P, 128)
-    tgt_r = Linear(256→128)(target_joint)
-    ctx_r = Linear(256→128)(ctx_now)
+  Project to d_pair=d_model=256 (no down-projection by default; pass --d-pair 128
+  to reproduce the legacy layout):
+    src_r = Linear(256→256)(source_joint)                (B, P, 256)
+    tgt_r = Linear(256→256)(target_joint)
+    ctx_r = Linear(256→256)(ctx_now)
 
   Broadcast across (P, P):
-    pair_feat = concat[src_r, ctx_r, tgt_r, ctx_r, src_r⊙tgt_r, ctx_r⊙ctx_r]  (B,P,P,768)
+    pair_feat = concat[src_r, ctx_r, tgt_r, ctx_r, src_r⊙tgt_r, ctx_r⊙ctx_r]  (B,P,P,1536)
 
   Shared trunk (no residual — purely sequential):
-    Linear(768 → 256) → GELU → Linear(256 → 256) → GELU      ─▶ trunk (B, P, P, 256)
+    Linear(1536 → 256) → GELU → Linear(256 → 256) → GELU     ─▶ trunk (B, P, P, 256)
 
   5 heads (each Linear(256 → 1) on the trunk, no residual):
     pair_head        : trunk[s,t]                    → pair_logits  (B, P, P)

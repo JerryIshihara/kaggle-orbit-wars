@@ -136,6 +136,30 @@
   .chart-panel .chart-body { flex: 1; min-height: 0; }
   .chart-panel svg { width: 100%; height: 100%; display: block; }
   .chart-panel .empty { color: var(--muted); font-style: italic; font-size: 12px; padding: 12px; text-align: center; }
+  .launch-matrix { display: flex; gap: 12px; flex-wrap: wrap; align-content: flex-start; overflow-y: auto; padding: 2px; }
+  .launch-player { min-width: 260px; flex: 1 1 300px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; padding: 8px; }
+  .launch-player-title { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; margin-bottom: 6px; font-size: 12px; color: var(--text); }
+  .launch-player-title .meta { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .launch-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 11px; }
+  .launch-table th, .launch-table td { border: 1px solid var(--border); padding: 4px 5px; text-align: center; }
+  .launch-table th { color: var(--muted); font-weight: 600; background: #171c2d; }
+  .launch-table td.zero { color: #4d5569; }
+  .launch-table td.ok { color: var(--muted); }
+  .launch-table td.warn { color: #f0b878; background: rgba(240, 184, 120, 0.08); }
+  .launch-table td.bad { color: var(--err); background: rgba(240, 123, 123, 0.10); }
+  .launch-table .cell-main { display: block; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; color: var(--text); }
+  .launch-table .cell-sub { display: block; color: var(--muted); font-size: 10px; margin-top: 1px; }
+  /* Compact per-reason mini-heatmaps: 4 reasons side-by-side per player. */
+  .reason-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  .reason-block { background: var(--panel); border: 1px solid var(--border); border-radius: 3px; padding: 4px 6px 5px; min-width: 0; }
+  .reason-block-title { display: flex; justify-content: space-between; align-items: baseline; font-size: 10px; color: var(--muted); margin-bottom: 3px; }
+  .reason-block-title .name { color: var(--text); font-weight: 600; }
+  .reason-block-title .count { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .reason-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 9.5px; }
+  .reason-table th, .reason-table td { border: 1px solid var(--border); padding: 2px 1px; text-align: center; line-height: 1.05; }
+  .reason-table th { color: var(--muted); font-weight: 500; background: #171c2d; font-size: 9px; }
+  .reason-table td { font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--text); }
+  .reason-table td.empty-cell { color: #3b4257; }
 
   .placeholder { color: var(--muted); font-style: italic; padding: 60px 20px; text-align: center; border: 1px dashed var(--border); border-radius: 6px; }
   @media (max-width: 900px) {
@@ -249,6 +273,14 @@
               <div class="chart-title">Time-to-target distribution</div>
               <div class="chart-body" id="ttoChart"><div class="empty">no data</div></div>
             </div>
+            <div class="chart-panel">
+              <div class="chart-title">Launch misses by motion class</div>
+              <div class="chart-body" id="launchMatrix"><div class="empty">no data</div></div>
+            </div>
+            <div class="chart-panel">
+              <div class="chart-title">Launch misses by reason</div>
+              <div class="chart-body" id="launchReasonMatrix"><div class="empty">no data</div></div>
+            </div>
           </div>
         </div>
       </div>
@@ -292,6 +324,8 @@ const replayLabel = document.getElementById('replayLabel');
 const chartEl = document.getElementById('chart');
 const wasteChartEl = document.getElementById('wasteChart');
 const ttoChartEl = document.getElementById('ttoChart');
+const launchMatrixEl = document.getElementById('launchMatrix');
+const launchReasonMatrixEl = document.getElementById('launchReasonMatrix');
 const replaySpeedToggle = document.getElementById('replaySpeed');
 let replaySpeedKey = 4;  // index into renderer's speeds[] (default 333 ms/step)
 
@@ -789,6 +823,8 @@ function resetMatchUI(agentIds) {
   chartEl.innerHTML = '<div class="empty">match running...</div>';
   wasteChartEl.innerHTML = '<div class="empty">waiting for end of match...</div>';
   ttoChartEl.innerHTML = '<div class="empty">waiting for end of match...</div>';
+  launchMatrixEl.innerHTML = '<div class="empty">waiting for end of match...</div>';
+  launchReasonMatrixEl.innerHTML = '<div class="empty">waiting for end of match...</div>';
 }
 
 function scheduleChartRender(scores, agentIds) {
@@ -986,6 +1022,144 @@ function renderTtoChart(records, agentIds) {
   ttoChartEl.innerHTML = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${parts.join('')}</svg>`;
 }
 
+// ---------- Launch miss matrix: source motion class → target motion class ----------
+const MOTION_KINDS = ['static', 'orbit', 'comet'];
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[ch]));
+}
+
+function reasonSummary(byReason) {
+  if (!byReason) return '';
+  return Object.entries(byReason)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join('\n');
+}
+
+function renderLaunchMatrix(stats, agentIds) {
+  if (!launchMatrixEl) return;
+  if (!stats || Object.keys(stats).length === 0) {
+    launchMatrixEl.innerHTML = '<div class="empty">no launch data</div>';
+    return;
+  }
+  const owners = Object.keys(stats).sort((a, b) => +a - +b);
+  const blocks = owners.map(ownerKey => {
+    const owner = +ownerKey;
+    const d = stats[ownerKey] || {};
+    const total = d.total || 0;
+    const miss = d.miss || 0;
+    const rate = total ? (100 * miss / total) : 0;
+    const rows = MOTION_KINDS.map(src => {
+      const cells = MOTION_KINDS.map(tgt => {
+        const cat = `${src}->${tgt}`;
+        const c = (d.by_category || {})[cat] || {};
+        const ct = c.total || 0;
+        const cm = c.miss || 0;
+        const cr = ct ? (100 * cm / ct) : 0;
+        let cls = 'zero';
+        if (ct > 0 && cm === 0) cls = 'ok';
+        else if (cr < 10) cls = 'warn';
+        else if (ct > 0) cls = 'bad';
+        const title = `${cat}\nmisses: ${cm}/${ct} (${cr.toFixed(1)}%)` +
+          (cm ? `\n${reasonSummary(c.by_reason)}` : '');
+        return `<td class="${cls}" title="${escapeHtml(title)}">
+          <span class="cell-main">${cm}/${ct}</span>
+          <span class="cell-sub">${ct ? cr.toFixed(0) + '%' : '—'}</span>
+        </td>`;
+      }).join('');
+      return `<tr><th>${src}</th>${cells}</tr>`;
+    }).join('');
+    const label = `P${owner + 1} ${agentIds[owner] || ''}`;
+    return `<div class="launch-player">
+      <div class="launch-player-title">
+        <span><span class="swatch" style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${PLAYER_COLORS[owner] || '#7a8295'}"></span>
+          ${escapeHtml(label)}</span>
+        <span class="meta">${miss}/${total} miss · ${rate.toFixed(1)}%</span>
+      </div>
+      <table class="launch-table">
+        <thead><tr><th>from \\ to</th>${MOTION_KINDS.map(k => `<th>${k}</th>`).join('')}</tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  }).join('');
+  launchMatrixEl.innerHTML = `<div class="launch-matrix">${blocks}</div>`;
+}
+
+// ---------- Launch miss reasons matrix: one mini 3×3 per reason, per player ----------
+// The backend (utils.logger.LAUNCH_MISS_REASONS) emits the canonical order
+// below. Keep this constant in sync with the Python tuple.
+const LAUNCH_MISS_REASONS = ['wrong_planet', 'sun', 'boundary', 'no_collision'];
+const LAUNCH_REASON_LABELS = {
+  wrong_planet: 'wrong planet',
+  sun: 'sun',
+  boundary: 'out of map',
+  no_collision: 'no hit',
+};
+
+function reasonCellShade(count, maxCount) {
+  // Light → strong red as count climbs. ``maxCount`` is the player's worst
+  // cell for this reason, so heatmaps stay readable across players with
+  // very different absolute miss counts.
+  if (!count || !maxCount) return '';
+  const t = Math.max(0.18, Math.min(1.0, count / maxCount));
+  return `background: rgba(240, 123, 123, ${(0.10 + t * 0.30).toFixed(2)})`;
+}
+
+function renderLaunchReasonMatrix(stats, agentIds) {
+  if (!launchReasonMatrixEl) return;
+  if (!stats || Object.keys(stats).length === 0) {
+    launchReasonMatrixEl.innerHTML = '<div class="empty">no launch data</div>';
+    return;
+  }
+  const owners = Object.keys(stats).sort((a, b) => +a - +b);
+  const blocks = owners.map(ownerKey => {
+    const owner = +ownerKey;
+    const d = stats[ownerKey] || {};
+    const totalMiss = d.miss || 0;
+    const byReasonCat = d.by_reason_category || {};
+    const reasonBlocks = LAUNCH_MISS_REASONS.map(reason => {
+      const cellMap = byReasonCat[reason] || {};
+      const reasonTotal = Object.values(cellMap).reduce((a, b) => a + (b || 0), 0);
+      const maxCell = Object.values(cellMap).reduce((a, b) => Math.max(a, b || 0), 0);
+      const rows = MOTION_KINDS.map(src => {
+        const cells = MOTION_KINDS.map(tgt => {
+          const key = `${src}->${tgt}`;
+          const cnt = cellMap[key] || 0;
+          const cls = cnt ? '' : 'empty-cell';
+          const style = cnt ? `style="${reasonCellShade(cnt, maxCell)}"` : '';
+          const cellTxt = cnt ? cnt : '·';
+          return `<td class="${cls}" ${style} title="${escapeHtml(reason)} · ${escapeHtml(key)}: ${cnt}">${cellTxt}</td>`;
+        }).join('');
+        return `<tr><th>${src}</th>${cells}</tr>`;
+      }).join('');
+      return `<div class="reason-block">
+        <div class="reason-block-title">
+          <span class="name">${escapeHtml(LAUNCH_REASON_LABELS[reason] || reason)}</span>
+          <span class="count">${reasonTotal}</span>
+        </div>
+        <table class="reason-table">
+          <thead><tr><th></th>${MOTION_KINDS.map(k => `<th>${k}</th>`).join('')}</tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+    }).join('');
+    const label = `P${owner + 1} ${agentIds[owner] || ''}`;
+    return `<div class="launch-player">
+      <div class="launch-player-title">
+        <span><span class="swatch" style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${PLAYER_COLORS[owner] || '#7a8295'}"></span>
+          ${escapeHtml(label)}</span>
+        <span class="meta">${totalMiss} miss total</span>
+      </div>
+      <div class="reason-grid">${reasonBlocks}</div>
+    </div>`;
+  }).join('');
+  launchReasonMatrixEl.innerHTML = `<div class="launch-matrix">${blocks}</div>`;
+}
+
 runBtn.addEventListener('click', async () => {
   const chosen = slots.slice(0, nPlayers);
   runBtn.disabled = true;
@@ -1030,6 +1204,8 @@ runBtn.addEventListener('click', async () => {
           renderChart(streamedScores, streamAgents);
           renderWasteChart(msg.waste_stats, msg.agents);
           renderTtoChart(msg.fleet_records, msg.agents);
+          renderLaunchMatrix(msg.launch_motion_stats, msg.agents);
+          renderLaunchReasonMatrix(msg.launch_motion_stats, msg.agents);
           statusEl.textContent = `done · ${msg.run_id}`;
           summaryEl.innerHTML = msg.rewards.map((rw, i) => {
             const label = `P${i + 1} (${msg.agents[i]}): ${rw}`;
@@ -1058,6 +1234,7 @@ runBtn.addEventListener('click', async () => {
             agents: streamAgents,
             wasteStats: msg.waste_stats,
             fleetRecords: msg.fleet_records,
+            launchMotionStats: msg.launch_motion_stats,
           };
         }
       }
@@ -1075,6 +1252,8 @@ window.addEventListener('resize', () => {
   renderChart(lastMatch.scores, lastMatch.agents);
   renderWasteChart(lastMatch.wasteStats, lastMatch.agents);
   renderTtoChart(lastMatch.fleetRecords, lastMatch.agents);
+  renderLaunchMatrix(lastMatch.launchMotionStats, lastMatch.agents);
+  renderLaunchReasonMatrix(lastMatch.launchMotionStats, lastMatch.agents);
 });
 
 renderSlots();

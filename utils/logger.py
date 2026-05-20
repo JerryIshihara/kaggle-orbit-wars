@@ -16,6 +16,23 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from agents.physics_utils import (
+    P_ID,
+    P_OWNER,
+    P_RADIUS,
+    P_SHIPS,
+    P_X,
+    P_Y,
+    _build_comet_lookup,
+    _find_first_collision_dynamic,
+    _infer_rotation_sign_raw,
+    _is_orbiting_xy,
+    _lead_aim_comet,
+    _lead_aim_orbital,
+    _lead_aim_static,
+    find_first_collision,
+)
+
 # Sun + map constants (mirror the env's geometry).
 SUN_CX = 50.0
 SUN_CY = 50.0
@@ -44,6 +61,50 @@ class FleetRecord:
         return self.end_step - self.launch_step
 
 
+@dataclass
+class LaunchMotionRecord:
+    """One accepted replay launch classified by source/target motion kind.
+
+    Outcomes are sourced from :func:`trace_fleets` (which walks the env's
+    fleet lifecycle for each fleet that actually appeared), so the miss
+    classification matches the env's ground truth — not a re-simulation.
+    Each launch motion record corresponds to exactly one accepted fleet:
+    moves the env rejected (e.g., insufficient running ship surplus
+    after earlier multi-target launches from the same source) produce no
+    record.
+
+    For hits, ``target_planet_id`` and ``actual_hit_id`` are the planet
+    the fleet actually collided with per the env trace. For trajectory
+    misses (``reason ∈ {"sun", "boundary", "unknown"}``), ``target_planet_id``
+    is the planet inferred from the launch angle via
+    :func:`_infer_intended_target` because the raw replay only carries
+    ``[source, angle, ships]``.
+
+    ``miss`` is trajectory-level, not combat-level: it is True when the
+    env says the fleet was removed without landing on the intended planet
+    (``destroyed_sun`` → ``"sun"``, ``out_of_map`` → ``"boundary"``,
+    ``unknown`` → ``"unknown"``). A fleet that landed but was annihilated
+    in combat is NOT a trajectory miss. ``wrong_planet`` flags the case
+    where the fleet hit a planet but the lead-aim-inferred intended
+    target was a different planet (e.g., the agent aimed past a friendly
+    blocker that absorbed the fleet); inference is reliable when the
+    agent uses one of the repo's ``shoot_*`` helpers.
+    """
+
+    step: int
+    owner: int
+    from_id: int
+    target_planet_id: int | None
+    actual_hit_id: int | None
+    source_kind: str
+    target_kind: str
+    category: str
+    miss: bool
+    reason: str
+    ships: int
+    angle: float
+
+
 def _seg_hits_circle(x1, y1, x2, y2, cx, cy, r):
     dx, dy = x2 - x1, y2 - y1
     len_sq = dx * dx + dy * dy
@@ -61,7 +122,407 @@ def _crosses_sun(x1, y1, x2, y2):
 def _fleet_speed(ships):
     if ships <= 1:
         return 1.0
-    return 1.0 + 5.0 * (math.log(max(2, ships)) / math.log(1000.0)) ** 1.5
+    speed = 1.0 + 5.0 * (math.log(max(2, ships)) / math.log(1000.0)) ** 1.5
+    return min(speed, 6.0)
+
+
+_MOTION_KINDS = ("static", "orbit", "comet")
+
+
+def _wrap_abs_angle(theta: float) -> float:
+    return abs((theta + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+def _get_obs_field(obs: dict, key: str, default=None):
+    return obs.get(key, default) if isinstance(obs, dict) else getattr(obs, key, default)
+
+
+def _planet_motion_kind(planet: list | tuple, obs: dict) -> str:
+    comet_ids = set(_get_obs_field(obs, "comet_planet_ids", []) or [])
+    pid = int(planet[P_ID])
+    if pid in comet_ids:
+        return "comet"
+    angular_velocity = abs(float(_get_obs_field(obs, "angular_velocity", 0.0) or 0.0))
+    if _is_orbiting_xy(
+        float(planet[P_X]),
+        float(planet[P_Y]),
+        float(planet[P_RADIUS]),
+        angular_velocity,
+    ):
+        return "orbit"
+    return "static"
+
+
+def _state_action(state) -> list:
+    if isinstance(state, dict):
+        return state.get("action") or []
+    return getattr(state, "action", None) or []
+
+
+def _infer_intended_target(
+    source: list | tuple,
+    angle: float,
+    ships: int,
+    obs: dict,
+    owner: int,
+) -> tuple[list | tuple | None, str]:
+    """Infer intended target from a replay action's angle.
+
+    Orbit Wars actions do not contain target IDs. For diagnostics we choose
+    the planet whose motion-aware lead-aim angle best matches the emitted
+    angle. This is robust for the agents in this repo because their public
+    launch helpers all emit exactly those lead-aim angles.
+    """
+    planets = list(_get_obs_field(obs, "planets", []) or [])
+    if not planets:
+        return None, "unknown"
+
+    sx = float(source[P_X])
+    sy = float(source[P_Y])
+    sid = int(source[P_ID])
+    angular_velocity = abs(float(_get_obs_field(obs, "angular_velocity", 0.0) or 0.0))
+    initial_planets = list(_get_obs_field(obs, "initial_planets", []) or [])
+    av_sign = _infer_rotation_sign_raw(planets, initial_planets)
+    av_signed = angular_velocity * av_sign
+    comet_lookup = _build_comet_lookup(list(_get_obs_field(obs, "comets", []) or []))
+    current_step = int(_get_obs_field(obs, "step", 0) or 0)
+
+    best: tuple[float, float, list | tuple, str] | None = None
+    for planet in planets:
+        pid = int(planet[P_ID])
+        if pid == sid:
+            continue
+        kind = _planet_motion_kind(planet, obs)
+        if kind == "comet":
+            lead = _lead_aim_comet(sx, sy, planet, int(ships), comet_lookup)
+            if lead is None:
+                lead = _lead_aim_static(
+                    sx, sy, float(planet[P_X]), float(planet[P_Y]), int(ships),
+                )
+        elif kind == "orbit":
+            lead = _lead_aim_orbital(
+                sx,
+                sy,
+                float(planet[P_X]),
+                float(planet[P_Y]),
+                int(ships),
+                av_signed,
+                current_step=current_step,
+            )
+        else:
+            lead = _lead_aim_static(
+                sx, sy, float(planet[P_X]), float(planet[P_Y]), int(ships),
+            )
+        px, py, _eta = lead
+        dx = px - sx
+        dy = py - sy
+        dist = math.hypot(dx, dy)
+        if dist <= 1e-6:
+            continue
+        aim = math.atan2(dy, dx)
+        err = _wrap_abs_angle(aim - angle)
+        # Tiny penalty for friendly planets: if a friendly blocker and an
+        # enemy target sit on nearly the same ray, the enemy/non-owned target
+        # is a better proxy for "intended target". The penalty is small enough
+        # that clear reinforcements are still classified correctly.
+        friendly_penalty = 0.002 if int(planet[P_OWNER]) == int(owner) else 0.0
+        score = err + friendly_penalty
+        key = (score, dist)
+        if best is None or key < (best[0], best[1]):
+            best = (score, dist, planet, kind)
+
+    if best is None:
+        return None, "unknown"
+    return best[2], best[3]
+
+
+def _first_collision_for_launch(
+    source: list | tuple,
+    angle: float,
+    ships: int,
+    obs: dict,
+) -> dict | None:
+    planets = list(_get_obs_field(obs, "planets", []) or [])
+    angular_velocity = abs(float(_get_obs_field(obs, "angular_velocity", 0.0) or 0.0))
+    comet_lookup = _build_comet_lookup(list(_get_obs_field(obs, "comets", []) or []))
+    if angular_velocity > 0.0 or comet_lookup:
+        av_sign = _infer_rotation_sign_raw(
+            planets,
+            list(_get_obs_field(obs, "initial_planets", []) or []),
+        )
+        return _find_first_collision_dynamic(
+            float(source[P_X]),
+            float(source[P_Y]),
+            float(source[P_RADIUS]),
+            int(source[P_ID]),
+            float(angle),
+            int(ships),
+            planets,
+            angular_velocity=angular_velocity,
+            av_signed=angular_velocity * av_sign,
+            comet_lookup=comet_lookup,
+            current_step=int(_get_obs_field(obs, "step", 0) or 0),
+        )
+    return find_first_collision(
+        float(source[P_X]),
+        float(source[P_Y]),
+        float(source[P_RADIUS]),
+        int(source[P_ID]),
+        float(angle),
+        int(ships),
+        planets,
+    )
+
+
+# Mapping from ``trace_fleets`` outcomes to ``(miss, reason)`` for the
+# motion miss-rate aggregator. Combat-loss (``annihilated``) is NOT a
+# trajectory miss — the fleet reached the target planet, it just lost
+# the fight. ``still_in_flight`` is treated as "ok" (didn't have time
+# to resolve before episode end); revisit if we ever want to surface
+# stranded fleets as a separate diagnostic.
+_FLEET_OUTCOME_TO_MISS: dict[str, tuple[bool, str]] = {
+    "captured":         (False, "ok"),
+    "reinforced":       (False, "ok"),
+    "annihilated":      (False, "ok"),
+    "still_in_flight":  (False, "still_in_flight"),
+    "destroyed_sun":    (True,  "sun"),
+    "out_of_map":       (True,  "boundary"),
+    "unknown":          (True,  "unknown"),
+}
+
+
+def trace_launch_motion(env) -> list[LaunchMotionRecord]:
+    """Classify accepted replay launches into source→target motion buckets.
+
+    Buckets are the 3×3 matrix:
+      static/orbit/comet source → static/orbit/comet inferred target.
+
+    Hit/miss labels come from :func:`trace_fleets`, which walks
+    ``env.steps`` to track each fleet's true outcome — matching the env's
+    ground truth instead of re-simulating physics. Moves the env rejected
+    (no matching fleet ever appeared) are silently skipped, which fixes
+    the multi-target-per-source surplus-drain over-count: a coalition
+    launch from one source whose later moves the env dropped because the
+    source's running ship pool was exhausted won't produce phantom
+    records.
+
+    Uses only the replay/env object, not agent-specific logs, so it can
+    analyze every player slot in the same replay.
+    """
+    records: list[LaunchMotionRecord] = []
+
+    # Pre-build ground-truth fleet outcomes. Group by (owner, launch_step,
+    # from_id) and pop FIFO per group as we walk moves — coalition
+    # launches from the same source on the same turn become a queue.
+    # ``trace_fleets.launch_step`` is the first env step a fleet was
+    # observed (the step the action was applied INTO), so it matches
+    # ``env.steps[step_idx][...].action`` for action at step_idx.
+    fleet_records = trace_fleets(env)
+    fleet_queue: dict[tuple[int, int, int], list[FleetRecord]] = {}
+    for f in fleet_records:
+        key = (int(f.owner), int(f.launch_step), int(f.from_id))
+        fleet_queue.setdefault(key, []).append(f)
+    for q in fleet_queue.values():
+        q.sort(key=lambda fr: fr.fleet_id)
+
+    # Kaggle stores each action on the *resulting* step. A move listed at
+    # env.steps[t][player].action was chosen from env.steps[t-1]'s observation
+    # and then applied during the transition into t. Analyze it against
+    # that launch-time observation, not the post-move observation.
+    for step_idx, step in enumerate(env.steps):
+        if step_idx <= 0 or not step:
+            continue
+        prev_step = env.steps[step_idx - 1]
+        if not prev_step:
+            continue
+        obs = prev_step[0].observation
+        planets = list(_get_obs_field(obs, "planets", []) or [])
+        if not planets:
+            continue
+        raw_by_id = {int(p[P_ID]): p for p in planets}
+        for owner, state in enumerate(step):
+            for move in _state_action(state):
+                if not isinstance(move, (list, tuple)) or len(move) < 3:
+                    continue
+                try:
+                    from_id = int(move[0])
+                    angle = float(move[1])
+                    ships = int(move[2])
+                except (TypeError, ValueError):
+                    continue
+                if ships <= 0 or not math.isfinite(angle):
+                    continue
+                source = raw_by_id.get(from_id)
+                if source is None:
+                    continue
+                if int(source[P_OWNER]) != int(owner):
+                    continue
+
+                # Look up the corresponding fleet. Multi-target rows from
+                # the same source produce a queue keyed by (owner, step,
+                # from_id) — pop FIFO so the k-th move maps to the k-th
+                # accepted fleet. Moves the env rejected (running ship
+                # pool exhausted by earlier moves) have no matching fleet
+                # and are skipped: they never actually launched.
+                key = (int(owner), int(step_idx), int(from_id))
+                queue = fleet_queue.get(key)
+                if not queue:
+                    continue
+                fleet = queue.pop(0)
+
+                source_kind = _planet_motion_kind(source, obs)
+                outcome = fleet.outcome
+                actual_hit_id: int | None = (
+                    int(fleet.target_planet_id)
+                    if fleet.target_planet_id is not None else None
+                )
+                miss, reason = _FLEET_OUTCOME_TO_MISS.get(
+                    outcome, (True, "unknown"),
+                )
+
+                if not miss and actual_hit_id is not None:
+                    # Fleet landed on a planet. Compare against the
+                    # lead-aim-inferred intended target; if they differ,
+                    # demote to ``wrong_planet`` (the agent aimed past a
+                    # blocker that absorbed the fleet).
+                    intended, intended_kind = _infer_intended_target(
+                        source, angle, ships, obs, owner,
+                    )
+                    if (
+                        intended is not None
+                        and int(intended[P_ID]) != actual_hit_id
+                    ):
+                        target_id = int(intended[P_ID])
+                        target_kind = intended_kind
+                        miss = True
+                        reason = "wrong_planet"
+                    else:
+                        target = raw_by_id.get(actual_hit_id)
+                        target_id = actual_hit_id
+                        target_kind = (
+                            _planet_motion_kind(target, obs)
+                            if target is not None else "static"
+                        )
+                elif not miss:
+                    # ``still_in_flight`` — fleet didn't resolve by episode
+                    # end. Bucket against the lead-aim-inferred intended
+                    # so we can still attribute it to a motion class.
+                    intended, intended_kind = _infer_intended_target(
+                        source, angle, ships, obs, owner,
+                    )
+                    target_id = (
+                        int(intended[P_ID]) if intended is not None else None
+                    )
+                    target_kind = intended_kind
+                else:
+                    # Trajectory miss: sun / boundary / unknown. Infer the
+                    # intended target so the heatmap can still bucket it.
+                    intended, intended_kind = _infer_intended_target(
+                        source, angle, ships, obs, owner,
+                    )
+                    target_id = (
+                        int(intended[P_ID]) if intended is not None else None
+                    )
+                    target_kind = intended_kind
+
+                category = f"{source_kind}->{target_kind}"
+                records.append(LaunchMotionRecord(
+                    step=step_idx - 1,
+                    owner=int(owner),
+                    from_id=from_id,
+                    target_planet_id=target_id,
+                    actual_hit_id=actual_hit_id,
+                    source_kind=source_kind,
+                    target_kind=target_kind,
+                    category=category,
+                    miss=miss,
+                    reason=reason,
+                    ships=ships,
+                    angle=angle,
+                ))
+    return records
+
+
+#: Canonical miss-reason buckets surfaced in the dashboard's reason heatmap.
+#: ``trace_launch_motion`` emits exactly these strings (or ``"ok"`` on hits).
+LAUNCH_MISS_REASONS: tuple[str, ...] = (
+    "wrong_planet", "sun", "boundary", "no_collision",
+)
+
+
+def launch_motion_miss_stats(env) -> dict[int, dict]:
+    """Per-player launch miss counts by source→target motion category.
+
+    Returned shape (per player owner key):
+
+      .. code-block:: python
+
+         {
+           "total": int, "hit": int, "miss": int, "miss_rate": float,
+           # top-level by-reason aggregation across all motion categories.
+           "by_reason": {reason: int, ...},
+           # per (src→tgt) motion cell aggregations.
+           "by_category": {
+             "static->orbit": {
+               "total": int, "hit": int, "miss": int, "miss_rate": float,
+               "by_reason": {reason: int, ...},
+             },
+             ...
+           },
+           # cross-tab: reason → (src→tgt) cell counts. The dashboard's
+           # per-reason heatmap reads directly from here.
+           "by_reason_category": {
+             "wrong_planet": {"static->static": int, "static->orbit": int, ...},
+             "sun": {...}, "boundary": {...}, "no_collision": {...},
+           },
+         }
+    """
+    records = trace_launch_motion(env)
+    n_players = len(env.steps[0]) if getattr(env, "steps", None) and env.steps else 0
+    categories = [f"{s}->{t}" for s in _MOTION_KINDS for t in _MOTION_KINDS]
+
+    def _empty_player() -> dict:
+        return {
+            "total": 0,
+            "hit": 0,
+            "miss": 0,
+            "by_reason": {},
+            "by_category": {
+                cat: {"total": 0, "hit": 0, "miss": 0, "by_reason": {}}
+                for cat in categories
+            },
+            "by_reason_category": {
+                reason: {cat: 0 for cat in categories}
+                for reason in LAUNCH_MISS_REASONS
+            },
+        }
+
+    out: dict[int, dict] = {owner: _empty_player() for owner in range(n_players)}
+
+    for r in records:
+        d = out.setdefault(r.owner, _empty_player())
+        d["total"] += 1
+        d["miss" if r.miss else "hit"] += 1
+        if r.category not in d["by_category"]:
+            d["by_category"][r.category] = {
+                "total": 0, "hit": 0, "miss": 0, "by_reason": {},
+            }
+        c = d["by_category"][r.category]
+        c["total"] += 1
+        c["miss" if r.miss else "hit"] += 1
+        if r.miss:
+            c["by_reason"][r.reason] = c["by_reason"].get(r.reason, 0) + 1
+            d["by_reason"][r.reason] = d["by_reason"].get(r.reason, 0) + 1
+            rc = d["by_reason_category"].setdefault(
+                r.reason, {cat: 0 for cat in categories},
+            )
+            rc[r.category] = rc.get(r.category, 0) + 1
+
+    for d in out.values():
+        d["miss_rate"] = d["miss"] / d["total"] if d["total"] else 0.0
+        for c in d["by_category"].values():
+            c["miss_rate"] = c["miss"] / c["total"] if c["total"] else 0.0
+    return out
 
 
 def trace_fleets(env) -> list[FleetRecord]:

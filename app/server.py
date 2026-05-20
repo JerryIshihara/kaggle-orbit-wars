@@ -26,6 +26,7 @@ from utils import (
     record_match,
     run_match,
     save_replay,
+    launch_motion_miss_stats,
     time_to_target,
     trace_fleets,
     waste_ratio,
@@ -474,6 +475,7 @@ async def play(req: PlayRequest):
         # Per-player fleet diagnostics — fed to the waste + tto charts.
         ws = waste_ratio(result.env)
         ts = time_to_target(result.env)
+        launch_motion_stats = launch_motion_miss_stats(result.env)
         # Compact per-fleet records (owner, travel_time, outcome) for histograms.
         records = [
             {"owner": r.owner, "tt": r.travel_time,
@@ -491,6 +493,9 @@ async def play(req: PlayRequest):
                 "waste_stats": {str(k): v for k, v in ws.items()},
                 "tto_stats": {str(k): v for k, v in ts.items()},
                 "fleet_records": records,
+                "launch_motion_stats": {
+                    str(k): v for k, v in launch_motion_stats.items()
+                },
             }
         ) + "\n"
 
