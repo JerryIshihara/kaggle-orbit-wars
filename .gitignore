@@ -69,6 +69,10 @@ data/colab_bundle/
 # Regenerable via the pretrain scripts under agents/transformer_v1/pretrain/.
 data/runs/
 
+# Kaggle submission tarballs + staged bundle dirs (produced by
+# scripts/pack_transformer_v2_for_kaggle.py; ~30 MB each, regenerable).
+submissions/
+
 # stray scratch files (jupyter "Untitled", etc.)
 Untitled
 
