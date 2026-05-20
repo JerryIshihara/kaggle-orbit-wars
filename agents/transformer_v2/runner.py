@@ -655,6 +655,50 @@ def transformer_v2_agent(obs):
     return _AGENT_SINGLETON.act(obs)
 
 
+# Frozen baseline checkpoint. Pinned to the best d=256 / 8-head /
+# 5-head-PairHead run trained on the bow+Ebi cache; row R@1 = 0.4165,
+# row R@5 = 0.7445, pair_logits BCE = 0.0506 on the held-out split.
+# When a fresh run lands under ``data/runs/entity/<new-TS>/`` the
+# default ckpt resolver picks it up (newest mtime wins), but this
+# constant + the ``transformer_v2_baseline`` registration below keep
+# the prior agent loadable for head-to-head matches.
+BASELINE_CKPT = (
+    _REPO_ROOT / "data" / "runs" / "entity"
+    / "bowEbi_pair5head_d256_h8_lr5e-05_b128_30ep_20260520-095412"
+    / "entity_encoder_best.pt"
+)
+
+_BASELINE_SINGLETON: TransformerAgent | None = None
+
+
+def transformer_v2_baseline_agent(obs):
+    """Frozen-baseline counterpart of ``transformer_v2``.
+
+    Always loads from :data:`BASELINE_CKPT` (the May-20 8-head ckpt)
+    regardless of what other runs land under ``data/runs/entity/``.
+    Use this to A/B the live ``transformer_v2`` against a known-good
+    baseline after a retrain — e.g.::
+
+        python run.py --mode play --agents transformer_v2 transformer_v2_baseline
+
+    The constant lives in :mod:`agents.transformer_v2.runner` so the
+    same loader path (and therefore the same legacy-ckpt compat shim)
+    is used for both ids.
+    """
+    global _BASELINE_SINGLETON
+    if _BASELINE_SINGLETON is None:
+        if not BASELINE_CKPT.exists():
+            raise FileNotFoundError(
+                f"transformer_v2_baseline ckpt missing at {BASELINE_CKPT}. "
+                "Pull it from "
+                "gs://orbit-wars-shipping/entity/runs/"
+                "bowEbi_pair5head_d256_h8_lr5e-05_b128_30ep_20260520-095412/"
+                "entity_encoder_best.pt"
+            )
+        _BASELINE_SINGLETON = TransformerAgent.load(ckpt_path=BASELINE_CKPT)
+    return _BASELINE_SINGLETON.act(obs)
+
+
 # Idempotent registration: ``python -m agents.transformer_v2.runner``
 # imports this module twice (once via the package import chain, once
 # as ``__main__``). A bare ``@register`` would raise on the second pass.
@@ -666,6 +710,14 @@ if "transformer_v2" not in _registry._REGISTRY:
         "v2 entity-pretrain PairHead policy: L0 specialists + L1-L4 + 2-head "
         "FiLM PairHead, thresholded pair-score cells + pair_frac sizing.",
     )(transformer_v2_agent)
+
+if "transformer_v2_baseline" not in _registry._REGISTRY:
+    _registry.register(
+        "transformer_v2_baseline",
+        "Frozen May-20 8-head d=256 5-head-PairHead baseline (bow+Ebi cache, "
+        "epoch 29). Use for A/B against the live transformer_v2 after a "
+        "retrain. ckpt: bowEbi_pair5head_d256_h8_lr5e-05_b128_30ep_20260520-095412.",
+    )(transformer_v2_baseline_agent)
 
 
 def main() -> None:
