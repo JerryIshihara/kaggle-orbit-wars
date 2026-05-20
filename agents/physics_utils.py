@@ -106,7 +106,13 @@ def fleet_speed(ships: int) -> float:
     """Speed (units/turn) for a fleet of `ships` — same formula as v1/v2/v3/v4."""
     if ships <= 1:
         return 1.0
-    return 1.0 + (MAX_SPEED - 1.0) * (math.log(ships) / SPEED_LOG_DENOM) ** 1.5
+    # Env parity: orbit_wars.py clamps the logarithmic speed curve at
+    # configuration.shipSpeed (6.0 by default). Without this cap, large
+    # launches (>1000 ships) are aim-predicted as faster than the env will
+    # actually move them, so moving-target lead aim can fall behind the target
+    # and the fleet may later sail out of bounds.
+    speed = 1.0 + (MAX_SPEED - 1.0) * (math.log(ships) / SPEED_LOG_DENOM) ** 1.5
+    return min(speed, MAX_SPEED)
 
 
 def crosses_sun(x1: float, y1: float, x2: float, y2: float) -> bool:

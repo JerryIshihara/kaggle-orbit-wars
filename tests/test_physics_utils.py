@@ -21,6 +21,12 @@ pu = _load_physics_utils()
 
 
 class PhysicsUtilsCollisionOrderTest(unittest.TestCase):
+    def test_fleet_speed_caps_at_env_ship_speed(self) -> None:
+        # The env applies min(speed, shipSpeed). Large launches must not
+        # lead-aim as if they move faster than the simulator permits.
+        self.assertEqual(pu.fleet_speed(1000), pu.MAX_SPEED)
+        self.assertEqual(pu.fleet_speed(10_000), pu.MAX_SPEED)
+
     def test_static_collision_checks_sun_before_planet(self) -> None:
         source = [0, 0, 50.0, 39.0, 1.0, 100, 0]
         target = [1, -1, 50.0, 44.0, 1.0, 0, 0]

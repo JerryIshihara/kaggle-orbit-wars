@@ -298,6 +298,21 @@ from utils.eval_seeds import SEEDS, BY_ARCHETYPE, SEEDS_QUICK
 
 `SEEDS_QUICK` (32 seeds) covers all 32 game-shape archetypes once; the full 128-seed `SEEDS` gives 4× per cell. Always play **both seats** per seed and aggregate **per archetype** — a net winrate gain can hide a regression on a specific board class. See `docs/EVAL_SEEDS.md` for the full methodology.
 
+## PPO roadmap
+
+`agents/transformer_v2/ppo.py` is currently a stub; PPO should be reintroduced
+only after the supervised PairHead runtime policy is stable. The two-machine
+CPU rollout/learner protocol is documented in:
+
+```text
+docs/PPO_TWO_CPU_PROTOCOL.md
+```
+
+Key constraint from that protocol: keep rollouts synchronous and strictly
+on-policy at first, use `plan_launch` as the environment projection gate, and
+track launch-miss matrices during eval so PPO does not learn unsafe semantic
+actions that the launcher silently drops.
+
 ## Memory & runtime notes
 
 - **Cache size:** 3.8 GB single-file `.pt`. Loads in ~3 min on first access (one-time cost; subsequent epochs reuse the in-memory snapshots).

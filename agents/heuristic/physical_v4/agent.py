@@ -95,7 +95,8 @@ def phase_of(step: int) -> str:
 def fleet_speed(ships: int) -> float:
     if ships <= 1:
         return 1.0
-    return 1.0 + (MAX_SPEED - 1.0) * (math.log(ships) / SPEED_LOG_DENOM) ** 1.5
+    speed = 1.0 + (MAX_SPEED - 1.0) * (math.log(ships) / SPEED_LOG_DENOM) ** 1.5
+    return min(speed, MAX_SPEED)
 
 
 def _dist_from_sun(x: float, y: float) -> float:
