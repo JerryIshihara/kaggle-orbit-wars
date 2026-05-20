@@ -49,7 +49,7 @@ class JointRoleAttention(nn.Module):
         self,
         d_model: int = 256,
         *,
-        n_heads: int = 4,
+        n_heads: int = 8,
         n_layers: int = 1,
         ff_mult: int = 2,
         dropout: float = 0.0,

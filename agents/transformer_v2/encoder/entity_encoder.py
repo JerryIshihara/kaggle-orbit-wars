@@ -157,7 +157,7 @@ class PlanetEntityEncoder(nn.Module):
         self,
         d_model: int = 256,
         *,
-        n_heads: int = 4,
+        n_heads: int = 8,
         dropout: float = 0.0,
         # Accepted-but-unused constructor kwargs from the dense-fusion
         # design; kept so existing call sites like ``PlanetEntityEncoder(

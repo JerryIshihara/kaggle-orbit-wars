@@ -159,20 +159,43 @@ def _mlp(in_dim: int, out_dim: int, *, n_hidden: int, hidden: int) -> nn.Sequent
     return nn.Sequential(*layers)
 
 
-class CometPastModel(nn.Module):
-    def __init__(
-        self,
-        d_model: int = 128,
-        multi_task: bool = True,
-        input_dim: int = INPUT_DIM,
-    ):
+class CometEncoder(nn.Module):
+    """The shared comet encoder: ``(B, input_dim) → (B, d_model)`` token.
+
+    This is the SINGLE class used both inside :class:`CometPastModel`
+    during L0 pretrain and as a standalone L0 encoder downstream (the
+    entity-pretrain stack and the runtime agent both consume it). The
+    body is a 3-Linear MLP (2 × Linear+GELU + final Linear) followed
+    by LayerNorm — pure scalar feature → token, no trajectory head.
+    """
+
+    def __init__(self, d_model: int = 128, input_dim: int = INPUT_DIM):
         super().__init__()
-        self.input_dim = input_dim
+        self.d_model = int(d_model)
+        self.input_dim = int(input_dim)
         # 3-Linear MLP: 2 (Linear→GELU) + final Linear.
         self.encoder = _mlp(input_dim, d_model, n_hidden=2, hidden=d_model)
         self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.encoder(x))
+
+
+class CometDecoder(nn.Module):
+    """Pretrain-only decoder: ``(B, d_model) → {trajectory, scalar heads}``.
+
+    Trajectory branch is a 3-Linear MLP producing the
+    30 future ``(dx, dy)`` slots. When ``multi_task=True``, six scalar
+    heads are added (categorical and regression) that mirror the planet
+    specialist's auxiliary tasks. Used only during L0 pretrain; the
+    entity-stack / agent path doesn't consume this module.
+    """
+
+    def __init__(self, d_model: int = 128, multi_task: bool = True):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.multi_task = bool(multi_task)
         self.decoder = _mlp(d_model, EXTRAP_DIM, n_hidden=2, hidden=d_model)
-        self.multi_task = multi_task
         if multi_task:
             self.scalar_heads = nn.ModuleDict()
             for name, spec in SCALAR_HEADS.items():
@@ -184,13 +207,77 @@ class CometPastModel(nn.Module):
         else:
             self.scalar_heads = None
 
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        z = self.norm(self.encoder(x))
+    def forward(self, z: torch.Tensor) -> dict[str, torch.Tensor]:
         out: dict[str, torch.Tensor] = {"extrap_trajectory": self.decoder(z)}
         if self.scalar_heads is not None:
             for name, head in self.scalar_heads.items():
                 out[name] = head(z)
         return out
+
+
+def _remap_legacy_comet_state_dict(state: dict) -> dict:
+    """Map the legacy flat-layout state_dict to the composed layout.
+
+    Old layout (CometPastModel == single nn.Module with all submodules at
+    the top level):
+
+        encoder.X            decoder.X
+        norm.X               scalar_heads.NAME.X
+
+    New layout (CometPastModel == CometEncoder + CometDecoder):
+
+        encoder.encoder.X    decoder.decoder.X
+        encoder.norm.X       decoder.scalar_heads.NAME.X
+    """
+    out: dict = {}
+    for k, v in state.items():
+        if k.startswith("encoder.") or k.startswith("norm."):
+            out[f"encoder.{k}"] = v
+        elif k.startswith("decoder.") or k.startswith("scalar_heads."):
+            out[f"decoder.{k}"] = v
+        else:
+            out[k] = v
+    return out
+
+
+class CometPastModel(nn.Module):
+    """Pretrain composite: :class:`CometEncoder` → :class:`CometDecoder`.
+
+    Saved state_dict layout: ``encoder.encoder.*``, ``encoder.norm.*``,
+    ``decoder.decoder.*``, ``decoder.scalar_heads.NAME.*``.
+
+    Legacy ckpts (``encoder.*`` / ``norm.*`` / ``decoder.*`` / ``scalar_heads.*``
+    at the top level) are auto-remapped by :meth:`load_state_dict` so prior
+    ``comet_past_best.pt`` files keep loading. After this refactor, new ckpts
+    written by the pretrain script use the composed layout.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 128,
+        multi_task: bool = True,
+        input_dim: int = INPUT_DIM,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.multi_task = bool(multi_task)
+        self.encoder = CometEncoder(d_model=d_model, input_dim=input_dim)
+        self.decoder = CometDecoder(d_model=d_model, multi_task=multi_task)
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        z = self.encoder(x)
+        return self.decoder(z)
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        # Detect legacy flat layout via canonical key absence: the new layout
+        # has "encoder.encoder.0.weight", the old one has "encoder.0.weight"
+        # at the top level (no "encoder.encoder.*").
+        if (
+            "encoder.encoder.0.weight" not in state_dict
+            and "encoder.0.weight" in state_dict
+        ):
+            state_dict = _remap_legacy_comet_state_dict(state_dict)
+        return super().load_state_dict(state_dict, strict=strict)
 
 
 def _masked_mse(pred: torch.Tensor, tgt: torch.Tensor, mask: torch.Tensor,

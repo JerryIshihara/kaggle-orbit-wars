@@ -1,38 +1,44 @@
 """Pair-score scorer with a shared 2-layer trunk and 5 output heads.
 
 After the L1-L4 entity stack, this head produces five complementary
-predictions per snapshot from the same `(B, P, P, 6·d_pair)` broadcast
-tensor. The first two layers of the original PairHead scorer become a
-**shared trunk** that all heads consume; each head is a single Linear
-on top of the 256-wide trunk output.
+predictions per snapshot from the same ``(B, P, P, 6·d_pair)`` broadcast
+tensor. The first two layers of the trunk are **shared** across all 5
+heads; each head is a single ``Linear`` on top of the trunk output.
+
+``d_pair`` defaults to ``d_model`` (no down-projection): the 3 input
+projections (src / tgt / ctx) become ``Linear(d_model → d_model)`` and
+preserve the full upstream width all the way into the trunk concat.
+Pass an explicit ``d_pair < d_model`` to reproduce the original
+down-projected layout if needed for ablation.
 
 Heads (per snapshot, output shapes):
 
   * ``pair_logits   (B, P, P)``  per-cell source→target compatibility
-  * ``glob_act      (B,)``       "any action this turn?"
-  * ``source_act    (B, P)``     "does planet p launch a fleet?"
-  * ``target_aim    (B, P)``     "is planet p a target?"
   * ``pair_frac     (B, P, P)``  fraction of source's ships sent to t,
                                   in [0, 1]; supervised on positive
-                                  cells only
+                                  cells only (raw logit returned;
+                                  caller sigmoids inside the loss)
+  * ``source_act    (B, P)``     "does planet p launch a fleet?"
+  * ``target_aim    (B, P)``     "is planet p a target?"
+  * ``glob_act      (B,)``       "any action this turn?"
 
-Trunk structure (matches the spec discussed in design review):
+Trunk structure (default ``d_pair = d_model = 256``):
 
-    pair_feat  (B, P, P, 6·d_pair=768)
-       │ Linear(768 → 256), GELU
+    pair_feat  (B, P, P, 6·d_pair = 1536)
+       │ Linear(1536 → trunk_hidden), GELU
        ▼
-    h1         (B, P, P, 256)
-       │ Linear(256 → 256), GELU
+    h1         (B, P, P, trunk_hidden)
+       │ Linear(trunk_hidden → trunk_hidden), GELU
        ▼
-    trunk      (B, P, P, 256)              ←── all 5 heads consume this
+    trunk      (B, P, P, trunk_hidden)     ←── all 5 heads consume this
 
 Heads:
 
-    pair_head        : Linear(256 → 1)  on trunk[b, s, t, :]
-    pair_frac_head   : Linear(256 → 1)  on trunk[b, s, t, :], sigmoid
-    source_act_head  : Linear(256 → 1)  on mean(trunk, dim=target)
-    target_aim_head  : Linear(256 → 1)  on mean(trunk, dim=source)
-    glob_act_head    : Linear(256 → 1)  on mean(trunk, dim=(source, target))
+    pair_head        : Linear(trunk_hidden → 1)  on trunk[b, s, t, :]
+    pair_frac_head   : Linear(trunk_hidden → 1)  on trunk[b, s, t, :]
+    source_act_head  : Linear(trunk_hidden → 1)  on mean(trunk, dim=target)
+    target_aim_head  : Linear(trunk_hidden → 1)  on mean(trunk, dim=source)
+    glob_act_head    : Linear(trunk_hidden → 1)  on mean(trunk, dim=(source, target))
 
 Pooling for the per-planet / snapshot heads uses **valid-mask-aware
 mean**: pad cells contribute zero with denominator counted from
@@ -75,12 +81,18 @@ class PairHead(nn.Module):
         self,
         d_model: int = 256,
         *,
-        d_pair: int = 128,
+        d_pair: int | None = None,
         trunk_hidden: int = 256,
         c_scalars: int = 0,
         dropout: float = 0.0,
     ):
         super().__init__()
+        # ``d_pair`` defaults to d_model — no down-projection. Passing an
+        # explicit smaller value reproduces the legacy 128-wide layout for
+        # ablation. Larger-than-d_model values are also legal (the
+        # projection then upcasts).
+        if d_pair is None:
+            d_pair = d_model
         self.d_model = d_model
         self.d_pair = d_pair
         self.trunk_hidden = trunk_hidden
@@ -88,6 +100,9 @@ class PairHead(nn.Module):
 
         # Three independent projections — source, target, and ctx
         # (shared between source and target context use in the concat).
+        # When d_pair == d_model these are square (no width change), so
+        # they default-init close to identity-passthrough; the head can
+        # still learn role-specific reweightings on top.
         self.src_proj = nn.Linear(d_model, d_pair)
         self.tgt_proj = nn.Linear(d_model, d_pair)
         self.ctx_proj = nn.Linear(d_model, d_pair)

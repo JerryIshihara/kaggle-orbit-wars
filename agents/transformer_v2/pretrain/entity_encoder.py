@@ -1,7 +1,7 @@
 """Current transformer_v2 entity / pair pretraining.
 
 The active training path freezes three L0 specialist encoders
-(:class:`PlanetEncoder`, :class:`CometPastModel.encoder`, and
+(:class:`PlanetEncoder`, :class:`CometEncoder`, and
 :class:`FleetEncoder`) and trains the L1→L4 perception / role stack plus
 a single :class:`PairHead` on expert source→target pair-set labels.
 
@@ -75,12 +75,14 @@ from ..paths import (
     RUNS_ROOT,
 )
 from .comet_past_encoder import (
+    CometEncoder,
     CometPastModel,
     INPUT_DIM as COMET_INPUT_DIM,
     N_PAST as COMET_N_PAST,
     PAST_COLS as COMET_PAST_COLS,
     SCALAR_FEAT_COLS as COMET_SCALAR_COLS,
     SCALAR_FEAT_DIM as COMET_SCALAR_DIM,
+    _remap_legacy_comet_state_dict,
 )
 
 
@@ -737,17 +739,33 @@ class EntityPretrainModel(nn.Module):
         self,
         d_model: int = 128,
         *,
+        entity_n_heads: int = 8,
         cross_n_heads: int = 8,
         cross_n_layers: int = 2,
         cross_ff_mult: int = 2,
-        dual_n_heads: int = 4,
+        dual_n_heads: int = 8,
         dropout: float = 0.0,
         n_steps: int = 1,
+        d_pair: int | None = None,
     ):
         super().__init__()
         self.d_model = d_model
         self.n_steps = int(n_steps)
-        self.entity = PlanetEntityEncoder(d_model=d_model)
+        # All MHA blocks default to 8 heads (head_dim = d_model // 8 = 32 at
+        # d_model=256). ``entity_n_heads`` controls L1's planet←fleet cross-attn;
+        # ``cross_n_heads`` controls L2's self-attn; ``dual_n_heads`` controls
+        # BOTH L3 (DualRoleAttention) and L4 (JointRoleAttention).
+        self.entity_n_heads = int(entity_n_heads)
+        self.cross_n_heads = int(cross_n_heads)
+        self.cross_n_layers = int(cross_n_layers)
+        self.dual_n_heads = int(dual_n_heads)
+        # ``d_pair`` controls PairHead's projection width. Default = d_model
+        # (no down-projection). Pass an explicit smaller value to reproduce
+        # the legacy 128-wide layout for ablation.
+        self.d_pair = int(d_pair) if d_pair is not None else int(d_model)
+        self.entity = PlanetEntityEncoder(
+            d_model=d_model, n_heads=self.entity_n_heads,
+        )
         self.cross = CrossEntityAttention(
             d_model=d_model,
             n_heads=cross_n_heads,
@@ -778,8 +796,10 @@ class EntityPretrainModel(nn.Module):
 
         # Pair-score head. Consumes the L4 joint role tokens plus L2
         # ctx_now and emits a dict of 5 logits/scores from a shared
-        # trunk. Trunk: Linear(768 → 256), GELU, Linear(256 → 256),
-        # GELU. Five single-Linear heads consume the trunk:
+        # trunk. With d_pair = d_model = 256 (no down-projection), the
+        # trunk is: Linear(6·d_model = 1536 → trunk_hidden = d_model),
+        # GELU, Linear(d_model → d_model), GELU. Five single-Linear
+        # heads consume the trunk:
         #   * pair_logits  (B, P, P)  per-cell source→target launch
         #   * pair_frac    (B, P, P)  fraction-of-source ships raw
         #   * source_act   (B, P)     "this planet launches"
@@ -788,7 +808,7 @@ class EntityPretrainModel(nn.Module):
         # Per-head loss masking lives in :func:`compute_multi_loss`.
         self.pair_head = PairHead(
             d_model=d_model,
-            d_pair=128,
+            d_pair=self.d_pair,       # default = d_model (full-width, no down-projection)
             trunk_hidden=d_model,
             dropout=dropout,
         )
@@ -882,8 +902,10 @@ class EntityPretrainModel(nn.Module):
 
 
 # ---------- Loss ----------
-# Canonical 5-head ordering. Used by training, eval, and the per-epoch
-# print so each row in the table maps to the same loss recipe.
+# Canonical 5-head ordering. The diagonal (s == s) stays masked out of the
+# loss — every off-diagonal cell is an independent binary "should source s
+# launch to target t?" prediction. Multi-target rows (coalition launches)
+# fall out of the per-cell BCE naturally.
 _HEAD_NAMES: tuple[str, ...] = (
     "pair_logits", "pair_frac", "source_act", "target_aim", "glob_act",
 )
@@ -929,6 +951,10 @@ def compute_multi_loss(
 
       * ``pair_logits``   BCE vs ``batch['pair_labels']`` masked by
         ``batch['pair_valid']``; ``pos_weight=pair_pos_weight``.
+        Diagonal stays masked out (cache invariant). Multi-target rows
+        (coalition launches) are handled naturally: each off-diagonal
+        cell is independent, so the loss penalizes EVERY True cell
+        regardless of how many other True cells share the row.
       * ``pair_frac``     MSE on sigmoid(pair_frac) vs the row-normalized
         ``pair_ships`` (fraction of source's ships sent to target).
         Masked to positive cells (pair_labels & pair_valid). Skipped
@@ -1073,7 +1099,7 @@ def evaluate(
     model: EntityPretrainModel,
     fleet_enc: FleetEncoder,
     planet_enc: PlanetEncoder,
-    comet_enc: _CometEncoder,
+    comet_enc: CometEncoder,
     loader: DataLoader,
     device: str,
 ) -> dict[str, dict[str, float]]:
@@ -1408,29 +1434,6 @@ def _format_heads_table(
 _format_per_head_table = _format_heads_table
 
 
-# ---------- Frozen comet encoder wrapper ----------
-class _CometEncoder(nn.Module):
-    """Frozen wrapper around :class:`CometPastModel`'s encoder+norm path.
-
-    Produces ``(..., d_model)`` tokens from ``(..., 123)`` inputs. The
-    comet specialist's downstream multi-task heads are discarded — only
-    the representation block (``encoder → LayerNorm``) is reused. The
-    encoder body is an MLP, so it's shape-agnostic and handles a
-    ``(B, P, 123)`` input the same way it handles ``(B, 123)`` at
-    pretrain time.
-    """
-
-    def __init__(self, model: CometPastModel):
-        super().__init__()
-        self.encoder = model.encoder
-        self.norm = model.norm
-        self.d_model = int(self.norm.normalized_shape[0])
-        self.input_dim = int(model.input_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.encoder(x))
-
-
 # ---------- Train loop ----------
 def _load_encoders(
     fleet_run_dir: Path,
@@ -1439,7 +1442,7 @@ def _load_encoders(
     *,
     device: str,
     expected_d_model: int | None = None,
-) -> tuple[FleetEncoder, PlanetEncoder, _CometEncoder]:
+) -> tuple[FleetEncoder, PlanetEncoder, CometEncoder]:
     fc = torch.load(
         fleet_run_dir / "fleet_encoder_best.pt",
         map_location=device, weights_only=False,
@@ -1488,13 +1491,30 @@ def _load_encoders(
          if k.startswith("encoder.")}
     )
     ccfg = cc["config"]
-    cmodel = CometPastModel(
+    cenc = CometEncoder(
         d_model=ccfg["d_model"],
-        multi_task=ccfg.get("multi_task", True),
         input_dim=ccfg.get("input_dim", COMET_INPUT_DIM),
     )
-    cmodel.load_state_dict(cc["model"])
-    cenc = _CometEncoder(cmodel)
+    # The ckpt may carry either the new composed layout
+    # (``encoder.encoder.*`` / ``encoder.norm.*`` / ``decoder.*``) or the
+    # legacy flat one (``encoder.*`` / ``norm.*`` / ``decoder.*`` /
+    # ``scalar_heads.*``). Extract the encoder's slice for either case.
+    cstate = cc["model"]
+    if "encoder.encoder.0.weight" in cstate:
+        # New layout — keys under the top-level ``encoder.`` submodule are
+        # the encoder; strip one prefix to land on CometEncoder's keys.
+        enc_state = {
+            k[len("encoder."):]: v
+            for k, v in cstate.items() if k.startswith("encoder.")
+        }
+    else:
+        # Legacy layout — ``encoder.*`` and ``norm.*`` keys already match
+        # CometEncoder's state_dict; drop the decoder + scalar_heads keys.
+        enc_state = {
+            k: v for k, v in cstate.items()
+            if k.startswith("encoder.") or k.startswith("norm.")
+        }
+    cenc.load_state_dict(enc_state)
     fenc.to(device).eval()
     penc.to(device).eval()
     cenc.to(device).eval()
@@ -1511,6 +1531,11 @@ def train(
     planet_run_dir: Path,
     comet_run_dir: Path,
     d_model: int = 128,
+    d_pair: int | None = None,
+    entity_n_heads: int = 8,
+    cross_n_heads: int = 8,
+    cross_n_layers: int = 2,
+    dual_n_heads: int = 8,
     batch_size: int = 128,
     epochs: int = 30,
     lr: float = 5e-5,
@@ -1690,17 +1715,32 @@ def train(
 
     # ---- Build entity encoder + heads ----
     n_steps = len(history_offsets) if history_offsets is not None else 1
-    model = EntityPretrainModel(d_model=d_model, n_steps=n_steps).to(device)
+    effective_d_pair = int(d_pair) if d_pair is not None else int(d_model)
+    model = EntityPretrainModel(
+        d_model=d_model, n_steps=n_steps, d_pair=effective_d_pair,
+        entity_n_heads=entity_n_heads,
+        cross_n_heads=cross_n_heads,
+        cross_n_layers=cross_n_layers,
+        dual_n_heads=dual_n_heads,
+    ).to(device)
     print(
         f"  entity model params: "
-        f"{sum(p.numel() for p in model.parameters()):,}  (n_steps={n_steps})"
+        f"{sum(p.numel() for p in model.parameters()):,}  "
+        f"(n_steps={n_steps}, d_pair={effective_d_pair}, "
+        f"heads: L1={entity_n_heads} L2={cross_n_heads}×{cross_n_layers}L "
+        f"L3=L4={dual_n_heads})"
     )
     opt = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=weight_decay,
     )
 
     config = {
-        "d_model": d_model, "lr": lr, "weight_decay": weight_decay,
+        "d_model": d_model, "d_pair": effective_d_pair,
+        "entity_n_heads": entity_n_heads,
+        "cross_n_heads": cross_n_heads,
+        "cross_n_layers": cross_n_layers,
+        "dual_n_heads": dual_n_heads,
+        "lr": lr, "weight_decay": weight_decay,
         "batch_size": batch_size, "epochs": epochs,
         "fleet_run_dir": str(fleet_run_dir),
         "planet_run_dir": str(planet_run_dir),
@@ -1860,6 +1900,31 @@ def main() -> None:
     # ever switch back to live EntitySnapshotDataset construction.
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument(
+        "--d-pair", type=int, default=None,
+        help="PairHead projection width. None (default) keeps the full "
+             "d_model width into the trunk's 6-way concat — no "
+             "down-projection. Pass 128 to reproduce the legacy "
+             "narrowed-trunk layout for ablation.",
+    )
+    parser.add_argument(
+        "--entity-n-heads", type=int, default=8,
+        help="L1 PlanetEntityEncoder cross-attn heads (default 8 → "
+             "32-dim per head at d_model=256).",
+    )
+    parser.add_argument(
+        "--cross-n-heads", type=int, default=8,
+        help="L2 CrossEntityAttention self-attn heads per encoder layer.",
+    )
+    parser.add_argument(
+        "--cross-n-layers", type=int, default=2,
+        help="L2 CrossEntityAttention number of Pre-LN encoder layers.",
+    )
+    parser.add_argument(
+        "--dual-n-heads", type=int, default=8,
+        help="Shared head count for L3 DualRoleAttention and L4 "
+             "JointRoleAttention (default 8).",
+    )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=5e-5)
@@ -1924,6 +1989,11 @@ def main() -> None:
         planet_run_dir=args.planet_run_dir,
         comet_run_dir=args.comet_run_dir,
         d_model=args.d_model,
+        d_pair=args.d_pair,
+        entity_n_heads=args.entity_n_heads,
+        cross_n_heads=args.cross_n_heads,
+        cross_n_layers=args.cross_n_layers,
+        dual_n_heads=args.dual_n_heads,
         batch_size=args.batch_size,
         epochs=args.epochs,
         lr=args.lr,
