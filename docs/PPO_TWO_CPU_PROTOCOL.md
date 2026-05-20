@@ -248,22 +248,53 @@ If each machine has many cores, run one env process per physical core minus
 one. Avoid oversubscription; Orbit Wars is Python-heavy and too many workers
 can slow total throughput.
 
-## Opponent schedule
+## Opponent schedule — self-play only
 
 Start with 2-player games. Add 4-player only after 2P improves.
 
-Recommended opponent mixture per rollout episode:
+The supervised baseline (`transformer_v2_baseline`, the frozen May-20
+8-head ckpt) already beats `physical_v4` ~75% on the stratified 16-seed
+panel and posts row R@1 = 0.42 / row R@5 = 0.74 on the held-out split.
+Training against `physical_v4` / `sniper_v2` from here mostly burns
+rollout budget on opponents that don't provide a useful gradient.
+
+**Rollouts are 100% self-play.** The learner sees a snapshot of itself
+from a pool of frozen prior versions. This keeps the rollout signal at
+or above the current policy's level and avoids the classic PPO trap of
+collapsing to a stable point against weak external opponents.
+
+### Self-play pool
+
+Maintain a pool of frozen policy checkpoints. Each rollout episode
+samples one opponent from the pool:
 
 | Probability | Opponent |
 |---:|---|
-| 40% | `physical_v4` |
-| 20% | `sniper_v2` |
-| 20% | latest frozen PPO checkpoint from the last promoted version |
-| 10% | current self-play mirror |
-| 10% | `random_v1` or weaker heuristic for exploration sanity |
+| 50% | **latest frozen PPO checkpoint** (`policy_v(K-1).pt`) |
+| 30% | **`transformer_v2_baseline`** (frozen May-20 supervised ckpt — the lower bound; the policy must keep beating it) |
+| 20% | **uniformly sampled older PPO checkpoint** (`policy_v_i` for `i ∈ [max(0, K-N_pool), K-2]`) |
 
-Play both seats. For every sampled seed, assign learner to seat 0 or seat 1
-with equal probability. Evaluation must always run both seats.
+Pool size `N_pool = 8` is a reasonable starting point. The older-uniform
+slot exists to prevent cyclic policy chasing (NFSP / Fictitious Self-Play
+intuition): if the learner forgets how to beat a strategy from 5 iters
+ago, the pool resurfaces it.
+
+The current policy `vK` never plays itself directly — always against
+*frozen* opponents. This keeps the policy gradient on the learner side
+unbiased; opponent moves are sampled but their logprobs aren't tracked.
+
+### Seat assignment
+
+Play both seats. For every sampled seed, assign learner to seat 0 or
+seat 1 with equal probability. Evaluation must always run both seats.
+
+### Eval vs rollout — keep external opponents for the gate
+
+`physical_v4` and `sniper_v2` disappear from rollouts but remain in the
+deterministic eval gate (see "Evaluation gate" below). They're cheap
+external yardsticks: if self-play improves but `physical_v4` winrate
+drops, the policy is overfitting to the pool — block promotion and
+investigate.
 
 ## Reward design
 
@@ -425,7 +456,8 @@ Run the full 128-seed panel before considering a submission.
 | invalid launch rate rises | policy exploiting unsafe semantic actions | keep invalid penalty, add cheap physics features, do not resample |
 | winrate up but miss matrix worse | unsafe projection hiding policy errors | block promotion; inspect category matrix |
 | value loss explodes | rewards too sparse/noisy | normalize advantages, reduce dense scale, lower value LR |
-| self-play improves but heuristic eval drops | overfitting to current self | increase `physical_v4`/`sniper_v2` mixture |
+| self-play winrate up but heuristic eval drops | policy overfit to current pool; cyclic chase | raise the older-uniform pool slot from 20% → 40%; lower the latest-frozen slot accordingly; check `transformer_v2_baseline` winrate is still ≥ 50% (it's the floor) |
+| pool keeps cycling (winrate vs each pool member oscillates) | pool too small / latest-only sampling | grow `N_pool` from 8 → 16; lower the latest-frozen slot to ≤ 40% |
 | CPU rollout too slow | too much tensor storage or T=6 | start T=1, fewer evals during smoke, profile featurization |
 
 ## Minimal implementation checklist
@@ -452,19 +484,46 @@ Suggested first real run:
 
 ```text
 run_id: ppo_v2_cpu_<timestamp>
-policy init: best supervised entity_encoder PairHead checkpoint
+policy init: best supervised entity_encoder PairHead checkpoint (latest top4 ckpt)
 T: 1
 mode: 2P only
+
+rollouts: 100% self-play
+  pool init: [transformer_v2_baseline]
+  pool grows by adding each promoted PPO checkpoint, cap N_pool = 8
+  per-episode opponent sampling:
+    50% latest frozen PPO checkpoint
+    30% transformer_v2_baseline (floor)
+    20% uniform from older frozen pool members
+
 rollout per iter: 128 episodes total
 Machine A: 48 episodes + learner/eval
 Machine B: 80 episodes
+
 update epochs: 3
 minibatch: 2048
 lr heads: 1e-4
 lr trunk: frozen
-bc_coef: 0.05
-eval: every iteration on SEEDS_QUICK vs physical_v4
-full eval: every 10 iterations on 128 seeds vs physical_v4 + sniper_v2
+bc_coef: 0.05  (anchor to supervised pair cache; not reduced until floor winrate stable)
+
+eval (deterministic, every iteration):
+  - SEEDS_QUICK vs transformer_v2_baseline          (must stay > 50%)
+  - SEEDS_QUICK vs latest 3 pool members             (track pool dominance)
+  - SEEDS_QUICK vs physical_v4                       (external sanity yardstick)
+
+full eval (every 10 iterations):
+  - 128 seeds vs transformer_v2_baseline + physical_v4 + sniper_v2
+```
+
+Promotion rule (see "Evaluation gate"):
+
+```text
+Promote policy_vK only if BOTH:
+  1. winrate vs transformer_v2_baseline ≥ winrate(prev_promoted vs baseline)
+  2. invalid launch rate ≤ 1.1 × prev_promoted's rate
+
+The baseline winrate is the load-bearing signal — if PPO can't beat the
+frozen supervised checkpoint we started from, it's regressing.
 ```
 
 Do not scale to larger asynchronous rollouts until this synchronous two-machine
