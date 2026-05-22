@@ -297,6 +297,182 @@ PairHead — shared 2-layer trunk + L1-conditioned FiLM + 2 single-Linear heads
 
 The runner consumes both at inference: pair_logits chooses the (s, t) cells to fire on (currently `pair_logits > 2.0` threshold, multi-target per source), and `sigmoid(pair_frac)` sizes each launch as a fraction of the source's ships.
 
+---
+
+## Reinforcement-learning layer (PPO)
+
+PPO is added on top of the supervised model as a wrapper — not a rewrite. The
+supervised L0–PairHead stack stays as the world-perception + action backbone;
+PPO contributes the policy-gradient training loop, three new heads, and a
+discipline about which layers are allowed to move per phase. The full bring-up
+protocol lives in [`docs/PPO_TWO_CPU_PROTOCOL.md`](docs/PPO_TWO_CPU_PROTOCOL.md);
+the algorithm-level sketch lives in [`PPO_PSEUDOCODE.md`](PPO_PSEUDOCODE.md).
+This section is the design overview.
+
+### What PPO adds
+
+A `PPOActorCritic` module wraps `EntityPretrainModel`:
+
+```
+                   ┌──────────────────────────────────────────────────────────┐
+                   │ supervised stack (already trained, freeze-controlled)    │
+                   │                                                          │
+                   │   L0 specialists (frozen always)                         │
+                   │      └─ Planet / Comet / Fleet encoders                  │
+                   │   L1 PlanetEntityEncoder      ┐                          │
+                   │   L2 CrossEntityAttention     │ "world perception"       │
+                   │                                                          │
+                   │   ── post-L2 boundary ───────────────────────            │
+                   │                                                          │
+                   │   ┌─ PlayerContextLearner   (planned; identity stub OK)  │
+                   │   ├─ StrategyLearner        (planned; identity stub OK)  │
+                   │   └─ ActionLearner ≡ L3 DualRoleAttention                │
+                   │                      + L4 JointRoleAttention             │
+                   │                      + PairHead trunk + FiLM             │
+                   │                          │                               │
+                   │                          ▼                               │
+                   │             pair_logits (B, P, P)                        │
+                   │             pair_frac   (B, P, P) — used as frac_loc     │
+                   └──────────────────────┬───────────────────────────────────┘
+                                          │
+                   ┌──────────────────────┴───────────────────────────────────┐
+                   │ PPOActorCritic wrapper (NEW for PPO)                     │
+                   │                                                          │
+                   │   noop_logit    = Linear(policy_ctx → 1)                 │
+                   │   value         = Linear(policy_ctx → 1)                 │
+                   │   frac_log_std  = nn.Parameter(log(0.35))                │
+                   │                    clamped to [log(0.15), log(0.80)]     │
+                   │                                                          │
+                   │ Sampled action per learner turn:                         │
+                   │   • categorical over [NOOP, P²] via pair_logits+noop     │
+                   │   • frac ~ LogitNormal(frac_loc[s,t], exp(frac_log_std)) │
+                   │   • projected to env via physics_utils.plan_launch       │
+                   └──────────────────────────────────────────────────────────┘
+```
+
+`policy_ctx = glob + learner_ctx + strategy_ctx` if `PlayerContextLearner` and
+`StrategyLearner` are implemented; otherwise a mean-pool of `ctx_now` over
+valid planets is used as the bootstrap. Keeps the wrapper checkpoint-compatible
+with the supervised PairHead ckpt: missing PPO-only keys initialize from scratch.
+
+### Freeze schedule (three phases)
+
+PPO is brought up conservatively — heads first, world perception last. Each
+phase only starts after the previous one's eval is stable.
+
+| Phase | Trainable | Frozen | Purpose |
+|---|---|---|---|
+| **0 — Plumbing** | `noop_head`, `value_head`, `frac_log_std`, PairHead **output layers** only | L0–L2, ActionLearner (L3/L4 + PairHead trunk + FiLM) | Prove PPO logprobs, GAE, the eval gate, and the distributed loop all work without destroying the BC policy. ~1–2M trainable params. |
+| **1 — Action adaptation** | + PlayerContextLearner, + StrategyLearner, + ActionLearner (L3+L4+PairHead) | L0–L2 (world perception) | Post-perception policy adaptation. If PlayerContext/Strategy are still identity stubs, this reduces to unfreezing L3+L4+full PairHead. ~5–10M trainable. |
+| **2 — Perception** | + L2 `CrossEntityAttention`; L1 only with strong evidence | L0 specialists | Only if diagnostics show world perception is stale. L0 stays frozen — it was pretrained on per-entity multitask supervision and should not be rewritten by sparse PPO rewards. ~15–25M trainable. |
+
+The pair distribution stays compatible with the supervised PairHead: BC anchor
+loss (`bc_coef · BCE(pair_logits, expert_labels)`) is mixed in throughout PPO
+to prevent collapse, sampled from the existing `_pair_cache`.
+
+### Sampling and env projection
+
+Phase 0 uses a **single-launch categorical** action per learner turn (NOOP + P²
+pair cells), much simpler than the runtime's thresholded multi-launch behavior.
+This is bring-up plumbing — track the gap with `emitted_launch` / launch-miss
+rates and validate before submission. Phase 1+ may upgrade to per-source
+categorical, autoregressive top-K, or Bernoulli-per-pair contracts.
+
+Every sampled action is projected to the env through `physics_utils.plan_launch`.
+If `plan_launch.ok=False`, the runner emits NOOP and the rollout earns an
+invalid-launch penalty — but the **stored action and logprob are NEVER
+resampled** (resampling would desync stored logp from executed action and break
+the PPO ratio mathematically). The single-source-of-truth `frac_sample` is the
+`[1e-4, 1-1e-4]`-clamped sigmoid; the launch-side clamp `[0.02, 1.00]` is
+applied only when emitting the env action.
+
+### Self-play pool
+
+Rollouts are **100% self-play**. Opponents come only from the frozen
+**promoted** lineage plus `transformer_v2_baseline` (the supervised May-20
+ckpt — the load-bearing floor). The current learner `policy_vK` never plays
+itself; doing so would train against a moving target whose logprobs aren't
+tracked.
+
+```
+per-episode opponent sampling:
+  50%  latest promoted PPO ckpt   (baseline fallback until first promotion)
+  30%  transformer_v2_baseline    (the floor — winrate must stay near 50%)
+  20%  uniform older promoted     (prevents cyclic chasing; baseline fallback)
+```
+
+Pool cap `N_pool = 8`. Promoted only — failed iters are kept on disk for
+debug but not added to the rollout pool.
+
+### Training topology — two CPU machines
+
+There is no GPU. Two CPU machines run in parallel:
+
+```
+Machine A  (the dev box, /Users/agent/dev/kaggle-orbit-wars)
+  • owns run dir, advantages, optim state, promotion gate, archive
+  • ~50% of rollout episodes
+  • Phase 0: full training locally
+  • Phase 1+: half of each paired minibatch + applies the optimizer step
+
+Machine B  (Tailscale 100.109.180.124, same workdir path)
+  • ~50% of rollout episodes
+  • Phase 1+: half of each paired minibatch + writes grad to file (no optim step)
+  • cold storage for archived rollouts, out-of-pool checkpoints, eval JSONs
+
+Connectivity: A → B SSH works; B → A is not reachable.
+All sync is rsync over SSH, initiated from A.
+```
+
+Phase 1+ training is data-parallel via **file-mediated gradient averaging**
+(one-way SSH rules out NCCL all-reduce). Per minibatch:
+
+```
+A: forward+backward on mb_A         ┐  parallel
+B: forward+backward on mb_B → file  ┘
+A: rsync-pull grad_B; grad = (grad_A + grad_B) / 2
+A: optimizer.step(); write new weights to file
+B: rsync-pull weights; reload; proceed to mb_{M+1}
+```
+
+The BC anchor loss only lives on A's gradient (the 47 GB `_pair_cache` stays on
+A); A doubles its `bc_coef` from `0.05 → 0.10` so the averaged gradient sees
+the same effective `0.05` coefficient. CPU-perf optimizations (batched envs
+per worker, `torch.compile(mode="reduce-overhead")`, shared opponent model
+instances, eval split 16/16 between A/B) are detailed in
+[`docs/PPO_TWO_CPU_PROTOCOL.md`](docs/PPO_TWO_CPU_PROTOCOL.md) under "CPU
+performance".
+
+### Promotion gate
+
+After every PPO iteration, deterministic eval runs against three mandatory
+opponents (`previous_promoted`, `transformer_v2_baseline`, `physical_v4`) on
+SEEDS_QUICK = 32 seeds × both seats. A candidate `policy_v(K+1)` is promoted
+only if all five conditions hold:
+
+```
+1. winrate vs previous_promoted ≥ 50% with non-negative paired seed-seat score
+2. winrate vs transformer_v2_baseline ≥ previous_promoted's baseline winrate − 2pp
+3. winrate vs physical_v4 drops by ≤ 5pp
+4. invalid_launch_rate ≤ 1.1 × previous_promoted's rate
+5. no new high-severity launch-miss-matrix regression
+```
+
+Non-promoted iters still archive the checkpoint for debug but do not enter the
+self-play pool. A startup calibration eval (`baseline` self-eval) bootstraps
+the relative thresholds for iter 1 and also catches eval-harness bugs
+(baseline-vs-baseline winrate must be `0.50 ± 0.05`).
+
+### Detail references
+
+| Doc | What's in it |
+|---|---|
+| [`docs/PPO_TWO_CPU_PROTOCOL.md`](docs/PPO_TWO_CPU_PROTOCOL.md) | Full two-machine protocol: roles, connectivity, rsync recipes, CPU-perf budget, distributed grad-averaging, archive policy, policy/action contract, reward shaping, hyperparameters, freeze schedule details, BC anchor math, evaluation gate, failure-mode table, startup calibration, implementation checklist, practical first-run config |
+| [`PPO_PSEUDOCODE.md`](PPO_PSEUDOCODE.md) | Algorithm sketch: coordinator + peer drivers, batched rollout worker, action sampling + env projection, GAE, `ppo_update_local` (Phase 0) and `ppo_update_distributed` (Phase 1+), self-play pool, promotion gate, archive step, train-log field reference |
+| [`agents/transformer_v2/ppo.py`](agents/transformer_v2/ppo.py) | Currently a stub. Will be the public CLI wrapper once `ppo_learner.py`, `ppo_rollout_worker.py`, and `ppo_train_peer.py` exist |
+
+---
+
 ### Supervision pipeline
 
 Single-stage behavior cloning from raw replay JSONs with a T=6 history window on the inputs:
