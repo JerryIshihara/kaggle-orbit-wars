@@ -35,6 +35,29 @@ Use a synchronous coordinator/worker setup.
 | Machine A | learner + local rollout worker | owns run directory, publishes policy checkpoints, waits for rollout shards, performs PPO update, runs eval |
 | Machine B | rollout worker only | polls for latest policy checkpoint, collects rollout shards, uploads/writes them atomically |
 
+### Concrete machines (this project)
+
+| Role | Host | User | Workdir |
+|---|---|---|---|
+| Machine A (learner) | the dev box this repo lives on | `agent` | `/Users/agent/dev/kaggle-orbit-wars` |
+| Machine B (rollout worker) | `100.109.180.124` (Tailscale) — MacBook Air, Apple Silicon, Darwin 24.1.0 | `hirotakaishihara` | `/Users/agent/dev/kaggle-orbit-wars` |
+
+**Workdir invariant:** the repo lives at the **same absolute path** on both
+machines (`/Users/agent/dev/kaggle-orbit-wars`). All rsync source and
+destination paths are therefore identical strings — no path translation needed
+in any sync command.
+
+**Connectivity (one-way):**
+
+- A → B: SSH works (`ssh hirotakaishihara@100.109.180.124`).
+- B → A: **not reachable.** Machine B cannot initiate a connection back to A.
+- Therefore **every** rsync invocation (in either direction) must be started
+  *from Machine A* using `rsync ... B:` or `rsync ... B:... .`. Machine B
+  is strictly a passive endpoint of any transfer.
+
+This rules out a worker-push model where B uploads its own shards. The
+learner on A must pull them.
+
 Recommended run directory:
 
 ```text
@@ -55,9 +78,11 @@ data/runs/ppo/<run_id>/
   train_log.jsonl
 ```
 
-The two machines can synchronize this directory through a shared filesystem,
-`rsync`, or the existing GCS bucket workflow. The important rule is atomic
-rollout writes:
+The two machines synchronize this directory with `rsync` over SSH, always
+initiated from Machine A (see "Connectivity" above). A shared filesystem or
+GCS bucket would also work but is unnecessary given the same-path invariant.
+
+The important rule is atomic rollout writes:
 
 ```text
 write shard_000123.pt.tmp
@@ -65,7 +90,42 @@ fsync/close
 rename shard_000123.pt.tmp -> shard_000123.pt
 ```
 
-The learner must never read `*.tmp`.
+The learner must never read `*.tmp`, and rsync must never transfer them
+either — see the `--exclude '*.tmp'` flag below.
+
+### rsync commands
+
+Both directions are run on Machine A. The paths on B match A exactly because
+of the workdir invariant.
+
+```bash
+# A -> B : publish the new policy checkpoint after a PPO update
+rsync -av --partial --inplace \
+  data/runs/ppo/<run_id>/checkpoints/policy_v${K}.pt \
+  hirotakaishihara@100.109.180.124:/Users/agent/dev/kaggle-orbit-wars/data/runs/ppo/<run_id>/checkpoints/
+
+# B -> A : pull B's rollout shards for iteration K
+rsync -av --partial --inplace --exclude '*.tmp' \
+  hirotakaishihara@100.109.180.124:/Users/agent/dev/kaggle-orbit-wars/data/runs/ppo/<run_id>/rollouts/v${K}/machine_b/ \
+  data/runs/ppo/<run_id>/rollouts/v${K}/machine_b/
+
+# A -> B : refresh the self-play opponent pool (frozen older PPO ckpts + baseline)
+rsync -av --delete \
+  data/runs/ppo/<run_id>/pool/ \
+  hirotakaishihara@100.109.180.124:/Users/agent/dev/kaggle-orbit-wars/data/runs/ppo/<run_id>/pool/
+```
+
+Notes:
+
+- `--partial --inplace` lets large shard transfers resume after a transient
+  Tailscale relay hiccup without restarting from zero.
+- `--exclude '*.tmp'` is **mandatory** for any rsync that reads from a
+  rollout directory — otherwise the learner could load a half-written
+  shard whose `.tmp → final` rename hadn't happened on B yet.
+- `--delete` is only safe on the pool-publish direction (A is the source of
+  truth for which frozen checkpoints are in the pool). **Never** use
+  `--delete` when pulling rollouts from B; B may still be writing more
+  shards for the same iteration.
 
 ## Policy/action contract
 
