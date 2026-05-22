@@ -28,12 +28,29 @@ every PPO iteration.
 
 ## Machine roles
 
-Use a synchronous coordinator/worker setup.
+Use a synchronous coordinator setup where **both machines do rollouts AND
+both contribute to the PPO update**. A is the coordinator (owns the run
+directory, makes the optimizer step) and B is a peer (computes gradients on
+its half of the data and ships them to A). This is data-parallel training
+with one-way file-mediated grad sync, not classic NCCL DDP — the one-way
+SSH constraint (see "Connectivity" below) rules out symmetric all-reduce.
 
-| Machine | Role | Work |
-|---|---|---|
-| Machine A | learner + local rollout worker | owns run directory, publishes policy checkpoints, waits for rollout shards, performs PPO update, runs eval |
-| Machine B | rollout worker only | polls for latest policy checkpoint, collects rollout shards, uploads/writes them atomically |
+| Machine | Rollout | Training | Eval | Coordination |
+|---|---|---|---|---|
+| Machine A | ~50% of episodes | half of every minibatch (forward+backward, applies optimizer) | quick-eval half + full-eval | owns run dir, advantages, optim state, promotion gate, archive |
+| Machine B | ~50% of episodes | half of every minibatch (forward+backward, writes grad to file) | quick-eval half | passive — runs the worker process A drives via rsync |
+
+Why split this way:
+
+- **Rollout is the dominant CPU cost** (500 steps × N episodes × forward
+  pass on a 256-dim transformer). Splitting 50/50 doubles rollout
+  throughput, which is the biggest win.
+- **The PPO update is much cheaper** but worth distributing once the
+  trunk is unfrozen (Phase 1+). Cost of distribution = grad/weight file
+  rsync per minibatch (see "CPU performance" and "Distributed training"
+  below).
+- **Eval also splits.** Quick-eval is 32 seeds × 2 seats × 3 opponents
+  ≈ 192 episodes; halving it between A and B saves real wall-clock.
 
 ### Concrete machines (this project)
 
@@ -126,6 +143,249 @@ Notes:
   truth for which frozen checkpoints are in the pool). **Never** use
   `--delete` when pulling rollouts from B; B may still be writing more
   shards for the same iteration.
+
+## CPU performance — where the time actually goes
+
+This is a CPU-only setup. Two CPUs, no GPU. The design has to assume
+**model forward passes dominate wall-clock**, not data movement or env
+step. The recommendations below are ordered by expected impact.
+
+### Rollout (dominant cost)
+
+A single rollout episode of 500 steps requires ~500 learner forwards +
+~500 opponent forwards (alternating seats in 2P). With 128 episodes per
+iteration, that's ~128k model forwards per iter. Optimizations:
+
+1. **Batched envs per worker process.** The model `forward(...)` already
+   takes a leading batch dim `B` (verified in
+   `agents/transformer_v2/encoder/entity_encoder.py:209`). Run `N_env`
+   envs per worker process and call the policy once with a `[N_env, P, d]`
+   tensor instead of `N_env` separate `[1, P, d]` calls. This is the
+   single biggest CPU win for rollouts. Start with `N_env = 4–8` per
+   worker, tune by `episodes/sec`.
+
+2. **Worker process count = physical cores − 1.** Apple Silicon B has
+   4 performance + 4 efficiency cores. Run ~7 worker processes (one
+   reserved for the rsync/coordinator daemon). Oversubscription past
+   physical core count slows total throughput because the env step is
+   pure Python and contends for the GIL.
+
+3. **`torch.inference_mode()` + `eval()`** during rollout. Skips autograd
+   graph allocation. Mandatory, not optional.
+
+4. **`torch.compile(policy, mode="reduce-overhead")`** on the rollout
+   forward. First call costs ~30–60s of compile; amortized over 128k
+   forwards per iter the payoff is large. Verify the compiled graph
+   handles the legality mask correctly (boolean indexing is the usual
+   compile gotcha).
+
+5. **Share opponent model instances across workers.** A pool checkpoint
+   loaded once per worker process is fine; loading it per episode is
+   wasted I/O. The opponent model is also a `torch.compile` candidate
+   since it's frozen.
+
+6. **Keep T=1.** Storing T=6 fleet history per step would 6× the
+   featurization cost and the shard size. T=1 was already the v1
+   choice; do not revisit until eval shows tactical regression.
+
+7. **Featurization caching is tempting but risky.** The
+   `agents/transformer_v2/featurizer/` modules are ~3000 lines of pure
+   Python and run every step. Incremental featurization (cache prev
+   step, patch the diffs) could halve rollout time, but the bugs hide
+   for many iterations because PPO still trains, just on slightly wrong
+   features. Defer to a Phase 1+ effort after the loop is stable.
+
+### Training (secondary cost)
+
+Per-iteration PPO update on heads-only is ~1–2M trainable parameters →
+forward+backward at batch 2048 ≈ 0.5–1s on CPU. Phase 1 unfreezes
+PairHead + L4 → ~5–10M params → ~2–4s per minibatch. Either way the
+update is small relative to rollouts, but distributing it still helps
+once the trunk is unfrozen.
+
+1. **Heads-only update is cheap enough to keep on A only in Phase 0.**
+   Distribution overhead (grad rsync, weight rsync, see
+   "Distributed training") would exceed the compute saved. Move to
+   distributed only when Phase 1 is active.
+
+2. **`torch.compile(policy)`** for the train forward too. The forward
+   compiled for rollouts may be the same graph; PyTorch will reuse.
+
+3. **Minibatch size 1024–2048 on CPU, not 4096.** CPU L2/L3 cache misses
+   dominate past 2048-step minibatches; smaller minibatches with more
+   gradient steps are usually faster on CPU than fewer larger ones.
+
+4. **BC anchor minibatch sampling stays on A.** `_pair_cache` is ~47GB
+   and lives on A (see "Archive policy"). Sampling the BC minibatch
+   once per PPO step and including only its loss on A's gradient is
+   simpler than replicating the cache to B. Trade-off: BC anchor only
+   appears in A's gradient, so its effective coefficient is halved
+   relative to the policy/value loss in the averaged gradient — bump
+   `bc_coef` by 2× to compensate.
+
+### Eval
+
+Quick-eval = 32 seeds × 2 seats × 3 opponents = 192 episodes per
+iteration. That's 1.5× the rollout budget — eval can easily dominate
+if run only on A.
+
+1. **Split quick-eval 50/50 between A and B.** A runs seeds 0..15, B
+   runs seeds 16..31 (both seats). A pulls B's eval JSON via rsync,
+   merges, applies promotion gate.
+
+2. **Full-eval (128 seeds) every 5–10 iterations**, not every
+   iteration. Quick-eval is sufficient for the per-iter promotion gate.
+
+3. **Skip eval when iteration KL was negligible.** If approx_KL < 0.2 ×
+   target_KL, the policy barely changed; the eval result will be
+   nearly identical to the prior promoted checkpoint. Save the CPU.
+
+### Shard format (storage / rsync bandwidth)
+
+Two options. Pick before implementation.
+
+| Option | Shard contents | Pros | Cons |
+|---|---|---|---|
+| **A. Featurized** | `planet_features`, `comet_features`, `fleet_features`, masks, action, logprob, value, reward, done | Training is fast — just forward through the stored tensors | Large (~MB per episode); slow rsync from B; 2–4× the disk |
+| **B. Raw obs + policy outputs** | raw env obs dict, action_id, frac, logprob, value, reward, done | ~10× smaller shards, fast rsync | Training has to re-run featurization, costing ~3× CPU per epoch (×N PPO epochs) |
+
+For CPU + Tailscale, **Option B is recommended** once the loop is
+verified. Storage and rsync win exceeds the re-featurization cost when
+PPO epochs ≤ 3.
+
+## Distributed training — file-mediated gradient averaging
+
+One-way SSH (`A → B`) rules out NCCL all-reduce. Both machines instead
+sync via files: B writes grads, A pulls, averages, applies the step,
+publishes new weights, B pulls. Per minibatch.
+
+```text
+sync/v<K>/
+  epoch_<E>/
+    mb_<M>_grad_B.pt.tmp  -> mb_<M>_grad_B.pt   # written by B, pulled by A
+    mb_<M>_weights.pt.tmp -> mb_<M>_weights.pt  # written by A, pulled by B
+```
+
+One PPO minibatch step:
+
+```text
+1. A: forward + backward on mb_A     →  grad_A           (parallel with B)
+1. B: forward + backward on mb_B     →  grad_B; write to sync/.../grad_B.pt.tmp
+2. B: rename grad_B.pt.tmp -> grad_B.pt          (atomic)
+3. A: rsync pull grad_B.pt
+4. A: grad = (grad_A + grad_B) / 2
+5. A: optimizer.step(); zero_grad()
+6. A: write weights.pt.tmp -> weights.pt         (atomic, on A's local fs)
+7. A: rsync push weights.pt to B
+8. B: load new weights from disk
+9. both: proceed to minibatch M+1
+```
+
+### Sync overhead estimate
+
+| Phase | Trainable params | Grad/weight size | Sync per minibatch | × 192 mb/iter |
+|---|---:|---:|---:|---:|
+| 0 (heads only) | ~1–2 M | ~4–8 MB | ~60 ms | ~12 s/iter |
+| 1 (+ PairHead, L4) | ~5–10 M | ~20–40 MB | ~150 ms | ~30 s/iter |
+| 2 (+ L3) | ~15–25 M | ~60–100 MB | ~400 ms | ~80 s/iter |
+
+For Phase 0, this is ~10% of total iter wall-clock — not worth
+distributing. Keep A-only training in Phase 0. **Switch to
+distributed training starting Phase 1.**
+
+### Less-frequent sync (local SGD) for Phase 2
+
+If Phase 2's 80 s/iter sync overhead is intolerable, use *local SGD*:
+each machine takes K=4 optimizer steps locally, then averages weights
+(not grads) every 4 steps. Cuts sync count by 4× at the cost of mild
+divergence between A's and B's model copies. Apply only after Phase 1
+shows the distributed update converges.
+
+### Sync atomicity
+
+All grad and weight files use the same `.tmp → rename` rule as rollout
+shards. Reader (A pulling grad, B pulling weights) **must** exclude
+`*.tmp` from rsync. Loading a half-written tensor file silently produces
+garbage updates without crashing.
+
+## Archive policy
+
+Disk on A (the dev box) is the working set: source, current iter,
+recent checkpoints. **Old artifacts move to B's
+`/Users/agent/dev/kaggle-orbit-wars/archive/`** dir. B has spare disk
+(rollout-only workload, no training datasets stored long-term) and the
+same workdir path so rsync targets are trivial.
+
+### What stays hot on A
+
+| Path | Why |
+|---|---|
+| `agents/`, `app/`, `scripts/`, `tests/` etc. | working tree |
+| `data/runs/ppo/<run_id>/checkpoints/policy_v[K-N_pool+1..K+1].pt` | active self-play pool + just-trained ckpt |
+| `data/runs/ppo/<run_id>/checkpoints/policy_v0.pt`, `transformer_v2_baseline.pt` | the floor and the init — referenced forever |
+| `data/runs/ppo/<run_id>/rollouts/v[K-1..K]/` | current iter + the one needed for any K-1 debug |
+| `data/runs/ppo/<run_id>/eval/v[K-10..K].json` | recent eval history for plots |
+| `data/runs/ppo/<run_id>/train_log.jsonl` | tiny, append-only |
+| `data/runs/ppo/<run_id>/sync/v<K>/` | current iter's grad/weight files (deleted at end of iter) |
+| `data/datasets/_pair_cache/` (47 GB) | BC anchor source — read every PPO step on A |
+| `data/datasets/_bc_cache/` (10 GB) | secondary BC cache — read at iter boundaries |
+
+### What moves to B's `archive/`
+
+| Path on A | Path on B | When |
+|---|---|---|
+| `data/runs/ppo/<run_id>/checkpoints/policy_v[0..K-N_pool].pt` | `archive/runs/ppo/<run_id>/checkpoints/` | after each promotion |
+| `data/runs/ppo/<run_id>/rollouts/v[0..K-2]/` | `archive/runs/ppo/<run_id>/rollouts/` | after iter K's update completes |
+| `data/runs/ppo/<run_id>/eval/v[0..K-11].json` | `archive/runs/ppo/<run_id>/eval/` | rolling |
+| `data/runs/ppo/<run_id>/replays/` (promoted only) | `archive/runs/ppo/<run_id>/replays/` | after each promotion |
+| `data/datasets/entity/`, `planet/`, `fleet/`, `cross_entity/`, `comet_only_*/` (~15 GB pretraining datasets) | `archive/datasets/` | one-time — these produced the supervised checkpoints, no longer read |
+
+The `data/datasets/_pair_cache/` (47 GB) and `_bc_cache/` (10 GB) stay
+on A because they are read every PPO step for the BC anchor.
+
+### Archive script
+
+Run from A after each iteration's promotion gate:
+
+```bash
+# scripts/ppo_archive.sh <run_id> <K>
+run_id="$1"; K="$2"
+pool_floor=$((K - 8))      # N_pool = 8
+roll_floor=$((K - 2))
+eval_floor=$((K - 11))
+
+# 1. ship cold checkpoints to B
+for v in $(seq 0 "$pool_floor"); do
+  [ -f "data/runs/ppo/$run_id/checkpoints/policy_v$v.pt" ] || continue
+  [ "$v" = "0" ] && continue  # keep v0 hot (the init)
+  rsync -av --remove-source-files \
+    "data/runs/ppo/$run_id/checkpoints/policy_v$v.pt" \
+    "hirotakaishihara@100.109.180.124:/Users/agent/dev/kaggle-orbit-wars/archive/runs/ppo/$run_id/checkpoints/"
+done
+
+# 2. ship cold rollouts
+for v in $(seq 0 "$roll_floor"); do
+  [ -d "data/runs/ppo/$run_id/rollouts/v$v" ] || continue
+  rsync -av --remove-source-files \
+    "data/runs/ppo/$run_id/rollouts/v$v/" \
+    "hirotakaishihara@100.109.180.124:/Users/agent/dev/kaggle-orbit-wars/archive/runs/ppo/$run_id/rollouts/v$v/"
+  rmdir "data/runs/ppo/$run_id/rollouts/v$v" 2>/dev/null
+done
+
+# 3. ship cold eval JSONs
+find "data/runs/ppo/$run_id/eval/" -maxdepth 1 -name 'v*.json' | \
+  awk -F'v|.json' -v floor="$eval_floor" '$2+0 < floor' | \
+  xargs -I{} rsync -av --remove-source-files {} \
+    "hirotakaishihara@100.109.180.124:/Users/agent/dev/kaggle-orbit-wars/archive/runs/ppo/$run_id/eval/"
+```
+
+`--remove-source-files` deletes the local file *only after* a successful
+transfer to B. Combined with the atomic write rule, this is safe even
+if rsync is interrupted mid-batch.
+
+**Never** archive a checkpoint that is in the current self-play pool —
+B's rollout workers load pool checkpoints from the *hot* path. The
+script's `pool_floor` arithmetic enforces this.
 
 ## Policy/action contract
 
@@ -263,19 +523,34 @@ before the PPO math is verified.
 
 ## Iteration lifecycle
 
-One synchronous PPO iteration:
+One synchronous PPO iteration. The "training" step has two variants:
+**Phase 0 = A-only** (heads update too cheap to distribute);
+**Phase 1+ = distributed** via file-mediated grad averaging.
 
 ```text
-1. Learner publishes checkpoints/policy_vK.pt.
-2. Both machines load exactly policy_vK.pt.
-3. Workers collect rollout shards using frozen policy_vK.
-4. Workers write shards into rollouts/vK/<machine_id>/.
-5. Learner waits until target rollout budget is reached.
-6. Learner ignores any late shards after the cutoff.
-7. Learner computes advantages from policy_vK values.
-8. Learner performs PPO update and writes policy_vK+1.pt.
-9. Learner runs deterministic evaluation for policy_vK+1.
-10. Repeat.
+1.  A: publish checkpoints/policy_vK.pt; rsync push to B.
+2.  Both: load exactly policy_vK.pt (eval mode, inference_mode for rollout).
+3.  Both: collect rollout shards in parallel using frozen policy_vK.
+4.  Both: write shards into rollouts/vK/<machine_id>/ atomically.
+5.  A: background-rsync-pull B's shards as they appear.
+6.  A: stop when rollout budget hit; ignore late shards.
+7.  A: compute GAE on the merged rollout set (advantages, returns).
+8a. Phase 0: A performs the PPO update locally, writes policy_vK+1.pt.
+8b. Phase 1+: distributed update —
+      i.   A splits minibatches; rsync push mb_B sequence to B.
+      ii.  for each (epoch E, minibatch M):
+             A computes grad_A on mb_A[E][M]                (parallel)
+             B computes grad_B on mb_B[E][M], writes file   (parallel)
+             A rsync-pulls grad_B
+             A averages grad = (grad_A + grad_B) / 2
+             A optim step; writes new weights to file
+             A rsync-pushes weights to B
+             B loads new weights
+      iii. final weights = policy_vK+1.pt on A; same weights now on B.
+9.  Both: run quick-eval (32 seeds split 16/16 between A and B).
+10. A: pull B's eval JSON, merge, apply promotion gate, append to train_log.jsonl.
+11. A: run archive script (cold checkpoints, cold rollouts, old eval → B/archive/).
+12. Repeat.
 ```
 
 Strict on-policy rule for v1:
@@ -284,8 +559,10 @@ Strict on-policy rule for v1:
 train vK update only on rollouts generated by policy_vK
 ```
 
-Do not train on stale shards from `vK-1`. With only two machines, synchronous
-collection is simpler and reliable enough.
+Do not train on stale shards from `vK-1`. With only two machines,
+synchronous collection is simpler and reliable enough. The grad/weight
+sync files in step 8b live in `sync/v<K>/` and are deleted at the end
+of the iteration (they are not archived).
 
 ## Rollout budget
 
@@ -297,16 +574,23 @@ Start small enough to iterate quickly, then scale.
 | Bring-up | 64-128 episodes | tune reward/action penalties |
 | Stable PPO | 256-512 episodes | real learning signal |
 
-On two CPU machines, split the target approximately by available cores:
+Split episodes roughly 50/50 between A and B. Both machines now
+contribute equally to training (after Phase 0) so neither side has a
+systematic obligation that warrants giving the other more rollout work:
 
 ```text
-Machine A: 35-45% of rollout budget, because it also trains/evals
-Machine B: 55-65% of rollout budget
+Machine A: 45-50% of rollout budget
+Machine B: 50-55% of rollout budget
 ```
 
-If each machine has many cores, run one env process per physical core minus
-one. Avoid oversubscription; Orbit Wars is Python-heavy and too many workers
-can slow total throughput.
+B gets a slight tilt because A also runs the GAE merge + optimizer
+step + archive — those are CPU-light but wall-clock-serial.
+
+Run one env worker process per physical core minus one (Apple Silicon
+B: 4P + 4E → ~7 workers; A: depends). Inside each worker, batch
+`N_env = 4–8` envs per forward pass — see "CPU performance →
+Rollout" above. Avoid total worker count past physical cores; the env
+step is pure Python and contends for the GIL.
 
 ## Opponent schedule — self-play only
 
@@ -518,25 +802,42 @@ Run the full 128-seed panel before considering a submission.
 | value loss explodes | rewards too sparse/noisy | normalize advantages, reduce dense scale, lower value LR |
 | self-play winrate up but heuristic eval drops | policy overfit to current pool; cyclic chase | raise the older-uniform pool slot from 20% → 40%; lower the latest-frozen slot accordingly; check `transformer_v2_baseline` winrate is still ≥ 50% (it's the floor) |
 | pool keeps cycling (winrate vs each pool member oscillates) | pool too small / latest-only sampling | grow `N_pool` from 8 → 16; lower the latest-frozen slot to ≤ 40% |
-| CPU rollout too slow | too much tensor storage or T=6 | start T=1, fewer evals during smoke, profile featurization |
+| CPU rollout too slow | one env per worker, no `torch.compile` | enable batched envs (`N_env=4-8`), `torch.compile(mode="reduce-overhead")`, share opponent model across workers (see "CPU performance → Rollout") |
+| grad sync dominates iter wall-clock in Phase 1+ | per-minibatch full-grad rsync | switch to local SGD (avg every K=4 steps), or shrink minibatch count |
+| disk on A fills up | rollouts/checkpoints accumulating | run `scripts/ppo_archive.sh` after each promotion; the script moves cold data to B's `archive/` |
+| B's pool checkpoint sampled but file missing on B | new pool member not yet rsynced | A must push the new ckpt to B *before* publishing v(K+1), not after |
+| `policy_vK+1` differs between A and B after distributed update | non-atomic weight write or B loaded stale weights | verify `.tmp → rename` for weight files; verify B's load step fences against partial reads |
 
 ## Minimal implementation checklist
 
-1. Add actor/value wrapper around current `EntityPretrainModel`.
+1. Add actor/value wrapper around current `EntityPretrainModel`. Make sure
+   the forward accepts batch dim > 1 (it already does — verified in
+   `agents/transformer_v2/encoder/entity_encoder.py:209`) and add a
+   batched rollout path that runs `N_env` envs through one forward.
 2. Add `noop_logit` and `pair_frac` distribution head if not already exposed
-   in the runtime policy.
+   in the runtime policy. Pin the `frac` distribution choice (Beta vs
+   clamped-Gaussian vs K-way Categorical) before writing logprob code.
 3. Implement `ppo_rollout_worker.py`:
-   - load checkpoint version
-   - run assigned episodes
-   - write rollout shards atomically
+   - load checkpoint version + opponent pool (loaded once per worker process)
+   - run assigned episodes with `torch.inference_mode()` + `torch.compile`
+   - `N_env` envs per worker, batched forward
+   - write rollout shards atomically (`.tmp → rename`)
 4. Implement `ppo_learner.py`:
-   - wait for rollout budget
+   - wait for rollout budget (with wall-clock timeout)
+   - rsync-pull B's shards
    - compute GAE
-   - PPO update
-   - publish next checkpoint
-5. Add deterministic eval script using `utils.eval_seeds`.
-6. Add dashboard replay save for promoted checkpoints.
-7. Keep `ppo.py` as the public CLI wrapper once the above exists.
+   - **Phase 0**: local PPO update only
+   - **Phase 1+**: distributed PPO update via grad/weight file sync
+     (see "Distributed training")
+   - publish next checkpoint; rsync push to B
+5. Add `ppo_train_peer.py` for Machine B (Phase 1+):
+   - load minibatch sequence A pushed
+   - per minibatch: forward+backward, write `grad_B.pt` atomically, poll for new weights
+6. Add deterministic eval script using `utils.eval_seeds`, split-aware
+   (so A runs seeds 0..15 and B runs 16..31, both seats).
+7. Add `scripts/ppo_archive.sh` — runs after each promotion, see "Archive policy".
+8. Add dashboard replay save for promoted checkpoints (hot on A, archive on B).
+9. Keep `ppo.py` as the public CLI wrapper once the above exists.
 
 ## Practical first run
 
@@ -547,8 +848,9 @@ run_id: ppo_v2_cpu_<timestamp>
 policy init: best supervised entity_encoder PairHead checkpoint (latest top4 ckpt)
 T: 1
 mode: 2P only
+freeze: Phase 0 (heads only); no distributed training yet
 
-rollouts: 100% self-play
+rollouts: 100% self-play, parallel on A and B
   pool init: [transformer_v2_baseline]
   pool grows by adding each promoted PPO checkpoint, cap N_pool = 8
   per-episode opponent sampling:
@@ -557,22 +859,31 @@ rollouts: 100% self-play
     20% uniform from older frozen pool members
 
 rollout per iter: 128 episodes total
-Machine A: 48 episodes + learner/eval
-Machine B: 80 episodes
+  Machine A: 60 episodes (+ GAE merge + optim + eval half)
+  Machine B: 68 episodes (+ eval half)
+  N_env per worker: 4
+  worker processes: physical_cores - 1 per machine
 
-update epochs: 3
-minibatch: 2048
-lr heads: 1e-4
-lr trunk: frozen
-bc_coef: 0.05  (anchor to supervised pair cache; not reduced until floor winrate stable)
+training (Phase 0 — A only):
+  update epochs: 3
+  minibatch: 1024  (CPU-friendly; smaller than the supervised default)
+  lr heads: 1e-4
+  lr trunk: frozen
+  bc_coef: 0.05  (anchor to supervised pair cache on A; doubled to 0.10
+                  once Phase 1 distributed training starts, since BC loss
+                  lives only on A's gradient)
 
-eval (deterministic, every iteration):
+eval (deterministic, every iteration, split A/B):
   - SEEDS_QUICK vs transformer_v2_baseline          (must stay > 50%)
   - SEEDS_QUICK vs latest 3 pool members             (track pool dominance)
   - SEEDS_QUICK vs physical_v4                       (external sanity yardstick)
 
 full eval (every 10 iterations):
   - 128 seeds vs transformer_v2_baseline + physical_v4 + sniper_v2
+
+archive (every promotion):
+  - scripts/ppo_archive.sh moves cold checkpoints + rollouts + eval JSON
+    to B's archive/ dir; deletes local after rsync success
 ```
 
 Promotion rule (see "Evaluation gate"):
