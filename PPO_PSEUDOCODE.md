@@ -119,38 +119,48 @@ def run_peer(run_dir):
 
 ## Actor-critic wrapper
 
+**Actor = existing PairHead outputs. Critic = single new `value_head` on
+L2's `glob`.** No new actor heads, no learnable σ, no NOOP slot.
+
 ```python
 class PPOActorCritic(nn.Module):
-    def __init__(self, entity_model):
-        self.entity_model = entity_model
-        self.player_context = PlayerContextLearner(entity_model.d_model)  # planned
-        self.strategy = StrategyLearner(entity_model.d_model)             # planned
-        self.noop_head = nn.Linear(entity_model.d_model, 1)
-        self.value_head = nn.Linear(entity_model.d_model, 1)
-        self.frac_log_std = nn.Parameter(tensor(log(0.35)))
+    def __init__(self, entity_model, sigma: float = 0.35):
+        super().__init__()
+        self.entity_model = entity_model           # supervised, partial-freeze
+        self.value_head   = nn.Linear(entity_model.d_model, 1)  # ONLY new param
+        self.sigma        = sigma                                # fixed hyperparam
 
     def forward(self, feats):
-        base = self.entity_model.forward_with_context(feats)
-        # base exposes pair_logits, pair_frac, and either global_context or ctx_now.
-        glob = base.global_context
-        if glob is None:
-            glob = masked_mean(base.ctx_now, feats.planet_mask, dim=1)
-        learner_ctx, player_ctx = self.player_context(base.ctx_now, glob, feats)
-        strategy_ctx = self.strategy(glob, learner_ctx, player_ctx)
-        policy_ctx = glob + learner_ctx + strategy_ctx
+        # Run the supervised stack once.
+        out = self.entity_model.forward_with_context(feats)
+        # out exposes: glob (B, d), ctx_now (B, P, d),
+        #              pair_logits (B, P, P), pair_frac (B, P, P).
         return {
-            "pair_logits": base.pair_logits,
-            "frac_loc": base.pair_frac,             # logit-normal mean
-            "noop_logit": self.noop_head(policy_ctx).squeeze(-1),
-            "value": self.value_head(policy_ctx).squeeze(-1),
-            "frac_log_std": clamp(self.frac_log_std, log(0.15), log(0.80)),
+            # CRITIC — reads ONLY L2's glob; gradient stops at L2.
+            "value":       self.value_head(out.glob).squeeze(-1),     # (B,)
+
+            # ACTOR — existing PairHead outputs only; no new heads.
+            "pair_logits": out.pair_logits,                            # (B, P, P)
+            "frac_loc":    out.pair_frac,                              # (B, P, P)
+            "sigma":       self.sigma,                                 # fixed
         }
 ```
 
-The real implementation may initially replace `PlayerContextLearner` and
-`StrategyLearner` with identity/zero modules. The architectural boundary still
-matters: L0-L2 are world perception; player context, strategy, and action
-heads are policy adaptation.
+Gradient flow:
+
+- `value_loss` ─► `value_head` ─► `glob` ─► [L2 frozen Phase 0/1; reaches L2
+  only in Phase 2].
+- `policy_loss + entropy + bc_loss` ─► `pair_logits` / `pair_frac` (output
+  Linears, Phase 0+) ─► PairHead trunk / FiLM (Phase 1+) ─► L3 / L4 (Phase 1+)
+  ─► PlayerContext / Strategy (Phase 1+) ─► L2 (Phase 2 only).
+- Critic and actor share L2 (read-only until Phase 2). No other coupling.
+- `value_head` is the **only** parameter that PPO introduces; everything else
+  PPO trains is an existing supervised parameter.
+
+The real implementation may keep `PlayerContextLearner` / `StrategyLearner`
+as identity / zero modules in early phases — Phase 1's "trainable" set then
+reduces to L3 + L4 + full PairHead. The conceptual boundary still matters
+for Phase 2 planning.
 
 ---
 
@@ -202,10 +212,9 @@ def run_batched_episodes(policy, sampler, seeds, run_dir, mid, wid, K):
                 out = policy(feats_batch)
                 for j, i in enumerate(learner_idxs):
                     mask              = legality_mask(envs[i], seats[i])
-                    action_id, logp_a = sample_action(
-                        out["pair_logits"][j], out["noop_logit"][j], mask)
-                    frac, logp_f      = sample_frac(
-                        out["frac_loc"][j], out["frac_log_std"], action_id)
+                    action_id, logp_a = sample_action(out["pair_logits"][j], mask)
+                    frac, logp_f      = sample_frac(out["frac_loc"][j],
+                                                     out["sigma"], action_id)
                     env_act, ok       = project_to_env(envs[i], action_id, frac)
                     buffers[i].add(feats_batch[j], mask, action_id, frac,
                                     logp_a + logp_f,
@@ -248,6 +257,7 @@ Notes:
 ```python
 def legality_mask(obs, seat):
     # Source must be own & have surplus; target must exist & != source.
+    # No NOOP slot — NOOP emerges from plan_launch rejection at env projection.
     own       = (obs.planets.owner == seat)
     surplus   = compute_surplus_vector(obs, seat)
     has_ships = (surplus >= obs.min_launch)
@@ -256,27 +266,28 @@ def legality_mask(obs, seat):
     tgt_ok    = exists                                         # (P,)
     pair_ok   = src_ok[:, None] & tgt_ok[None, :]              # (P, P)
     pair_ok  &= ~eye(P, dtype=bool)                            # src != tgt
-    return concat([true_scalar(), pair_ok.flatten()])          # +1 NOOP slot
+    return pair_ok.flatten()                                   # P*P bool
 
-def sample_action(pair_logits, noop_logit, mask):
-    flat = concat([noop_logit[None], pair_logits.flatten()])
-    flat = where(mask, flat, -inf)
+def sample_action(pair_logits, mask):
+    """Sample (s, t) from a Categorical over flattened P*P pair_logits.
+    Returns (action_id ∈ [0, P²), logp_pair)."""
+    flat = where(mask, pair_logits.flatten(), -inf)
     dist = Categorical(logits=flat)
     a    = dist.sample()
     return a, dist.log_prob(a)
 
-def sample_frac(frac_loc, frac_log_std, action_id):
+def sample_frac(frac_loc, sigma, action_id):
     """Returns (frac_sample, logp_frac).
+
+    sigma is a fixed hyperparameter (CLI), NOT a learned parameter.
 
     `frac_sample` is the value stored in the shard. PPO recomputes
     logp_frac from `frac_sample` at update time, so the two must agree
     exactly — that means we must NOT apply the launch clamp here.
     The launch clamp lives in `project_to_env`.
     """
-    if action_id == 0:
-        return 0.0, 0.0                          # NOOP: no frac decision
-    src, tgt = unflatten(action_id - 1, P, P)
-    normal = Normal(frac_loc[src, tgt], exp(frac_log_std))
+    src, tgt = unflatten(action_id, P, P)                # no NOOP offset
+    normal = Normal(frac_loc[src, tgt], sigma)
     z = normal.sample()
     # The [1e-4, 1-1e-4] clamp is numerical only (avoid logit(0/1) = ±inf).
     # It IS applied to the stored value, and logp uses the same value.
@@ -286,9 +297,7 @@ def sample_frac(frac_loc, frac_log_std, action_id):
     return frac_sample, logp
 
 def project_to_env(obs, action_id, frac_sample):
-    if action_id == 0:                                  # NOOP
-        return [], ok=True
-    src, tgt = unflatten(action_id - 1, P, P)
+    src, tgt = unflatten(action_id, P, P)
     source   = obs.planets[src]
     surplus  = compute_surplus(source, obs.enemy_fleets)
     # Launch clamp goes HERE, not in sample_frac. Keeps the stored
@@ -299,7 +308,7 @@ def project_to_env(obs, action_id, frac_sample):
         return [], ok=False
     launch   = physics_utils.plan_launch(obs, src, tgt, ships)
     if not launch.ok:
-        return [], ok=False                              # invalid -> penalty
+        return [], ok=False                              # invalid -> NOOP + penalty
     return [[src, launch.angle, ships]], ok=True
 ```
 
@@ -307,10 +316,18 @@ Never resample on invalid: the sampled action stays in the buffer with its
 original logprob and earns an `invalid_launch_penalty`. Resampling would
 desync stored logprob from executed action and break the PPO ratio.
 
+**NOOP semantics:** there is no NOOP action in the categorical. Every learner
+turn samples a pair; if `plan_launch.ok=False` the env action is empty and the
+rollout earns the invalid-launch penalty. The policy learns NOOP-equivalent
+behavior by putting low logit on infeasible cells (so the masked categorical
+naturally drives toward the few feasible cells, and when none are good the
+penalty dominates the gradient toward suppressing pair logits in that state).
+
 **Rollout-replay test (mandatory before Phase 0 promotion):** for a random
-sample of shards, recompute `logp_frac` from the stored `frac_sample` using
-the model state that produced it, and assert byte-equality with the stored
-`logprob_frac`. Catches any silent drift between sampling and storage.
+sample of shards, recompute `logp_pair + logp_frac` from the stored
+`(action_id, frac_sample)` using the model state that produced it, and assert
+byte-equality with the stored `logprob`. Catches any silent drift between
+sampling and storage (sigma drift, legality-mask drift, etc.).
 
 ---
 
@@ -487,15 +504,17 @@ def ppo_peer_train_loop(run_dir, policy, K):
 def ppo_minibatch_loss(policy, mb, pair_cache, bc_coef,
                         value_coef, ent_coef, clip):
     out = policy(mb.feats)
-    new_logp  = action_logprob(out["pair_logits"], out["noop_logit"],
-                                out["frac_loc"], out["frac_log_std"],
+    # action_logprob: categorical(pair_logits, mask) + logit-normal(frac_loc, sigma).
+    new_logp  = action_logprob(out["pair_logits"], out["frac_loc"], out["sigma"],
                                 mb.action_mask, mb.action_id, mb.frac)
     ratio     = exp(new_logp - mb.old_logp)
     policy_loss = -mean(min(ratio * mb.adv,
                              clip(ratio, 1 - clip, 1 + clip) * mb.adv))
     value_loss  = mean((out["value"] - mb.returns) ** 2)
-    entropy     = mean(action_entropy(out["pair_logits"], out["noop_logit"],
-                                      out["frac_log_std"], mb.action_mask))
+    # Entropy: only the categorical contributes a *trainable* entropy term.
+    # The frac logit-normal has sigma fixed, so its entropy is constant and
+    # drops out of the gradient (kept here only for logging if desired).
+    entropy     = mean(categorical_entropy(out["pair_logits"], mb.action_mask))
 
     bc_loss = 0.0
     if bc_coef > 0 and pair_cache is not None:
@@ -568,11 +587,11 @@ added to the self-play pool and is **not** considered for submission.
 
 ## Freeze schedule (parameter groups)
 
-| Phase | Trainable | Frozen | Notes |
-|---|---|---|---|
-| 0 | noop / value / frac_log_std / PairHead output layers | L0-L2 world perception, current L3/L4 ActionLearner trunk, PairHead trunk+FiLM | "PPO plumbing" — prove the update doesn't destroy the BC policy |
-| 1 | PlayerContextLearner / StrategyLearner / current L3-L4 ActionLearner / full PairHead | L0-L2 | Post-perception adaptation; PPO heads stay at `1e-4`, post-L2 trunk at `1e-5` |
-| 2 | + CrossEntityAttention (L2), then L1 only with evidence | L0 specialists | Only if diagnostics show world perception is stale or missing facts |
+| Phase | Trainable | Frozen | New params | Notes |
+|---|---|---|---:|---|
+| 0 | `value_head` + PairHead `pair_logits` output Linear + PairHead `pair_frac` output Linear | L0-L2 world perception, ActionLearner trunk (L3/L4 + PairHead trunk + FiLM) | ~257 + ~512 existing | "PPO plumbing" — prove the value head learns V(s), the actor output Linears can be PPO-updated, and BC anchor prevents collapse. The only NEW parameter is `value_head`. |
+| 1 | + PairHead trunk + FiLM + L3 + L4 + planned PlayerContext/Strategy | L0-L2 | + 2–10 M | Post-perception adaptation. PPO output Linears stay at `1e-4`, trunk at `1e-5`. If PlayerContext/Strategy are still identity stubs, reduces to unfreezing L3 + L4 + full PairHead. |
+| 2 | + CrossEntityAttention (L2); L1 only with evidence | L0 specialists | + ~1–2 M | Only if diagnostics show world perception is stale or missing facts. L0 always stays frozen. |
 
 ---
 
