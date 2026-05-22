@@ -311,80 +311,153 @@ This section is the design overview.
 
 ### What PPO adds
 
-A `PPOActorCritic` module wraps `EntityPretrainModel`:
+**Actor = the existing `pair_logits` and `pair_frac` outputs from `PairHead`.
+No new actor heads.** Critic is a single new `value_head` reading L2's `glob`.
+The whole PPO addition is one `Linear(256 → 1)` (~257 new params); everything
+else PPO trains is an existing supervised parameter.
 
 ```
-                   ┌──────────────────────────────────────────────────────────┐
-                   │ supervised stack (already trained, freeze-controlled)    │
-                   │                                                          │
-                   │   L0 specialists (frozen always)                         │
-                   │      └─ Planet / Comet / Fleet encoders                  │
-                   │   L1 PlanetEntityEncoder      ┐                          │
-                   │   L2 CrossEntityAttention     │ "world perception"       │
-                   │                                                          │
-                   │   ── post-L2 boundary ───────────────────────            │
-                   │                                                          │
-                   │   ┌─ PlayerContextLearner   (planned; identity stub OK)  │
-                   │   ├─ StrategyLearner        (planned; identity stub OK)  │
-                   │   └─ ActionLearner ≡ L3 DualRoleAttention                │
-                   │                      + L4 JointRoleAttention             │
-                   │                      + PairHead trunk + FiLM             │
-                   │                          │                               │
-                   │                          ▼                               │
-                   │             pair_logits (B, P, P)                        │
-                   │             pair_frac   (B, P, P) — used as frac_loc     │
-                   └──────────────────────┬───────────────────────────────────┘
-                                          │
-                   ┌──────────────────────┴───────────────────────────────────┐
-                   │ PPOActorCritic wrapper (NEW for PPO)                     │
-                   │                                                          │
-                   │   noop_logit    = Linear(policy_ctx → 1)                 │
-                   │   value         = Linear(policy_ctx → 1)                 │
-                   │   frac_log_std  = nn.Parameter(log(0.35))                │
-                   │                    clamped to [log(0.15), log(0.80)]     │
-                   │                                                          │
-                   │ Sampled action per learner turn:                         │
-                   │   • categorical over [NOOP, P²] via pair_logits+noop     │
-                   │   • frac ~ LogitNormal(frac_loc[s,t], exp(frac_log_std)) │
-                   │   • projected to env via physics_utils.plan_launch       │
-                   └──────────────────────────────────────────────────────────┘
+                 INPUT  (per learner turn)
+       planet_features  comet_features  fleet_features  masks + routing
+                                  │
+   ─────────────────────────────── │ ──────────────────────────────────────
+   SUPERVISED STACK                ▼
+                ┌─────────────────────────────────────────┐
+   L0           │  PlanetEnc │ CometEnc │ FleetEnc        │ frozen always
+                │  18→256    │ 123→256  │ 24→256          │
+                │  └─── entity_self (B,T,P,256) ──────────┐
+                │              │                          │
+   L1           │  PlanetEntityEncoder  cross-attn        │ Phase 0/1/2: frozen
+                │              ▼                          │
+                │           entity_tokens (B,T,P,256)     │
+                │              │                          │
+   L2           │  CrossEntityAttention + CLS, T=6 steps  │ Phase 0/1/2: frozen
+                │              │                          │ Phase 3 only with evidence
+                │       ┌──────┴──────┐                   │
+                │       │             │                   │
+                │   glob (B,256)   ctx_now (B,P,256)      │
+                └───┬───┴───────────────────┬─────────────┘
+                    │                       │
+                    │           ╔═══════════│════════════════════════════╗
+                    │           ║ post-L2   ▼  (ActionLearner pathway)   ║
+                    │           ║   PlayerContextLearner  (planned/stub) ║
+                    │           ║   StrategyLearner       (planned/stub) ║
+                    │           ║   L3 DualRoleAttention                 ║
+                    │           ║   L4 JointRoleAttention                ║ Phase 0: trunk frozen
+                    │           ║   PairHead  trunk + FiLM               ║ Phase 1+: trainable
+                    │           ║          │                             ║
+                    │           ║   ┌──────┴──────┐                      ║
+                    │           ║   ▼             ▼                      ║
+                    │           ║ pair_logits  pair_frac                 ║ Phase 0: output
+                    │           ║  (B,P,P)     (B,P,P)                   ║ Linears trainable
+                    │           ╚═════│═════════════│════════════════════╝
+                    │                 │             │
+   ═══════════════ │ ══════════════ │ ═══════════ │ ════════════════════
+   PPO WRAPPER      │                 │             │
+                    ▼                 ▼             ▼
+            ┌────────────────┐  ┌──────────────────────────────────────┐
+            │   CRITIC       │  │   ACTOR (no new heads)               │
+            │                │  │                                      │
+            │ value_head     │  │  Categorical(logits =                │
+            │ Linear(256→1)  │  │    where(legality_mask,              │
+            │   ↑ ONLY new   │  │          pair_logits.flatten(),      │
+            │   ↑ parameter  │  │          −inf))                      │
+            │   ↑ (~257)     │  │       ▼  sample (s, t)               │
+            │                │  │                                      │
+            │  V(s) scalar   │  │  LogitNormal(loc = pair_frac[s,t],   │
+            │                │  │              σ = 0.35 fixed)         │
+            │                │  │       ▼  sample frac via sigmoid(z)  │
+            └────────┬───────┘  └───────┬──────────────────────────────┘
+                     │                  │
+                     │                  ▼
+                     │     project_to_env: plan_launch(s, t,
+                     │       ships = round(clamp(frac,.02,1)·src.ships))
+                     │       ┌────────┴────────┐
+                     │       │                 │
+                     │   ok=True             ok=False
+                     │       │                 │
+                     │       ▼                 ▼
+                     │   [s, angle, ships]   NOOP + invalid penalty
+                     │                       (NEVER resample;
+                     │                        stored logp stays)
+                     │
+   ═════════════════ │ ════════════════════════════════════════════════
+   GRADIENT FLOW    (during ppo_update)
+                     │
+   value_loss   ───► value_head ──► glob ──► [L2 frozen P0/1; unfrozen P2]
+
+   policy_loss  ───► (NOT into value_head)
+   entropy      ───► pair_logits, pair_frac (output Linears) ─► PairHead trunk
+   bc_loss      ───►                                              (Phase 1+)
+                                                                   │
+                                                            ─► L3 / L4 / FiLM
+                                                                   │  Phase 1+
+                                                            ─► PlayerContext / Strategy
+                                                                   │  Phase 1+
+                                                            ─► L2  Phase 2 only
+
+   Critic and actor share L2 (read-only until Phase 2). No other coupling.
+   BC anchor (pair_cache → bce(pair_logits, expert)) lives ONLY on A's
+   gradient in distributed Phase 1+; bc_coef doubles 0.05 → 0.10 to keep
+   effective weight after averaging.
 ```
 
-`policy_ctx = glob + learner_ctx + strategy_ctx` if `PlayerContextLearner` and
-`StrategyLearner` are implemented; otherwise a mean-pool of `ctx_now` over
-valid planets is used as the bootstrap. Keeps the wrapper checkpoint-compatible
-with the supervised PairHead ckpt: missing PPO-only keys initialize from scratch.
+**Why this split:**
+- **Decoupled gradients.** Value-loss never enters L3/L4/PairHead. Actor-loss
+  never enters `value_head`. Each head optimizes its own objective without
+  the other's noise.
+- **glob is the right signal for V(s).** L2's CLS already summarizes the board
+  (frontiers, balance, threats). Pulling role-aware or pair-aware tokens into
+  the value head would add variance without changing what's predictable.
+- **Cheaper critic.** `Linear(256 → 1)` = 257 params. Fast to train, easy to
+  swap, no interference with the (much larger) actor pathway.
+- **Cleaner Phase-2 transition.** When L2 eventually unfreezes, value-loss
+  on L2 is a single well-conditioned scalar-regression signal — much
+  friendlier than the multi-head action zoo PairHead would dump on L2.
 
 ### Freeze schedule (three phases)
 
-PPO is brought up conservatively — heads first, world perception last. Each
-phase only starts after the previous one's eval is stable.
+PPO is brought up conservatively — value + actor output Linears first, action
+trunk next, perception last. Each phase only starts after the previous one's
+eval is stable.
 
-| Phase | Trainable | Frozen | Purpose |
-|---|---|---|---|
-| **0 — Plumbing** | `noop_head`, `value_head`, `frac_log_std`, PairHead **output layers** only | L0–L2, ActionLearner (L3/L4 + PairHead trunk + FiLM) | Prove PPO logprobs, GAE, the eval gate, and the distributed loop all work without destroying the BC policy. ~1–2M trainable params. |
-| **1 — Action adaptation** | + PlayerContextLearner, + StrategyLearner, + ActionLearner (L3+L4+PairHead) | L0–L2 (world perception) | Post-perception policy adaptation. If PlayerContext/Strategy are still identity stubs, this reduces to unfreezing L3+L4+full PairHead. ~5–10M trainable. |
-| **2 — Perception** | + L2 `CrossEntityAttention`; L1 only with strong evidence | L0 specialists | Only if diagnostics show world perception is stale. L0 stays frozen — it was pretrained on per-entity multitask supervision and should not be rewritten by sparse PPO rewards. ~15–25M trainable. |
+| Phase | Trainable | Frozen | New params | Goal |
+|---|---|---|---:|---|
+| **0 — Plumbing** | `value_head` + PairHead `pair_logits` output Linear + PairHead `pair_frac` output Linear | L0–L2, ActionLearner trunk (L3 + L4 + PairHead trunk + FiLM) | ~257 + ~512 existing | Prove PPO update + GAE + eval gate + distributed loop work without destroying the BC policy. |
+| **1 — Action adaptation** | + PairHead trunk + FiLM + L3 + L4 + PlayerContext/Strategy when implemented | L0–L2 | + 2–10 M | Post-perception adaptation. If PlayerContext/Strategy are still identity stubs, reduces to unfreezing L3+L4+full PairHead. |
+| **2 — Perception** | + L2 `CrossEntityAttention`; L1 only with strong evidence | L0 always | + ~1–2 M | Only if diagnostics show world perception is stale. L0 stays frozen — it was pretrained on per-entity multitask supervision and should not be rewritten by sparse PPO rewards. |
 
-The pair distribution stays compatible with the supervised PairHead: BC anchor
-loss (`bc_coef · BCE(pair_logits, expert_labels)`) is mixed in throughout PPO
-to prevent collapse, sampled from the existing `_pair_cache`.
+The actor stays compatible with the supervised PairHead: BC anchor loss
+(`bc_coef · BCE(pair_logits, expert_labels)`) is mixed in throughout PPO to
+prevent collapse, sampled from the existing `_pair_cache`.
 
 ### Sampling and env projection
 
-Phase 0 uses a **single-launch categorical** action per learner turn (NOOP + P²
-pair cells), much simpler than the runtime's thresholded multi-launch behavior.
-This is bring-up plumbing — track the gap with `emitted_launch` / launch-miss
-rates and validate before submission. Phase 1+ may upgrade to per-source
-categorical, autoregressive top-K, or Bernoulli-per-pair contracts.
+Phase 0 samples exactly one (source, target) pair per learner turn from a
+`Categorical` over the flattened `P × P` `pair_logits` with the legality mask
+applied. **There is no explicit NOOP slot.** NOOP only emerges when
+`plan_launch` rejects the sampled pair (out-of-surplus, blocking planet,
+boundary, sun, …); the rollout then earns an invalid-launch penalty. This
+penalty does double-duty: it teaches the policy to put low logit on
+infeasible cells, which is the same thing as learning NOOP via avoiding
+all-infeasible turns.
 
-Every sampled action is projected to the env through `physics_utils.plan_launch`.
-If `plan_launch.ok=False`, the runner emits NOOP and the rollout earns an
-invalid-launch penalty — but the **stored action and logprob are NEVER
-resampled** (resampling would desync stored logp from executed action and break
-the PPO ratio mathematically). The single-source-of-truth `frac_sample` is the
-`[1e-4, 1-1e-4]`-clamped sigmoid; the launch-side clamp `[0.02, 1.00]` is
-applied only when emitting the env action.
+`frac` is sampled from `LogitNormal(loc=pair_frac[s,t], σ=0.35_fixed)` — σ
+is a CLI-tunable hyperparameter, not a learned parameter. Stored
+`frac_sample = clamp(sigmoid(z), 1e-4, 1−1e-4)` (numerical only); the
+launch-side clamp `[0.02, 1.00]` is applied only at env projection. PPO
+recomputes logprob from the stored value, so the launch clamp **must not**
+be applied at sample time — otherwise the stored logp would not match the
+recomputed logp at update time and the PPO ratio would silently desync.
+
+Invalid actions are **never resampled** — the original pair stays in the
+buffer with its original logprob.
+
+**Multi-launch gap:** the supervised runner fires multiple sources per turn
+via `pair_logits > 2.0` threshold; PPO v1 here fires one. Track
+`emitted_launch_rate` + launch-miss matrix; upgrade to a per-source
+Bernoulli or autoregressive top-K contract in Phase 1+ if eval shows it
+matters.
 
 ### Self-play pool
 

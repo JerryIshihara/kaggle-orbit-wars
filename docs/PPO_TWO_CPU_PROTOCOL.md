@@ -18,8 +18,8 @@ L0 specialists                    frozen
 L1-L2 world perception            frozen at first, touched only with evidence
 PlayerContext/Strategy learners   planned post-L2 trainable modules
 ActionLearner (current L3/L4)      trainable after PPO plumbing
-PairHead output layers            trainable
-noop/value PPO heads              trainable
+PairHead output layers            trainable (the actor IS these layers)
+value_head                        trainable (the ONLY new PPO parameter)
 ```
 
 The first PPO version should be conservative: keep the environment-facing
@@ -33,10 +33,11 @@ The earlier version of this plan was directionally useful but too optimistic
 in several places. These are load-bearing corrections for the implementation:
 
 - **The active model is not yet an actor-critic.** `EntityPretrainModel`
-  currently returns only `pair_logits` and raw `pair_frac`. PPO must wrap it in
-  a `PPOActorCritic` module that adds player/strategy context when available,
-  a scalar `noop_logit`, a value head, and a stochastic fraction distribution.
-  Do not pretend the existing PairHead already exposes those tensors.
+  currently returns `pair_logits`, raw `pair_frac`, `glob`, and `ctx_now`.
+  PPO wraps it minimally: the actor IS the existing `pair_logits` and
+  `pair_frac` outputs; the critic is a single new `Linear(d_model -> 1)`
+  reading `glob` from L2. No `noop_head`, no learnable σ — NOOP comes from
+  `plan_launch.ok=False`; frac σ is a fixed hyperparameter.
 - **Phase 0 uses a single-launch semantic action only as plumbing.** The
   runtime `TransformerAgent` can emit multiple thresholded launches per turn
   with per-source budgeting. A single categorical launch is easier to make
@@ -463,33 +464,47 @@ manifest, not version arithmetic, enforces this. Promotion is sparse, so
 
 ### Actor-critic wrapper
 
-The active `EntityPretrainModel` is still a supervised PairHead model. Its
-forward returns:
+**Actor = the existing `pair_logits` and `pair_frac` outputs from PairHead.
+Critic = a single new `value_head` reading L2's `glob`.** PPO introduces one
+parameter — `value_head` (~257) — and nothing else. No `noop_head`, no
+learnable σ for the fraction.
+
+The active `EntityPretrainModel` forward returns:
 
 ```text
 pair_logits  (B, P, P)
 pair_frac    (B, P, P) raw logit; runtime uses sigmoid(pair_frac)
+glob         (B, 256)  CLS readout from L2 CrossEntityAttention
+ctx_now      (B, P, 256)
 ```
 
-PPO should add a wrapper instead of rewriting world perception. The wrapper can
-start thin and later grow explicit post-L2 context modules:
+The wrapper is therefore minimal:
 
 ```text
-PPOActorCritic(EntityPretrainModel):
+PPOActorCritic(EntityPretrainModel, sigma: float = 0.35):
+  # CRITIC — reads ONLY glob; gradient stops at L2.
+  value        = Linear(d_model -> 1)(glob)              # ~257 new params
+
+  # ACTOR — existing PairHead outputs; no new heads.
   pair_logits  = base_out["pair_logits"]
-  frac_loc     = base_out["pair_frac"]        # logit-normal mean
-  learner_ctx  = PlayerContextLearner(ctx_now, glob)       # planned
-  strategy_ctx = StrategyLearner(glob, learner_ctx, players) # planned
-  noop_logit   = Linear([glob, learner_ctx, strategy_ctx] -> 1)
-  value        = Linear([glob, learner_ctx, strategy_ctx] -> 1)
-  frac_log_std = learned scalar, clamped to log([0.15, 0.80])
+  frac_loc     = base_out["pair_frac"]                   # logit-normal mean
+  sigma        = sigma                                   # fixed hyperparameter
 ```
 
-Use the L2 global token returned by `CrossEntityAttention` for `noop_logit` and
-`value` if the implementation exposes it cleanly. If not, mean-pool the current
-valid `ctx_now` tokens as a first pass and leave a TODO to switch to the real
-global token. Keep this wrapper checkpoint-compatible with the supervised
-PairHead ckpt: missing PPO-only keys initialize from scratch.
+**Why split this way:**
+
+- **Decoupled gradients.** `value_loss` enters `value_head` and stops at L2
+  (which is frozen in Phase 0/1, only unfrozen in Phase 2). `policy_loss +
+  entropy + bc_loss` enters the actor heads and propagates back through the
+  post-L2 stack as freezes lift.
+- **`glob` is the right signal for V(s).** L2's CLS already summarizes the
+  board (frontiers, balance, threats). Pulling role-aware or pair-aware tokens
+  into the value head would add variance without changing what is predictable.
+- **Cheaper critic.** `Linear(d_model -> 1) = 257` params is trivially fast
+  and easy to train; no interference with the (much larger) actor pathway.
+- **Cleaner Phase-2 transition.** When L2 eventually unfreezes, value-loss on
+  L2 is a single well-conditioned scalar-regression signal — much friendlier
+  than the multi-head action zoo PairHead would dump on L2.
 
 Architectural boundary for PPO:
 
@@ -516,12 +531,20 @@ separately because Phase 0 trains those output layers but freezes the trunk.
 
 ### Phase 0 semantic action
 
-Phase 0 samples exactly one semantic decision per learner turn:
+Phase 0 samples exactly one (source, target) pair per learner turn from a
+Categorical over the flattened `P * P` `pair_logits` with the legality mask
+applied:
 
 ```text
-action 0                = NOOP
-action 1 + source*P+tgt = launch(source, target)
+action_id ∈ [0, P*P)        # no NOOP slot
+source, target = unflatten(action_id, P, P)
 ```
+
+**There is no explicit NOOP action.** NOOP only emerges when `plan_launch`
+rejects the sampled pair (out-of-surplus, blocking planet, boundary, sun, …);
+the rollout earns an invalid-launch penalty in that case. The penalty does
+double-duty: it teaches the policy to put low logit on infeasible cells,
+which is the same thing as learning NOOP via avoiding all-infeasible turns.
 
 This single-launch distribution is intentionally a bring-up simplification.
 It does **not** reproduce the production runner's thresholded multi-launch
@@ -541,15 +564,29 @@ rollout too slow and can also hide useful negative signal.
 
 ### Fraction distribution
 
-Pin the fraction distribution now; do not leave it as an implementation choice.
-Reuse the existing `pair_frac` raw logit as the mean of a logit-normal:
+Reuse the existing `pair_frac` raw logit as the mean of a logit-normal with
+**fixed σ** (not a learned parameter):
 
 ```text
-z            ~ Normal(frac_loc[source, target], exp(frac_log_std))
+sigma        = 0.35   # fixed hyperparameter, CLI-tunable per run
+z            ~ Normal(frac_loc[source, target], sigma)
 frac_sample  = clamp(sigmoid(z), 1e-4, 1 - 1e-4)    # numerical clamp only
 logp_frac    = Normal.log_prob(logit(frac_sample))
                - log(frac_sample) - log(1 - frac_sample)
 ```
+
+Why fixed σ rather than learned:
+
+- The actor must use only existing parameters (the user's design constraint).
+  A learned `frac_log_std` would be a new actor parameter.
+- Fixed σ keeps the actor's parameter set identical to the supervised model
+  (only PairHead's output Linears) — checkpoint compatibility is trivial.
+- σ controls exploration. Schedule it manually between runs (start `0.35`;
+  decrease toward `0.15` as PPO converges) rather than letting the model
+  collapse it.
+- Frac's entropy term becomes a constant and drops out of the gradient. This
+  is fine — entropy regularization only needs to act on the categorical, which
+  is the discrete decision dominating exploration.
 
 **Store `frac_sample` (the `[1e-4, 1-1e-4]`-clamped value) in the shard.**
 PPO recomputes `logp_frac` at update time from the stored `frac_sample`, so
@@ -571,8 +608,8 @@ sampled action and break the PPO ratio. Add a rollout-replay test that
 recomputes `logp_frac` from `frac_sample` and asserts equality to
 `logprob_frac` in the shard.
 
-For `NOOP`, store `frac_sample = 0` and `logp_frac = 0`; the action logprob is
-only the categorical NOOP logprob.
+Because there is no NOOP slot, every learner turn samples a pair and a frac.
+NOOP semantics come from `plan_launch.ok == False` at env projection.
 
 ### Environment projection
 
@@ -661,8 +698,8 @@ Minimum fields:
                 "routing":         dict[str, Tensor],
 
                 # PPO data
-                "action_mask":      Tensor[n, 1 + P*P], # exact mask used for sampling
-                "action_id":       Tensor[n],      # 0 = noop, >0 = pair
+                "action_mask":      Tensor[n, P*P], # exact pair mask used for sampling (no NOOP slot)
+                "action_id":       Tensor[n],      # flat pair index in [0, P*P)
                 "frac_sample":     Tensor[n],
                 "logprob":         Tensor[n],      # logp_action + logp_frac
                 "logprob_action":  Tensor[n],
@@ -930,33 +967,35 @@ Do not unfreeze everything at once.
 Train only:
 
 ```text
-noop head
-PairHead pair_logits output layer
-PairHead pair_frac output layer
-frac_log_std
-value head
+value_head                          (the ONLY new PPO parameter)
+PairHead pair_logits output Linear  (existing)
+PairHead pair_frac output Linear    (existing)
 ```
 
-Freeze L0-L2 world perception and freeze the current compact ActionLearner
-trunk (L3/L4 + PairHead trunk/FiLM). Goal: prove PPO logprobs, value learning,
+Freeze L0-L2 world perception and freeze the ActionLearner trunk
+(L3/L4 + PairHead trunk + FiLM). Goal: prove PPO logprobs, value learning,
 GAE, and eval plumbing work without destroying the BC policy.
+
+There is no `noop_head` and no `frac_log_std` — both removed in the minimal
+actor design. NOOP comes from `plan_launch.ok=False`; frac σ is a fixed
+hyperparameter.
 
 ### Phase 1 — post-perception adaptation
 
 Unfreeze:
 
 ```text
-PlayerContextLearner (if implemented)
-StrategyLearner (if implemented)
-ActionLearner L3/L4
-PairHead
-value head
-ship-fraction head
-noop head
+PlayerContextLearner (if implemented; identity stub OK)
+StrategyLearner (if implemented; identity stub OK)
+ActionLearner L3 (DualRoleAttention)
+ActionLearner L4 (JointRoleAttention)
+PairHead trunk + FiLM (in addition to the output Linears already trained in Phase 0)
+value_head (continues)
 ```
 
-Keep L0-L2 frozen. Use low LR for the current action trunk (L3/L4 and PairHead
-trunk/FiLM); keep the PPO-only heads at the higher head LR.
+Keep L0-L2 frozen. Use low LR for the action trunk (L3/L4 and PairHead
+trunk/FiLM); keep the actor output Linears and `value_head` at the higher
+head LR.
 
 **Fallback when post-L2 stubs aren't implemented yet:** if
 `PlayerContextLearner` and `StrategyLearner` are still identity / zero modules
@@ -1061,12 +1100,14 @@ Run the full 128-seed panel before considering a submission.
 
 ## Minimal implementation checklist
 
-1. Add `PPOActorCritic` around current `EntityPretrainModel`. Make sure
-   the forward accepts batch dim > 1 and returns `pair_logits`, `frac_loc`,
-   `noop_logit`, `value`, and `frac_log_std`.
-2. Implement the single-launch categorical action contract plus logit-normal
-   fraction sampling/logprob. Store the exact `action_mask`, semantic
-   `action_id`, `frac_sample`, and logprob components in every shard.
+1. Add `PPOActorCritic` around current `EntityPretrainModel`. The wrapper
+   adds a single `Linear(d_model -> 1)` `value_head`; it does NOT add any
+   actor head. Forward returns `pair_logits`, `frac_loc` (= `pair_frac`),
+   `value`, and `sigma` (fixed CLI hyperparameter).
+2. Implement the single-launch categorical over `P*P` pair cells (no NOOP
+   slot) plus logit-normal fraction sampling with fixed σ. Store the exact
+   `action_mask` (shape `(P*P,)`), `action_id` (flat pair index), `frac_sample`,
+   and logprob components in every shard.
 3. Implement `ppo_rollout_worker.py`:
    - load checkpoint version + promoted opponent pool (loaded once per worker process)
    - hard-fail if the current learner checkpoint appears in the opponent pool
