@@ -48,9 +48,11 @@ PPO trains is an existing supervised parameter.
                                    L4 JointRoleAttention,             └─► pair_frac      │
                                    PairHead trunk + FiLM)                  (B, P, P)     │
                                                                                           │
-                  Categorical(logits = where(legality_mask, flat(pair_logits), −inf))  ◄──┘
-                  LogitNormal(loc = pair_frac[s, t], σ = 0.35 fixed)
-                  NOOP = plan_launch.ok == False (invalid penalty)
+                  source ~ Categorical([NOOP_logit=0] + row_max(pair_logits))         ◄──┘
+                  target_bits[j] ~ Bernoulli(logits = pair_logits[source, j])
+                  one source may emit multiple targets in the same snapshot
+                  frac_raw[j] ~ LogitNormal(loc = pair_frac[source, j], σ = 0.35 fixed)
+                  (row_max, not row_logsumexp — see "Known problems" #1)
 ```
 
 Forward pseudo:
@@ -71,26 +73,38 @@ shape; see "Phase 0 semantic action" + "Fraction distribution" for sampling.
 ### Why this split
 
 - **Decoupled gradients.** `value_loss` enters `value_head`, stops at L2
-  (frozen Phase 0/1). `policy_loss + entropy + bc_loss` enters actor heads,
-  propagates through post-L2 as freezes lift. No cross-talk.
+  because L2 stays frozen throughout PPO. `policy_loss + entropy + bc_loss`
+  enters actor heads, propagates through post-L2 as freezes lift. No
+  cross-talk.
 - **`glob` is the right signal for V(s).** L2's CLS already summarizes the
   board. Pulling role-aware or pair-aware tokens into the value head adds
   variance without changing what is predictable.
-- **No NOOP slot.** NOOP comes from `plan_launch.ok == False` (existing
-  invalid-launch penalty). Saves the actor a dimension and a head.
+- **Explicit source-level NOOP.** The source categorical has a fixed-logit NOOP
+  entry, so the policy can choose not to act without manufacturing an invalid
+  launch. No new learned `noop_head` is required.
 - **σ fixed, not learned.** Keeps the actor's parameter set exactly equal
   to the supervised PairHead's. Anneal σ between runs (start 0.35, lower
   toward 0.15 as PPO converges).
 
 ### Freeze schedule
 
+**PPO never trains anything earlier than L4.** L0–L3 are frozen for the
+entire PPO run (no Phase 2 perception-unfreeze). The supervised L0-L3
+representation is treated as the fixed substrate the actor adapts on top of.
+
 | Phase | Trainable | Frozen | New params |
 |---|---|---|---:|
-| **0 — Plumbing** | `value_head` (3-Linear MLP) + PairHead `pair_logits` head + PairHead `pair_frac` head | L0–L2, ActionLearner trunk (L3 + L4 + PairHead trunk + FiLM) | ~132 k |
-| **1 — Action adaptation** | + PairHead trunk + FiLM + L3 + L4 + planned PlayerContext / Strategy (identity stub OK) | L0–L2 | + 2–10 M |
-| **2 — Perception** | + L2 `CrossEntityAttention`; L1 only with evidence | L0 always | + ~1–2 M |
+| **0 — Plumbing** | `value_head` (3-Linear MLP) + PairHead `pair_logits` head + PairHead `pair_frac` head | L0–L3, PlayerContext / Strategy, L4, PairHead trunk + FiLM | ~132 k |
+| **1 — Action adaptation** | + L4 JointRoleAttention + PairHead trunk + FiLM | L0–L3, PlayerContext / Strategy | + ~1–2 M |
 
-L0 never unfreezes. See "Freeze schedule" for per-phase details.
+**L0 → L3 stay frozen forever.** No phase ever unfreezes
+`CrossEntityAttention` (L2), `PlanetEntityEncoder` (L1), L0 specialists,
+or `DualRoleAttention` (L3). The planned PlayerContext / Strategy modules
+sit between L2 and L3 in the data flow and stay frozen too; if you later
+implement them you can give them their own trainable phase outside the
+L0-L3 freeze rule.
+
+See "Freeze schedule" for per-phase details.
 
 ### PairHead bootstrap preconditions
 
@@ -195,14 +209,14 @@ in several places. These are load-bearing corrections for the implementation:
   PPO wraps it minimally: the actor IS the existing `pair_logits` and
   `pair_frac` outputs; the critic is a new 3-Linear MLP `value_head`
   (`Linear(d → H) → GELU → Linear(H → H) → GELU → Linear(H → 1)`) reading
-  `glob` from L2. No `noop_head`, no learnable σ — NOOP comes from
-  `plan_launch.ok=False`; frac σ is a fixed hyperparameter.
-- **Phase 0 uses a single-launch semantic action only as plumbing.** The
-  runtime `TransformerAgent` can emit multiple thresholded launches per turn
-  with per-source budgeting. A single categorical launch is easier to make
-  mathematically correct for PPO, but it is a behavior mismatch. Treat it as
-  bring-up; before submission either prove the single-launch policy beats the
-  runtime rule or implement an autoregressive/per-source multi-launch sampler.
+  `glob` from L2. No learned `noop_head`, no learnable σ — NOOP is the
+  fixed-logit entry in the source categorical; frac σ is a fixed
+  hyperparameter.
+- **Phase 0 uses a one-source, multi-target semantic action.** Each learner
+  snapshot samples at most one acting source, then samples a multi-hot target
+  set from that source's target logits. This matches the important runtime
+  behavior that one source can split launches across several targets, while
+  keeping the PPO logprob tractable.
 - **The learner must never be its own opponent in rollout.** Opponents come
   only from frozen *promoted* checkpoints plus the supervised baseline. The
   current `policy_vK` being updated is on-policy for learner actions, but it is
@@ -461,8 +475,8 @@ after replay-parity tests pass.
 
 | Option | Shard contents | Pros | Cons |
 |---|---|---|---|
-| **A. Featurized** | `planet_features`, `comet_features`, `fleet_features`, routing tensors, action mask, action, logprob, value, reward, done | Training is fast — just forward through the stored tensors | Large (~MB per episode); slow rsync from B; 2–4× the disk |
-| **B. Raw obs + policy outputs** | raw env obs dict, action mask, action_id, frac, logprob, value, reward, done | ~10× smaller shards, fast rsync | Training has to re-run featurization, costing ~3× CPU per epoch (×N PPO epochs) |
+| **A. Featurized** | `planet_features`, `comet_features`, `fleet_features`, routing tensors, pair/source masks, source id, target bits, frac raws, logprob, value, reward, done | Training is fast — just forward through the stored tensors | Large (~MB per episode); slow rsync from B; 2–4× the disk |
+| **B. Raw obs + policy outputs** | raw env obs dict, pair/source masks, source id, target bits, frac raws, logprob, value, reward, done | ~10× smaller shards, fast rsync | Training has to re-run featurization, costing ~3× CPU per epoch (×N PPO epochs) |
 
 For CPU + Tailscale, **Option B is recommended after the loop is verified**.
 Storage and rsync win exceeds the re-featurization cost when PPO epochs ≤ 3,
@@ -503,15 +517,14 @@ One PPO minibatch step:
 |---|---:|---:|---:|---:|
 | 0 (heads only) | ~1–2 M | ~4–8 MB | ~60 ms | ~12 s/iter |
 | 1 (+ PairHead, L4) | ~5–10 M | ~20–40 MB | ~150 ms | ~30 s/iter |
-| 2 (+ L3) | ~15–25 M | ~60–100 MB | ~400 ms | ~80 s/iter |
 
 For Phase 0, this is ~10% of total iter wall-clock — not worth
 distributing. Keep A-only training in Phase 0. **Switch to
 distributed training starting Phase 1.**
 
-### Less-frequent sync (local SGD) for Phase 2
+### Less-frequent sync (local SGD) if Phase 1 sync dominates
 
-If Phase 2's 80 s/iter sync overhead is intolerable, use *local SGD*:
+If Phase 1 sync overhead becomes intolerable, use *local SGD*:
 each machine takes K=4 optimizer steps locally, then averages weights
 (not grads) every 4 steps. Cuts sync count by 4× at the cost of mild
 divergence between A's and B's model copies. Apply only after Phase 1
@@ -700,7 +713,7 @@ saturate the thin heads almost immediately.
 **Why split this way:**
 
 - **Decoupled gradients.** `value_loss` enters `value_head` and stops at L2
-  (which is frozen in Phase 0/1, only unfrozen in Phase 2). `policy_loss +
+  because L2 stays frozen throughout PPO. `policy_loss +
   entropy + bc_loss` enters the actor heads and propagates back through the
   post-L2 stack as freezes lift.
 - **`glob` is the right signal for V(s).** L2's CLS already summarizes the
@@ -711,9 +724,9 @@ saturate the thin heads almost immediately.
   train and trivially serializable. A single Linear would saturate fast
   against a non-linear value target; deeper than 3 is overkill for a 256-d
   CLS input.
-- **Cleaner Phase-2 transition.** When L2 eventually unfreezes, value-loss on
-  L2 is a single well-conditioned scalar-regression signal — much friendlier
-  than the multi-head action zoo PairHead would dump on L2.
+- **Cleaner restart boundary.** If L2 ever needs to change, retrain the
+  supervised stack and restart PPO from that checkpoint rather than unfreezing
+  perception inside an active PPO run.
 
 Architectural boundary for PPO:
 
@@ -740,27 +753,49 @@ separately because Phase 0 trains those output layers but freezes the trunk.
 
 ### Phase 0 semantic action
 
-Phase 0 samples exactly one (source, target) pair per learner turn from a
-Categorical over the flattened `P * P` `pair_logits` with the legality mask
-applied:
+Phase 0 samples one acting source per learner snapshot, then allows that
+source to launch to multiple targets based on logits:
 
 ```text
-action_id ∈ [0, P*P)        # no NOOP slot
-source, target = unflatten(action_id, P, P)
+source_id ∈ {NOOP, 0..P-1}
+target_bits[j] ∈ {0, 1} for every real target j
 ```
 
-**There is no explicit NOOP action.** NOOP only emerges when `plan_launch`
-rejects the sampled pair (out-of-surplus, blocking planet, boundary, sun, …);
-the rollout earns an invalid-launch penalty in that case. The penalty does
-double-duty: it teaches the policy to put low logit on infeasible cells,
-which is the same thing as learning NOOP via avoiding all-infeasible turns.
+The source distribution is a categorical with a fixed-logit `NOOP` entry.
+The source score is the **row max** over valid targets (not `logsumexp`), to
+avoid an n-targets count bias on the source pick (see "Known problems" #1
+and "Resolutions" below):
 
-This single-launch distribution is intentionally a bring-up simplification.
-It does **not** reproduce the production runner's thresholded multi-launch
-behavior. Track that gap explicitly with emitted-launch rate, per-source
-multi-target opportunities, and eval versus the frozen `transformer_v2_baseline`.
+```text
+source_pair_logits[s, j] = where(pair_mask[s, j], pair_logits[s, j], -inf)
+source_logits[s]         = max_j(source_pair_logits[s, j])      # row max, no count bias
+source_logits[s]         = where(source_mask[s], source_logits[s], -inf)
+source_id                ~ Categorical([noop_logit = 0, source_logits...])
+logp_source              = dist.log_prob(source_id)
+```
 
-Use a cheap legality mask before sampling:
+Reads as: "score each source by its best available target". Sources with
+many merely-OK targets do not artificially win — the per-target Bernoulli
+step still gives them a chance to fire on multiple cells once chosen.
+`noop_logit = 0` is a fixed hyperparameter; expose it as
+`--noop-logit-bias` (default `0.0`) and log `noop_rate` by turn bucket and
+`n_valid_sources` so it can be retuned between runs.
+
+If `source_id == NOOP`, emit no launch and store only the source decision. If a
+real source is sampled, sample a multi-hot target set from that source's row:
+
+```text
+target_logits[j] = pair_logits[source_id, j]
+target_bits[j]   ~ Bernoulli(logits = target_logits[j])  for valid targets
+logp_targets     = sum_j BernoulliLogProb(target_bits[j])
+```
+
+This is the intended action contract: **in one snapshot, one source can launch
+to multiple targets, and the target set is driven by logits.** Runtime eval may
+threshold the Bernoulli probabilities for deterministic play, but PPO rollout
+must sample and store the Bernoulli decisions.
+
+Use cheap legality masks before sampling:
 
 - source exists
 - source is owned by the learner
@@ -771,91 +806,91 @@ Use a cheap legality mask before sampling:
 Do **not** mask by expensive full physics for every pair in v1. That makes CPU
 rollout too slow and can also hide useful negative signal.
 
-### Fraction distribution
+If a non-NOOP source samples an empty target set, emit no launch, record
+`empty_target_set = 1`, and apply a small penalty. This teaches the source
+categorical to choose NOOP when no target is worth launching at, without making
+NOOP depend on invalid physics projection.
 
-Reuse the existing `pair_frac` raw logit as the mean of a logit-normal with
-**fixed σ** (not a learned parameter):
+### Fraction / allocation distribution
+
+For every selected target, reuse the existing `pair_frac[source, target]` raw
+logit as the mean of a logit-normal with **fixed σ** (not a learned parameter):
 
 ```text
-sigma        = 0.35   # fixed hyperparameter, CLI-tunable per run
-z            ~ Normal(frac_loc[source, target], sigma)
-frac_sample  = clamp(sigmoid(z), 1e-4, 1 - 1e-4)    # numerical clamp only
-logp_frac    = Normal.log_prob(logit(frac_sample))
-               - log(frac_sample) - log(1 - frac_sample)
+sigma          = 0.35   # fixed hyperparameter, CLI-tunable per run
+z_j            ~ Normal(frac_loc[source, j], sigma)  for selected targets
+frac_raw_j     = clamp(sigmoid(z_j), 1e-4, 1 - 1e-4) # numerical clamp only
+logp_frac_j    = Normal.log_prob(logit(frac_raw_j))
+                 - log(frac_raw_j) - log(1 - frac_raw_j)
+logp_frac      = sum_j logp_frac_j
 ```
+
+`frac_raw_j` is a semantic allocation preference, not an independent fraction
+of the source's ships. During environment projection, the selected target raws
+are normalized into a source budget split:
+
+```text
+budget_ships = safe_launch_budget(source, surplus)
+weight_j     = frac_raw_j / sum_k(frac_raw_k)
+ships_j      = round_budgeted(weight_j * budget_ships)
+```
+
+This prevents one source's multi-target launches from exceeding its surplus.
+The shard must store the selected targets and the exact `frac_raw_j` values used
+to compute `logp_frac`; PPO recomputes logprob from those stored semantic
+samples, not from the post-projection rounded ship counts.
 
 Why fixed σ rather than learned:
 
-- The actor must use only existing parameters (the user's design constraint).
-  A learned `frac_log_std` would be a new actor parameter.
+- The actor must use only existing parameters. A learned `frac_log_std` would be
+  a new actor parameter.
 - Fixed σ keeps the actor's parameter set identical to the supervised model
   (only PairHead's output Linears) — checkpoint compatibility is trivial.
 - σ controls exploration. Schedule it manually between runs (start `0.35`;
   decrease toward `0.15` as PPO converges) rather than letting the model
   collapse it.
-- Frac's entropy term becomes a constant and drops out of the gradient. This
-  is fine — entropy regularization only needs to act on the categorical, which
-  is the discrete decision dominating exploration.
 
-**Store `frac_sample` (the `[1e-4, 1-1e-4]`-clamped value) in the shard.**
-PPO recomputes `logp_frac` at update time from the stored `frac_sample`, so
-the two must agree exactly — that means the value stored must be the same
-value the log-prob was computed on.
-
-The launch-side clamp is applied **later, only at env projection**, not at
-sampling time:
-
-```text
-ship_fraction_for_launch = clamp(frac_sample, 0.02, 1.00)
-ships                    = round(ship_fraction_for_launch * source.ships)
-```
-
-This separation is load-bearing: if the launch clamp were applied at
-sampling time and the clamped value stored, every step where
-`sigmoid(z) < 0.02` would silently desync stored logprob from the
-sampled action and break the PPO ratio. Add a rollout-replay test that
-recomputes `logp_frac` from `frac_sample` and asserts equality to
-`logprob_frac` in the shard.
-
-Because there is no NOOP slot, every learner turn samples a pair and a frac.
-NOOP semantics come from `plan_launch.ok == False` at env projection.
+Add a rollout-replay test that recomputes `logp_source + logp_targets +
+logp_frac` from the stored `(source_id, target_bits, frac_raw)` using the model
+state that produced the shard.
 
 ### Environment projection
 
-After sampling a launch, convert it to an env action through
-`physics_utils.plan_launch`.
+After sampling the semantic action, convert every selected target into an env
+launch through `physics_utils.plan_launch`, using the budgeted ship count for
+that target.
 
-If `plan_launch.ok == True`:
+For each selected target where `plan_launch.ok == True`:
 
 ```text
-emit [source_planet_id, launch.angle, ships]
+emit [source_planet_id, launch.angle, ships_j]
 ```
 
-If `plan_launch.ok == False`:
+For each selected target where `plan_launch.ok == False`:
 
 ```text
-emit NOOP
-record invalid_launch = 1
+drop that target launch
+record invalid_launch += 1
 record invalid_reason = launch.reason
 apply a small invalid-action penalty
 ```
 
 Do **not** resample until valid. Resampling changes the executed action without
 matching the stored PPO log-probability and makes the update mathematically
-wrong. The sampled invalid action should stay in the rollout with its original
+wrong. The sampled invalid target should stay in the rollout with its original
 logprob, receive a penalty, and teach the policy away from that region.
 
-### Phase 1+ multi-launch upgrade
+### Phase 1+ multi-source upgrade
 
-Before using PPO-trained checkpoints for submission, decide whether the
-single-launch simplification is acceptable. If it leaves obvious value on the
-table, upgrade the sampler to one of these contracts:
+The Phase 0 contract intentionally allows multi-target launches from one source
+only. If this leaves obvious value on the table, upgrade to one of these
+contracts after the PPO loop is stable:
 
 | Contract | Logprob shape | Notes |
 |---|---|---|
-| Per-source categorical | one NOOP/target decision per launchable source | closest to current row-wise budgeting; can emit several sources per turn |
-| Autoregressive top-K | sequentially sample pair/STOP with source budgets updated after each pick | closest to threshold runner; most code |
-| Bernoulli per legal pair | independent fire/no-fire per cell | simple but high-variance and needs strict cap/budget rules |
+| Per-source independent rows | one target-bit vector per launchable source | closest to threshold runner; can emit several sources per turn |
+| Autoregressive source rows | sequentially sample source/STOP, then target bits for that source | stronger budget control; more code |
+| Bernoulli per legal pair | independent fire/no-fire per cell | simple but high-variance and needs strict global caps |
 
 Keep the chosen semantic action in the rollout exactly as sampled. Projection
 through `plan_launch` may drop invalid launches, but it must not alter the
@@ -888,7 +923,7 @@ Minimum fields:
     "machine_id": str,
     "created_at": str,
     "git_sha": str,
-    "policy_action_contract": "single_launch_v1",
+    "policy_action_contract": "source_multi_target_v1",
     "episodes": [
         {
             "seed": int,
@@ -907,11 +942,14 @@ Minimum fields:
                 "routing":         dict[str, Tensor],
 
                 # PPO data
-                "action_mask":      Tensor[n, P*P], # exact pair mask used for sampling (no NOOP slot)
-                "action_id":       Tensor[n],      # flat pair index in [0, P*P)
-                "frac_sample":     Tensor[n],
-                "logprob":         Tensor[n],      # logp_action + logp_frac
-                "logprob_action":  Tensor[n],
+                "pair_mask":        Tensor[n, P, P], # exact pair mask used for source/target sampling
+                "source_mask":      Tensor[n, P],    # source-eligible rows
+                "source_id":        Tensor[n],       # -1 = NOOP, else source index in [0, P)
+                "target_bits":      Tensor[n, P],    # multi-hot targets for source_id
+                "frac_raw":         Tensor[n, P],    # valid only where target_bits == 1
+                "logprob":         Tensor[n],        # logp_source + logp_targets + logp_frac
+                "logprob_source":  Tensor[n],
+                "logprob_targets": Tensor[n],
                 "logprob_frac":    Tensor[n],
                 "value":           Tensor[n],
                 "reward":          Tensor[n],
@@ -919,12 +957,13 @@ Minimum fields:
 
                 # diagnostics
                 "invalid_launch":  Tensor[n],
+                "empty_target_set": Tensor[n],
                 "invalid_reason":   list[str],
                 "emitted_launch":   Tensor[n],      # bool
                 "source_idx":       Tensor[n],
-                "target_idx":       Tensor[n],
+                "target_indices":   list[list[int]],
                 "source_pid":       Tensor[n],
-                "target_pid":       Tensor[n],
+                "target_pids":      list[list[int]],
             },
         },
     ],
@@ -933,9 +972,10 @@ Minimum fields:
 
 Use CPU tensors and save with `torch.save`. Prefer `float16` or compressed
 `npz` only after the loop is correct; debuggability matters more at first.
-`action_mask` is mandatory for featurized shards because the cheap legality
-mask depends on source ownership, surplus, padding, and diagonal removal; do
-not try to reconstruct it from normalized model features during the PPO update.
+`pair_mask` and `source_mask` are mandatory for featurized shards because the
+cheap legality mask depends on source ownership, surplus, padding, and diagonal
+removal; do not try to reconstruct them from normalized model features during
+the PPO update.
 
 If rollout files become too large, the first optimization is to store raw obs
 plus policy outputs and re-featurize on the learner. That path must have a
@@ -983,6 +1023,32 @@ and calibration is no longer consulted.
 The calibration eval is also a sanity check: if baseline-vs-baseline
 winrate is not ≈0.50 ± 0.05, the eval harness is broken (RNG seeding,
 seat-symmetric scoring, etc.) — fix before iter 0.
+
+### T=1 vs T=6 ablation (also pre-iter-0)
+
+PPO rolls out at `T=1` for CPU cost reasons, but the supervised PairHead
+was trained at `T=6`. A T=1 distribution shift can silently degrade the
+target-selection signal PPO is supposed to fine-tune (see "Known
+problems" #8). Run a second one-shot eval before iter 0:
+
+```text
+ablation_T6 = quick_eval(transformer_v2_baseline, T=6, SEEDS_QUICK,
+                         opponents=[physical_v4])
+ablation_T1 = quick_eval(transformer_v2_baseline, T=1, SEEDS_QUICK,
+                         opponents=[physical_v4])
+delta_pp    = ablation_T6.winrate.physical_v4 - ablation_T1.winrate.physical_v4
+```
+
+**Gate:** refuse to start PPO if `delta_pp > 0.05` (T=1 drops winrate vs
+`physical_v4` by more than 5 pp). Options when the gate fails:
+
+1. Accept the perf hit and proceed at T=1, noting that PPO is optimizing
+   through a degraded observation interface.
+2. Retrain the supervised PairHead at T=1 (cheaper inference, smaller
+   rollout shards) and bootstrap PPO from that ckpt.
+3. Run PPO at T=6 from the start, taking the rollout-CPU cost hit.
+
+Persist the result to `data/runs/ppo/<run_id>/eval/v0_t_ablation.json`.
 
 ## Iteration lifecycle
 
@@ -1169,7 +1235,12 @@ BC anchor.
 
 ## Freeze schedule
 
-Do not unfreeze everything at once.
+**PPO never trains anything earlier than L4.** L0–L3 are frozen for the
+entire PPO run; there is no Phase 2 perception unfreeze. The supervised
+L0–L3 representation is treated as the fixed substrate the actor adapts on
+top of, and PPO only ever moves the parameters strictly **after L3** in the
+data flow (L4 + PairHead trunk + FiLM + PairHead 2 heads + the new
+`value_head`).
 
 ### Phase 0 — PPO plumbing
 
@@ -1181,79 +1252,104 @@ PairHead pair_logits head         (existing 3-Linear MLP)
 PairHead pair_frac head           (existing 3-Linear MLP)
 ```
 
-Freeze L0-L2 world perception and freeze the ActionLearner trunk
-(L3/L4 + PairHead trunk + FiLM). Goal: prove PPO logprobs, value learning,
-GAE, and eval plumbing work without destroying the BC policy.
+Freeze everything else: L0 specialists, L1, L2, the planned PlayerContext /
+Strategy modules, L3 DualRoleAttention, L4 JointRoleAttention, and the
+PairHead trunk + FiLM conditioner. Goal: prove PPO logprobs, value
+learning, GAE, and eval plumbing work without destroying the BC policy.
 
-There is no `noop_head` and no `frac_log_std` — both removed in the minimal
-actor design. NOOP comes from `plan_launch.ok=False`; frac σ is a fixed
-hyperparameter.
+There is no learned `noop_head` and no `frac_log_std` — both are removed in the
+minimal actor design. NOOP is the fixed-logit entry in the source categorical;
+frac σ is a fixed hyperparameter.
 
 Note: the supervised PairHead ckpt PPO consumes must have been trained with
 `head_n_layers >= 3` and `conditioner_n_layers >= 2` (see "PairHead bootstrap
 preconditions"). Phase 0 trains the deep `pair_logits` and `pair_frac` heads
 in their entirety, not just a final output Linear.
 
-### Phase 1 — post-perception adaptation
+### Phase 1 — action adaptation (after L3 only)
 
 Unfreeze:
 
 ```text
-PlayerContextLearner (if implemented; identity stub OK)
-StrategyLearner (if implemented; identity stub OK)
-ActionLearner L3 (DualRoleAttention)
 ActionLearner L4 (JointRoleAttention)
-PairHead trunk + FiLM (in addition to the output Linears already trained in Phase 0)
+PairHead trunk + FiLM (in addition to the 2 output heads already trained in Phase 0)
 value_head (continues)
 ```
 
-Keep L0-L2 frozen. Use low LR for the action trunk (L3/L4 and PairHead
-trunk/FiLM); keep the actor output Linears and `value_head` at the higher
-head LR.
+Keep frozen: L0, L1, L2, PlayerContext / Strategy, **L3 DualRoleAttention**.
+Use low LR for the L4 + PairHead trunk + FiLM block; keep the actor heads
+and `value_head` at the higher head LR.
 
-**Fallback when post-L2 stubs aren't implemented yet:** if
-`PlayerContextLearner` and `StrategyLearner` are still identity / zero modules
-(see "Actor-critic wrapper"), Phase 1 has no new parameters at those layers.
-It then reduces to: unfreeze the existing `aggregator/dual_role_attention.py`
-(L3) + `aggregator/joint_role_attention.py` (L4) + full `PairHead` (trunk +
-FiLM + output layers). The conceptual L0-L2 / post-L2 boundary is preserved
-for Phase 2 planning, but the actual trainable parameter set is the same as
-the prior design's Phase 1.
+L3's role-aware tokens stay fixed at their supervised values. L4 is the
+only attention block PPO updates, and its job is to re-mix the frozen
+L3-produced source/target tokens under the PPO objective. This caps PPO's
+ability to disturb the perception/role substrate while still letting it
+adapt the final pair-scoring stage to game outcomes.
 
-### Phase 2 — perception adaptation, only if needed
+### Phase 2 — does not exist
 
-If Phase 1 plateaus and diagnostics show world perception is stale or missing
-facts, unfreeze:
-
-```text
-CrossEntityAttention (L2)
-PlanetEntityEncoder (L1), only after L2 evidence
-post-L2 learner stack
-```
-
-Keep L0 specialists frozen unless there is strong evidence that perception
-itself is wrong. L0 was pretrained for physical/entity perception and should
-not be rewritten by sparse PPO rewards early.
+There is no Phase 2 in this design. L0-L3 stay frozen for the entire PPO
+run. If diagnostics later show world perception or role-assignment is
+genuinely stale (e.g., the policy can't beat the baseline in eval despite
+healthy KL and stable BC anchor), the right response is to retrain the
+**supervised PairHead** with updated L0-L3 modules and restart PPO from
+the new ckpt — not to unfreeze L0-L3 in flight during PPO.
 
 ## BC anchor
 
-Use a small supervised anchor during PPO to prevent policy collapse:
+Use a small supervised anchor during PPO to prevent policy collapse. The
+anchor must match the `source_multi_target_v1` factorization — a flat
+pair-BCE alone fights the source categorical (see "Known problems" #4).
+
+**Factorized BC loss** (drop-in for the prior flat `BCE(pair_logits, …)`):
 
 ```text
-loss = ppo_loss
-     + value_coef * value_loss
-     - entropy_coef * entropy
-     + bc_coef * BCE(pair_logits, expert_pair_labels)
+# Per snapshot, the pair cache provides:
+#   expert_source_one_hot  (P,)        — which source the expert launched from
+#   expert_target_bits     (P, P) bool — per-source row of expert target bits
+#                                         (multi-positive on coalition turns)
+#
+# Project supervised pair_logits into the same source / target spaces the
+# PPO actor reads from (no new heads — same projections):
+src_scores = max_j(where(pair_mask[s, j], pair_logits[s, j], -inf))      # (P,)
+src_scores = concat([noop_score = 0, src_scores])                        # (P+1,)
+
+# 1. Source BC — cross-entropy against the (P+1)-way expert source.
+#    NOOP supervision is "no expert launched from any source this snapshot".
+expert_src_idx = expert_source_idx_or_noop                               # ∈ {0..P}
+bc_source = CrossEntropy(src_scores, expert_src_idx)
+
+# 2. Target BC — Bernoulli on the EXPERT's source row (if expert acted).
+#    Mask to that single source's row so the loss does not bleed across rows
+#    and does not contradict the source categorical.
+if expert_src_idx > 0:
+    s = expert_src_idx - 1
+    bc_target = BernoulliBCE(pair_logits[s, :], expert_target_bits[s, :],
+                              mask=pair_mask[s, :])
+else:
+    bc_target = 0
+
+bc_loss = bc_source + bc_target_weight * bc_target
 ```
 
 Start:
 
 ```text
-bc_coef = 0.05
+bc_coef             = 0.05      # outer coefficient on bc_loss
+bc_target_weight    = 1.0       # relative weight of target BCE vs source CE
+                                # tune up to ~3.0 if source CE dominates
 ```
 
-Decay toward `0.0` only after deterministic eval beats the BC-only policy.
-Sample BC minibatches from the existing pair cache, not from rollout shards.
+Two diagnostics make BC failures separable:
+
+- `bc_source_loss` / `bc_target_loss` reported separately so you can see
+  whether the source categorical or the target Bernoulli is the limiter.
+- `bc_source_top1_acc` (argmax over `src_scores` vs `expert_src_idx`) and
+  `bc_target_row_recall_at_k` (per-row recall on the expert's source).
+
+Decay `bc_coef` toward `0.0` only after deterministic eval beats the
+BC-only policy. Sample BC minibatches from the existing pair cache, not
+from rollout shards.
 
 ## Evaluation gate
 
@@ -1275,7 +1371,18 @@ Report:
 - invalid launch rate
 - emitted launch rate
 - launch miss matrix from the dashboard analysis
-- entropy
+- launch miss matrix **broken down by source type** (static / orbital / comet)
+  — needed to surface "Known problems" #6 (projection hiding policy errors)
+- selected-vs-emitted target counts per snapshot (gap = targets dropped by
+  `plan_launch` after PPO logprob was already committed)
+- per-target invalid reason histogram (`wrong_planet_*`, `boundary`, `sun`,
+  `exceeds_surplus`, `min_launch`, …)
+- `target_count_per_chosen_source` distribution (mean / p50 / p95) — flags
+  "Known problems" #3 (Bernoulli weak count control)
+- `bc_source_loss`, `bc_target_loss`, `bc_source_top1_acc`,
+  `bc_target_row_recall_at_k` — separate the factorized BC anchor
+- `noop_rate` overall + bucketed by `n_valid_sources`
+- entropy (split: `entropy_source`, `entropy_target`)
 - approx KL
 - value explained variance
 - mean/median episode length
@@ -1305,7 +1412,7 @@ Run the full 128-seed panel before considering a submission.
 | self-play winrate up but heuristic eval drops | policy overfit to current pool; cyclic chase | raise the older-uniform pool slot from 20% → 40%; lower the latest-promoted slot accordingly; check `transformer_v2_baseline` winrate is still near the floor |
 | pool keeps cycling (winrate vs each pool member oscillates) | pool too small / latest-only sampling | grow `N_pool` from 8 → 16; lower the latest-promoted slot to ≤ 40% |
 | rollout opponent is `policy_vK` | pool builder used the learner checkpoint instead of promoted ckpts | hard-fail rollout startup; `policy_vK` may be learner only, never opponent |
-| PPO ratio NaNs or changes under replay | missing/stale `action_mask` or unstable fraction clamp | store exact action mask and clamp fraction before logit/logprob; add rollout replay test |
+| PPO ratio NaNs or changes under replay | missing/stale `pair_mask` / `source_mask`, target-bit drift, or unstable fraction clamp | store exact masks, source id, target bits, and frac raws; add rollout replay test |
 | CPU rollout too slow | one env per worker, no `torch.compile` | enable batched envs (`N_env=4-8`), `torch.compile(mode="reduce-overhead")`, share opponent model across workers (see "CPU performance → Rollout") |
 | grad sync dominates iter wall-clock in Phase 1+ | per-minibatch full-grad rsync | switch to local SGD (avg every K=4 steps), or shrink minibatch count |
 | disk on A fills up | rollouts/checkpoints accumulating | run `scripts/ppo_archive.sh` after each iteration's promotion gate; the script moves cold data to B's `archive/` |
@@ -1323,9 +1430,10 @@ Run the full 128-seed panel before considering a submission.
    The bootstrap PairHead ckpt must have been trained with
    `conditioner_n_layers >= 2` and `head_n_layers >= 3` (see "PairHead
    bootstrap preconditions") — refuse to load shallower ckpts at startup.
-2. Implement the single-launch categorical over `P*P` pair cells (no NOOP
-   slot) plus logit-normal fraction sampling with fixed σ. Store the exact
-   `action_mask` (shape `(P*P,)`), `action_id` (flat pair index), `frac_sample`,
+2. Implement the `source_multi_target_v1` action contract: source categorical
+   with fixed-logit NOOP, Bernoulli target bits over the chosen source's row,
+   and logit-normal frac raws for selected targets with fixed σ. Store the
+   exact `pair_mask`, `source_mask`, `source_id`, `target_bits`, `frac_raw`,
    and logprob components in every shard.
 3. Implement `ppo_rollout_worker.py`:
    - load checkpoint version + promoted opponent pool (loaded once per worker process)
@@ -1338,7 +1446,8 @@ Run the full 128-seed panel before considering a submission.
    - rsync-pull B's shards
    - **hard-fail on mismatch** of shard `policy_version` (must equal current
      `vK`), `policy_action_contract` (must equal the contract the learner is
-     configured for), and presence/shape of `action_mask`. Never silently
+     configured for), and presence/shape of `pair_mask`, `source_mask`, and
+     `target_bits`. Never silently
      train on cross-version or cross-contract shards — log the offending
      shard path and abort the iteration.
    - compute GAE
@@ -1365,8 +1474,8 @@ run_id: ppo_v2_cpu_<timestamp>
 policy init: best supervised entity_encoder PairHead checkpoint (latest top4 ckpt)
 T: 1
 mode: 2P only
-action contract: single_launch_v1
-freeze: Phase 0 (PairHead output layers + PPO-only heads); no distributed training yet
+action contract: source_multi_target_v1
+freeze: Phase 0 (value_head + PairHead output layers); no distributed training yet
 
 rollouts: 100% self-play, parallel on A and B
   pool init: [transformer_v2_baseline]  # all opponent slots fall back to baseline
@@ -1387,7 +1496,7 @@ training (Phase 0 — A only):
   minibatch: 1024  (CPU-friendly; smaller than the supervised default)
   lr heads: 1e-4
   lr trunk: frozen
-  fraction distribution: logit-normal, shared learned log_std
+  fraction distribution: per-selected-target logit-normal, fixed sigma
   bc_coef: 0.05  (anchor to supervised pair cache on A; doubled to 0.10
                   once Phase 1 distributed training starts, since BC loss
                   lives only on A's gradient)
@@ -1420,3 +1529,196 @@ and physical_v4 matches are regression guards.
 
 Do not scale to larger asynchronous rollouts until this synchronous two-machine
 loop shows stable KL, stable entropy, and non-degrading miss matrices.
+
+## Known problems / design risks
+
+These are not blockers for the first implementation, but they are the places
+most likely to make `source_multi_target_v1` fail or produce misleading PPO
+signals.
+
+1. **Source score via row `logsumexp` is biased by target count and logit
+   scale.** A source with many mediocre valid targets can beat a source with
+   one excellent target because `logsumexp` grows with the number of valid
+   cells. Track selected-source entropy, source row max, source row mean, and
+   target count. If source choices look diffuse or over-favor high-candidate
+   rows, replace `row_logsumexp(pair_logits)` with a small explicit source
+   scorer or use `row_max + learned_row_summary`.
+
+2. **The fixed NOOP logit may be poorly calibrated.** `noop_logit = 0` is simple
+   and adds no learned actor parameter, but the scale of PairHead logits can
+   move as PPO trains. If NOOP is almost never sampled or dominates early,
+   expose `noop_logit` as a CLI bias/temperature, still fixed during a run, and
+   log `noop_rate` by turn bucket and source-mask availability.
+
+3. **Independent Bernoulli target bits have weak target-count control.** The
+   policy can sample zero targets or too many targets from the chosen source.
+   `empty_target_set` catches the first case; the second needs `targets_per_src`
+   metrics, a soft cap penalty, or a later top-k/STOP contract. Do not silently
+   truncate target bits during rollout, because that changes the semantic action
+   without matching the stored PPO logprob.
+
+4. **BC anchor must match the factorized action contract.** The current cache
+   has pair labels, but PPO now factorizes action as source categorical plus
+   target Bernoulli row. The BC loss should supervise source selection from
+   rows with any positive pair and target bits within the chosen/gold source
+   rows. A flat pair BCE alone may fight the source categorical and hide whether
+   source selection or target-set selection is failing.
+
+5. **`pair_frac` semantics changed under multi-target allocation.** Supervised
+   `pair_frac[source, target]` used to mean an independent launch fraction for
+   one pair. In `source_multi_target_v1`, selected `frac_raw` values are
+   normalized into a shared source budget. That makes them allocation weights,
+   not absolute fractions. Track budget exhaustion, per-target ship error
+   against expert launches, and whether normalized small targets starve.
+
+6. **Projection can still hide policy errors.** `plan_launch` may drop selected
+   target bits after PPO has already committed to their logprob. This is correct
+   PPO accounting, but it means eval must distinguish semantic target choices
+   from emitted launches. Log per-target invalid reasons, selected-vs-emitted
+   target counts, and miss matrix categories by source type.
+
+7. **One source per snapshot is still a policy-class limitation.** The contract
+   captures "one source can launch multiple targets" but not "multiple sources
+   can act in the same snapshot." If eval shows good target quality but low
+   emitted-launch volume or poor reinforcement timing, move to the Phase 1+
+   multi-source contract rather than trying to fix it with reward shaping.
+
+8. **T=1 rollout is a distribution shift from T=6 supervised training.** CPU
+   cost justifies T=1 for bring-up, but the model may lose fleet-history signal
+   that the PairHead relied on. Run a pre-PPO deterministic T=1 vs T=6 ablation
+   on the same checkpoint; if target selection drops sharply, PPO is optimizing
+   through a damaged observation interface.
+
+9. **PlayerContext and Strategy are named but not yet load-bearing.** The
+   protocol freezes planned post-L2 modules during PPO. If they are identity or
+   zero modules, the action learner still has to infer player state and doctrine
+   from pair tokens. Treat explicit PlayerContext/Strategy as a separate
+   supervised bring-up target before expecting PPO to learn strategy cleanly.
+
+10. **Value head may be underconditioned.** `glob` describes the board, but value
+    also depends on learner seat, opponent checkpoint, and self-play pool mix.
+    If value explained variance stays poor while policy metrics move, condition
+    the critic on seat/opponent/player context or train separate value baselines
+    per opponent bucket.
+
+## Resolutions
+
+For each known problem above, this section records the verdict — **fix
+applied** (spec or code now reflects the fix), **diagnostic added** (no
+behavior change yet but the failure mode will be observable in the eval/
+log fields so we can act on evidence), or **accepted limitation** (the
+trade-off is intentional and documented). Reasoning included so future
+revisits start from the same context.
+
+| # | Problem | Verdict | Where |
+|---|---|---|---|
+| 1 | Source `logsumexp` count bias | **Fix applied** | "Phase 0 semantic action" |
+| 2 | Fixed NOOP logit calibration | **Diagnostic added** + CLI flag | "Phase 0 semantic action", train_log |
+| 3 | Bernoulli weak target-count control | **Diagnostic added** | "Evaluation gate" report list |
+| 4 | BC anchor mismatched with factorized action | **Fix applied** | "BC anchor" |
+| 5 | `pair_frac` semantics changed under allocation | **Accepted + documented loudly** | "Fraction / allocation distribution" |
+| 6 | Projection can hide policy errors | **Diagnostic added** | "Evaluation gate" report list |
+| 7 | One source per snapshot is a policy-class limit | **Accepted; upgrade path documented** | "Phase 1+ multi-source upgrade" |
+| 8 | T=1 distribution shift from T=6 supervised | **Pre-iter-0 gate added** | "T=1 vs T=6 ablation" |
+| 9 | PlayerContext / Strategy not load-bearing yet | **Accepted; separate workstream** | (this section) |
+| 10 | Value head may be underconditioned | **Diagnostic added; fallback documented** | (this section) |
+
+### Reasoning per item
+
+1. **Source `logsumexp` count bias — fix applied.** `row_logsumexp(pair_logits)`
+   grows with the number of valid targets, so a source with 8 mediocre options
+   beats a source with 1 excellent option purely from cell count. Swapped to
+   `max_j(pair_logits[s, j])` in both "Phase 0 semantic action" (PROTOCOL) and
+   `sample_source_multi_target` (PSEUDOCODE). Reads as "score each source by its
+   best available target". Doesn't penalize multi-target sources because the
+   per-target Bernoulli step still fires on multiple cells once the source is
+   chosen. The portfolio-style "this source is good *because* it has many
+   options" argument is moot under the one-source-per-snapshot Phase 0 contract;
+   if Phase 1+ moves to multi-source, revisit.
+
+2. **NOOP logit calibration — diagnostic, no spec fix yet.** Hard-coding
+   `noop_logit = 0` is a reasonable starting point and keeps "no new actor
+   parameter" intact. The right move is observability first: surface
+   `noop_rate` overall + bucketed by `n_valid_sources` in the eval report, and
+   expose `--noop-logit-bias` (default `0.0`) so runs can be retuned between
+   iterations without code edits. If NOOP rate stays near 0 or 1 once the
+   policy stabilizes, retune the bias rather than learning it (a learned NOOP
+   head re-introduces an actor parameter we explicitly didn't want).
+
+3. **Bernoulli weak target-count control — diagnostic, no spec fix yet.** The
+   `empty_target_set` penalty handles the zero case. The too-many case is
+   gated by observability: `target_count_per_chosen_source` (mean / p50 / p95)
+   enters the eval report. If the p95 routinely exceeds ~4 (production runner's
+   typical ceiling) without a winrate win, add a soft cap penalty
+   `λ * max(0, k − k_max)^2` as an opt-in flag. **Do not** silently truncate
+   target bits during rollout — that would desync stored logprob from executed
+   action and break the PPO ratio.
+
+4. **BC anchor mismatched — fix applied.** A flat `BCE(pair_logits,
+   expert_pair_labels)` supervises the *flattened* pair space, but the actor
+   factorizes as source-then-target. The two gradients pull in different
+   directions and hide whether failures are at source selection or target
+   selection. Replaced with a factorized BC in "BC anchor":
+   `bc_loss = CE(src_scores, expert_source) + BernoulliBCE(pair_logits[expert_src, :],
+   expert_target_bits)`. The two parts get separate diagnostics
+   (`bc_source_top1_acc`, `bc_target_row_recall_at_k`) so we can see which
+   component is the limiter. Reuses the existing `pair_cache` — only the loss
+   computation changes.
+
+5. **`pair_frac` semantic change — accepted, documented loudly.** Supervised
+   `pair_frac[s, t]` was trained on `target_ships / source_ships` for *one*
+   pair. Under multi-target allocation the selected `frac_raw_j` values get
+   normalized into a shared source budget, which makes them weights rather than
+   absolute fractions. The supervised init is now an approximate starting
+   point, not an exact match. Rejected the alternative (introduce a new
+   allocation-aware head) because it violates the "use existing PairHead
+   outputs" constraint. Trade-off accepted: PPO learns the right allocation
+   under the policy gradient. Mitigation: monitor per-target ship error vs
+   expert launches and budget exhaustion; if normalized small-weight targets
+   chronically starve, revisit the normalization formula (e.g., temperature on
+   `frac_raw` softmax instead of plain division).
+
+6. **Projection hides policy errors — diagnostic added.** This is the existing
+   trade-off of using `plan_launch` as a safety gate, not a bug. The invalid
+   penalty does the right thing for the actor; eval just needs the data to
+   distinguish "policy chose badly" from "policy chose fine but physics
+   rejected." Added per-target invalid-reason histogram, selected-vs-emitted
+   target counts, and a launch-miss matrix broken down by source type to the
+   "Evaluation gate" report list. No spec change beyond reporting.
+
+7. **One source per snapshot — accepted; upgrade path documented.** The
+   policy-class limit is by design for Phase 0. The "Phase 1+ multi-source
+   upgrade" section already specifies three concrete upgrade contracts
+   (per-source independent rows, autoregressive source rows, Bernoulli per
+   legal pair). Trigger condition: if Phase 0 eval shows good per-source
+   target quality (high `bc_target_row_recall_at_k`) but low overall
+   `emitted_launch_rate` vs the supervised runner, that's the signal to move
+   to a multi-source contract — fix it in the policy class rather than
+   patching with reward shaping.
+
+8. **T=1 distribution shift — pre-iter-0 gate added.** PPO rolls out at T=1
+   for CPU cost; supervised PairHead was trained at T=6. Easy to miss this
+   silently degrading target selection. Added a T=1 vs T=6 ablation as part
+   of startup calibration that refuses to start PPO if `winrate vs physical_v4`
+   drops by more than 5 pp at T=1. Failure routes: accept the hit, retrain
+   supervised at T=1, or pay the rollout-CPU cost of T=6 from iter 0.
+
+9. **PlayerContext / Strategy not load-bearing — accepted; separate
+   workstream.** These modules are conceptual today (identity / zero stubs).
+   PPO doesn't depend on them being implemented — the freeze schedule keeps
+   them frozen alongside L0–L3. The right home for them is a *supervised*
+   bring-up run that adds player-state and doctrine targets to the
+   pretraining objective; PPO should bootstrap from a ckpt that already has
+   them trained, not try to learn strategy through them from sparse PPO
+   reward. Out of scope for the PPO MVP.
+
+10. **Value head may be underconditioned — diagnostic + fallback flag.** The
+    3-Linear MLP on `glob` is sized for V(s) ≈ f(board state). If
+    `value_explained_variance` stays poor for ~5 iterations after policy KL
+    and entropy stabilize, concat seat one-hot + opponent-id embedding into
+    the `value_head` input: `value_head(concat[glob, seat_emb, opp_emb])`.
+    This is a minimal extension (still no L3/L4 coupling) gated on evidence.
+    Add `--value-condition-seat`, `--value-condition-opponent` flags now so
+    the toggle is one-line later. Rejected per-opponent value baselines for
+    v1: more code, less interpretable, and the seat/opp-conditioned single
+    head is usually enough.
