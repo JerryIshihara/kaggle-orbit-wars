@@ -2,16 +2,18 @@
 
 The active training path freezes three L0 specialist encoders
 (:class:`PlanetEncoder`, :class:`CometEncoder`, and
-:class:`FleetEncoder`) and trains the L1→L4 perception / role stack plus
-a single :class:`PairHead` on expert source→target pair-set labels.
+:class:`FleetEncoder`) and trains L1→L2 world perception plus the current
+compact post-L2 ActionLearner (L3→L4→PairHead) on expert source→target
+pair-set labels.
 
 The on-disk pair cache stores raw snapshot tensors plus current-turn
 ``pair_labels`` / ``pair_valid`` matrices. At train time we run the
 frozen L0 encoders under ``no_grad``, hard-route planet-vs-comet slots
 with ``torch.where(is_comet, comet_tok, planet_tok)``, then train:
 
-``PlanetEntityEncoder → CrossEntityAttention → DualRoleAttention →
-JointRoleAttention → PairHead``.
+``PlanetEntityEncoder → CrossEntityAttention`` finishes world perception;
+``DualRoleAttention → JointRoleAttention → PairHead`` is the current compact
+action learner.
 
 The current cache is history-aware: ``CachedPairDataset`` stacks the
 T=6 window ``(t-5, t-4, t-3, t-2, t-1, t)`` at ``__getitem__`` time,
@@ -691,7 +693,7 @@ class EntitySnapshotDataset(Dataset):
 
 # ---------- Model ----------
 class EntityPretrainModel(nn.Module):
-    """Per-planet supervised head over a 4-layer trainable stack.
+    """Pair supervised model over world perception + action learning.
 
     Stack (L0 specialists held externally, frozen):
 
@@ -701,17 +703,22 @@ class EntityPretrainModel(nn.Module):
       L2  CrossEntityAttention
           self-attention across planets + learned CLS → per-planet
           ``ctx_now (B, P, d)`` and snapshot ``glob (B, d)``.
+
+          This is the end of world perception. Above L2 the model should
+          learn learner-relative context, strategy, and actions rather than
+          re-discovering what exists on the board.
+
       L3  DualRoleAttention
-          two parallel role-conditioned cross-attention branches over
-          ``ctx_now``:
+          current compact ActionLearner: two parallel role-conditioned
+          cross-attention branches over ``ctx_now``:
             * source-to-target → ``source_aware (B, P, d)``
             * target-to-source → ``target_aware (B, P, d)``
       L4  JointRoleAttention
-          concatenates ``source_aware`` and ``target_aware`` into one
-          ``(B, 2P, d)`` sequence (with fresh role embeddings),
-          runs a 1-layer Pre-LN TransformerEncoder so every (slot,
-          role) attends to every other (slot, role), then splits
-          back into ``source_joint (B, P, d)`` and
+          current compact ActionLearner: concatenates ``source_aware``
+          and ``target_aware`` into one ``(B, 2P, d)`` sequence (with
+          fresh role embeddings), runs a 1-layer Pre-LN TransformerEncoder
+          so every (slot, role) attends to every other (slot, role), then
+          splits back into ``source_joint (B, P, d)`` and
           ``target_joint (B, P, d)``.
 
       Head (pair score, replaces the prior binary decoders):
@@ -729,11 +736,9 @@ class EntityPretrainModel(nn.Module):
       ``CachedPairDataset`` cache (built by
       ``scripts/build_pair_dataset_orbital_occle.py``).
 
-    L4 is the explicit mix step after the parallel source/target
-    branches. It does not collapse the roles into one vector; it lets
-    source-mode and target-mode tokens exchange information, then keeps
-    separate ``source_joint`` and ``target_joint`` streams for the pair
-    scorer.
+    Planned next split: insert explicit ``PlayerContextLearner`` and
+    ``StrategyLearner`` modules between L2 and the ActionLearner. The
+    current L3/L4/PairHead path is the compact action learner placeholder.
     """
 
     def __init__(
@@ -755,9 +760,10 @@ class EntityPretrainModel(nn.Module):
         self.d_model = d_model
         self.n_steps = int(n_steps)
         # All MHA blocks default to 8 heads (head_dim = d_model // 8 = 32 at
-        # d_model=256). ``entity_n_heads`` controls L1's planet←fleet cross-attn;
-        # ``cross_n_heads`` controls L2's self-attn; ``dual_n_heads`` controls
-        # BOTH L3 (DualRoleAttention) and L4 (JointRoleAttention).
+        # d_model=256). ``entity_n_heads`` controls L1's planet←fleet
+        # perception; ``cross_n_heads`` controls L2's world-perception
+        # self-attn; ``dual_n_heads`` controls the current compact
+        # post-L2 ActionLearner blocks L3 and L4.
         self.entity_n_heads = int(entity_n_heads)
         self.cross_n_heads = int(cross_n_heads)
         self.cross_n_layers = int(cross_n_layers)
@@ -830,11 +836,13 @@ class EntityPretrainModel(nn.Module):
     # Freeze / unfreeze helpers                                          #
     # ------------------------------------------------------------------ #
     def freeze_perception(self) -> dict[str, int]:
-        """Freeze L1–L4 perception so only the PairHead trains.
+        """Freeze the current upstream stack so only the PairHead trains.
 
         L0 specialists are already frozen by ``_load_encoders`` (they live
-        outside the EntityPretrainModel). This zeros out the parameter
-        budget for the entity / cross / dual_role / joint_role submodules.
+        outside the EntityPretrainModel). Conceptually, L1-L2 are world
+        perception and L3-L4 are the current compact ActionLearner. This
+        helper freezes both groups because the existing "head-only"
+        experiment is meant to test PairHead capacity, not post-L2 adaptation.
         Returns ``{layer: param_count_frozen}`` for the build log.
 
         Caller convention: invoke right after model construction, before
@@ -970,6 +978,109 @@ class EntityPretrainModel(nn.Module):
             pair_valid=pair_valid,
         )
         return heads
+
+    def forward_with_context(
+        self,
+        planet_tokens: torch.Tensor,
+        fleet_tokens: torch.Tensor,
+        routing: dict[str, torch.Tensor],
+        planet_mask: torch.Tensor,
+        is_comet: torch.Tensor | None = None,
+        pair_type_ids: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Like :meth:`forward` but also returns ``glob`` and ``ctx_now``.
+
+        Used by PPO (``agents.transformer_v2.ppo.PPOActorCritic``): the
+        critic reads ``glob`` (L2 CLS readout); diagnostics consume
+        ``ctx_now`` and the L4 joint role tokens.
+
+        Returns ``{pair_logits, pair_frac, glob, ctx_now, source_joint,
+        target_joint, l1_now}``.
+        """
+        is_temporal = planet_tokens.dim() == 4
+        if is_temporal:
+            B, T, P, d = planet_tokens.shape
+            F = fleet_tokens.shape[2]
+            entity_tokens_flat = self.entity(
+                planet_tokens.reshape(B * T, P, d),
+                fleet_tokens.reshape(B * T, F, d),
+                routing["fleet_target_idx"].reshape(B * T, F),
+                routing["fleet_source_idx"].reshape(B * T, F),
+                routing["fleet_owner_slot"].reshape(B * T, F),
+                routing["fleet_ships_log"].reshape(B * T, F),
+                routing["fleet_eta_norm"].reshape(B * T, F),
+                routing["fleet_mask"].reshape(B * T, F),
+                planet_mask=planet_mask.reshape(B * T, P),
+            )
+            entity_tokens = entity_tokens_flat.reshape(B, T, P, d)
+        else:
+            entity_tokens = self.entity(
+                planet_tokens, fleet_tokens,
+                routing["fleet_target_idx"], routing["fleet_source_idx"],
+                routing["fleet_owner_slot"], routing["fleet_ships_log"],
+                routing["fleet_eta_norm"], routing["fleet_mask"],
+                planet_mask=planet_mask,
+            )
+
+        ctx_full, glob = self.cross(
+            entity_tokens,
+            planet_mask if not is_temporal else planet_mask,
+        )
+        if is_temporal:
+            ctx_now = ctx_full[:, -1]
+            planet_mask_now = planet_mask[:, -1]
+            l1_now = entity_tokens[:, -1]
+        else:
+            ctx_now = ctx_full
+            planet_mask_now = planet_mask
+            l1_now = entity_tokens
+
+        if is_comet is None:
+            is_comet_now = torch.zeros(
+                planet_mask_now.shape, dtype=torch.bool,
+                device=planet_mask_now.device,
+            )
+        elif is_comet.dim() == 3:
+            is_comet_now = is_comet[:, -1].to(torch.bool)
+        else:
+            is_comet_now = is_comet.to(torch.bool)
+
+        if pair_type_ids is not None and pair_type_ids.dim() == 4:
+            pair_type_now = pair_type_ids[:, -1].to(torch.long)
+        elif pair_type_ids is not None:
+            pair_type_now = pair_type_ids.to(torch.long)
+        else:
+            pair_type_now = None
+
+        source_aware, target_aware = self.dual_role(ctx_now, planet_mask_now)
+        source_joint, target_joint = self.joint_role(
+            source_aware, target_aware, planet_mask_now,
+        )
+
+        B_now, P_now = planet_mask_now.shape
+        pair_valid = (
+            planet_mask_now.unsqueeze(2)
+            & planet_mask_now.unsqueeze(1)
+        )
+        eye = torch.eye(P_now, dtype=torch.bool, device=pair_valid.device)
+        pair_valid = pair_valid & ~eye.unsqueeze(0)
+
+        heads = self.pair_head(
+            source_joint, target_joint, ctx_now,
+            l1_tokens=l1_now,
+            is_comet=is_comet_now,
+            pair_type_ids=pair_type_now,
+            pair_valid=pair_valid,
+        )
+        return {
+            "pair_logits": heads["pair_logits"],
+            "pair_frac": heads["pair_frac"],
+            "glob": glob,
+            "ctx_now": ctx_now,
+            "source_joint": source_joint,
+            "target_joint": target_joint,
+            "l1_now": l1_now,
+        }
 
 
 # ---------- Loss ----------
