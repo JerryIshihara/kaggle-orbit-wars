@@ -729,12 +729,13 @@ class _PPOWithL0(torch.nn.Module):
 
     def forward(self, planet_features, fleet_features, planet_mask,
                  is_comet, pair_type_ids, routing):
-        # L0 frozen forward.
+        # L0 frozen forward. Handles both rollout-time (B, P, dim) and
+        # BC-anchor (B, T, P, dim) shapes — comet_features must match
+        # planet_features' leading shape exactly.
         with torch.no_grad():
-            B = planet_features.shape[0]
-            P = planet_features.shape[1]
+            comet_shape = list(planet_features.shape[:-1]) + [self.comet_enc.input_dim]
             comet_features = torch.zeros(
-                (B, P, self.comet_enc.input_dim),
+                comet_shape,
                 device=planet_features.device,
                 dtype=planet_features.dtype,
             )
