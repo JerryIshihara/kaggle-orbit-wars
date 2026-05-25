@@ -481,11 +481,15 @@ PPO is brought up conservatively — value + actor output Linears first, action
 trunk next, perception last. Each phase only starts after the previous one's
 eval is stable.
 
+**PPO never trains anything earlier than L4.** L0–L3 (and the planned
+PlayerContext / Strategy) are frozen for the entire PPO run; there is no
+Phase 2 perception-unfreeze.
+
 | Phase | Trainable | Frozen | New params | Goal |
 |---|---|---|---:|---|
-| **0 — Plumbing** | `value_head` (3-Linear MLP) + PairHead `pair_logits` output Linear + PairHead `pair_frac` output Linear | L0–L2, ActionLearner trunk (L3 + L4 + PairHead trunk + FiLM) | ~132 k + ~512 existing | Prove PPO update + GAE + eval gate + distributed loop work without destroying the BC policy. |
-| **1 — Action adaptation** | + PairHead trunk + FiLM + L3 + L4 + PlayerContext/Strategy when implemented | L0–L2 | + 2–10 M | Post-perception adaptation. If PlayerContext/Strategy are still identity stubs, reduces to unfreezing L3+L4+full PairHead. |
-| **2 — Perception** | + L2 `CrossEntityAttention`; L1 only with strong evidence | L0 always | + ~1–2 M | Only if diagnostics show world perception is stale. L0 stays frozen — it was pretrained on per-entity multitask supervision and should not be rewritten by sparse PPO rewards. |
+| **0 — Plumbing** | `value_head` (3-Linear MLP) + PairHead `pair_logits` head + PairHead `pair_frac` head | L0–L3, PlayerContext / Strategy, L4, PairHead trunk + FiLM | ~132 k | Prove PPO update + GAE + eval gate + distributed loop work without destroying the BC policy. |
+| **1 — Action adaptation** | + L4 JointRoleAttention + PairHead trunk + FiLM | L0–L3, PlayerContext / Strategy | + ~1–2 M | Action adaptation strictly **after L3**. L3's role-aware tokens stay fixed; L4 re-mixes them under PPO. Caps PPO's ability to disturb the perception/role substrate. |
+| **—** (no Phase 2) | (no further unfreeze) | L0–L3 always | — | If diagnostics show perception is stale, retrain the supervised PairHead and restart PPO from the new ckpt — do not unfreeze L0-L3 in flight. |
 
 The actor stays compatible with the supervised PairHead: BC anchor loss
 (`bc_coef · BCE(pair_logits, expert_labels)`) is mixed in throughout PPO to
