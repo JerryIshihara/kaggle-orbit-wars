@@ -35,8 +35,9 @@ in several places. These are load-bearing corrections for the implementation:
 - **The active model is not yet an actor-critic.** `EntityPretrainModel`
   currently returns `pair_logits`, raw `pair_frac`, `glob`, and `ctx_now`.
   PPO wraps it minimally: the actor IS the existing `pair_logits` and
-  `pair_frac` outputs; the critic is a single new `Linear(d_model -> 1)`
-  reading `glob` from L2. No `noop_head`, no learnable σ — NOOP comes from
+  `pair_frac` outputs; the critic is a new 3-Linear MLP `value_head`
+  (`Linear(d → H) → GELU → Linear(H → H) → GELU → Linear(H → 1)`) reading
+  `glob` from L2. No `noop_head`, no learnable σ — NOOP comes from
   `plan_launch.ok=False`; frac σ is a fixed hyperparameter.
 - **Phase 0 uses a single-launch semantic action only as plumbing.** The
   runtime `TransformerAgent` can emit multiple thresholded launches per turn
@@ -465,9 +466,9 @@ manifest, not version arithmetic, enforces this. Promotion is sparse, so
 ### Actor-critic wrapper
 
 **Actor = the existing `pair_logits` and `pair_frac` outputs from PairHead.
-Critic = a single new `value_head` reading L2's `glob`.** PPO introduces one
-parameter — `value_head` (~257) — and nothing else. No `noop_head`, no
-learnable σ for the fraction.
+Critic = a new 3-Linear MLP `value_head` reading L2's `glob`.** PPO's only
+new module is `value_head` (~132 k params); no `noop_head`, no learnable σ
+for the fraction.
 
 The active `EntityPretrainModel` forward returns:
 
@@ -481,15 +482,62 @@ ctx_now      (B, P, 256)
 The wrapper is therefore minimal:
 
 ```text
-PPOActorCritic(EntityPretrainModel, sigma: float = 0.35):
-  # CRITIC — reads ONLY glob; gradient stops at L2.
-  value        = Linear(d_model -> 1)(glob)              # ~257 new params
+PPOActorCritic(EntityPretrainModel, sigma: float = 0.35,
+                value_hidden: int | None = None):
+  # CRITIC — 3-Linear MLP on glob. ~132 k new params at H=d_model=256.
+  H = value_hidden or d_model
+  value_head = Sequential(
+      Linear(d_model -> H), GELU,
+      Linear(H -> H),       GELU,
+      Linear(H -> 1),
+  )
+  value        = value_head(glob).squeeze(-1)
 
   # ACTOR — existing PairHead outputs; no new heads.
   pair_logits  = base_out["pair_logits"]
   frac_loc     = base_out["pair_frac"]                   # logit-normal mean
   sigma        = sigma                                   # fixed hyperparameter
 ```
+
+**Why 3 Linears for the value head:** a single Linear is too shallow to
+model V(s) as a non-linear function of `glob`. Two GELU non-linearities +
+3 weight matrices give the critic enough capacity to learn the board
+geometry ↔ winning-state mapping without leaking into the actor.
+
+### PairHead bootstrap preconditions (depths)
+
+PPO trains the actor *through* PairHead's FiLM and the two output heads in
+Phase 1+. Each module needs enough capacity to adapt strategy under the
+policy gradient — depths can't be added post hoc. The supervised PairHead
+checkpoint PPO consumes must be trained with these minimums:
+
+| Module | Minimum depth | `agents/transformer_v2/aggregator/pair_head.py` flag |
+|---|---|---|
+| FiLM conditioner | ≥ 3 Linears | `conditioner_n_layers >= 2` |
+| `pair_logits` head | ≥ 3 Linears | `head_n_layers >= 3` |
+| `pair_frac` head   | ≥ 3 Linears | `head_n_layers >= 3` |
+
+Shapes once these flags are set:
+
+```text
+conditioner_n_layers = 2  →  Linear(cond_in → H) → GELU →
+                             Linear(H → H)       → GELU →
+                             Linear(H → 2·trunk_h)             # γ + β output
+
+head_n_layers = 3         →  Linear(trunk_h → H) → GELU →
+                             Linear(H → H)       → GELU →
+                             Linear(H → 1)
+```
+
+The final Linear init (`γ = β = 0` for FiLM; `std=0.02` for each action
+head) is preserved at any depth, so loading the deeper supervised ckpt is
+bit-stable on the first PPO forward.
+
+If a candidate ckpt was trained with the legacy defaults
+(`conditioner_n_layers = 1` and/or `head_n_layers = 1`), **retrain the
+supervised PairHead with the required flags before starting PPO**. PPO
+cannot retrofit capacity into a shallow ckpt — the policy gradient would
+saturate the thin heads almost immediately.
 
 **Why split this way:**
 
@@ -500,8 +548,11 @@ PPOActorCritic(EntityPretrainModel, sigma: float = 0.35):
 - **`glob` is the right signal for V(s).** L2's CLS already summarizes the
   board (frontiers, balance, threats). Pulling role-aware or pair-aware tokens
   into the value head would add variance without changing what is predictable.
-- **Cheaper critic.** `Linear(d_model -> 1) = 257` params is trivially fast
-  and easy to train; no interference with the (much larger) actor pathway.
+- **Cheap, depth-appropriate critic.** A 3-Linear MLP (~132 k at H=256) is
+  thick enough to model V(s) non-linearly in `glob` but still cheap to
+  train and trivially serializable. A single Linear would saturate fast
+  against a non-linear value target; deeper than 3 is overkill for a 256-d
+  CLS input.
 - **Cleaner Phase-2 transition.** When L2 eventually unfreezes, value-loss on
   L2 is a single well-conditioned scalar-regression signal — much friendlier
   than the multi-head action zoo PairHead would dump on L2.
@@ -967,9 +1018,9 @@ Do not unfreeze everything at once.
 Train only:
 
 ```text
-value_head                          (the ONLY new PPO parameter)
-PairHead pair_logits output Linear  (existing)
-PairHead pair_frac output Linear    (existing)
+value_head                        (3-Linear MLP, ~132 k — the ONLY new PPO module)
+PairHead pair_logits head         (existing 3-Linear MLP)
+PairHead pair_frac head           (existing 3-Linear MLP)
 ```
 
 Freeze L0-L2 world perception and freeze the ActionLearner trunk
@@ -979,6 +1030,11 @@ GAE, and eval plumbing work without destroying the BC policy.
 There is no `noop_head` and no `frac_log_std` — both removed in the minimal
 actor design. NOOP comes from `plan_launch.ok=False`; frac σ is a fixed
 hyperparameter.
+
+Note: the supervised PairHead ckpt PPO consumes must have been trained with
+`head_n_layers >= 3` and `conditioner_n_layers >= 2` (see "PairHead bootstrap
+preconditions"). Phase 0 trains the deep `pair_logits` and `pair_frac` heads
+in their entirety, not just a final output Linear.
 
 ### Phase 1 — post-perception adaptation
 
@@ -1101,9 +1157,14 @@ Run the full 128-seed panel before considering a submission.
 ## Minimal implementation checklist
 
 1. Add `PPOActorCritic` around current `EntityPretrainModel`. The wrapper
-   adds a single `Linear(d_model -> 1)` `value_head`; it does NOT add any
-   actor head. Forward returns `pair_logits`, `frac_loc` (= `pair_frac`),
+   adds a 3-Linear MLP `value_head`
+   (`Linear(d → H) → GELU → Linear(H → H) → GELU → Linear(H → 1)`,
+   default H = d_model = 256, ~132 k params); it does NOT add any actor
+   head. Forward returns `pair_logits`, `frac_loc` (= `pair_frac`),
    `value`, and `sigma` (fixed CLI hyperparameter).
+   The bootstrap PairHead ckpt must have been trained with
+   `conditioner_n_layers >= 2` and `head_n_layers >= 3` (see "PairHead
+   bootstrap preconditions") — refuse to load shallower ckpts at startup.
 2. Implement the single-launch categorical over `P*P` pair cells (no NOOP
    slot) plus logit-normal fraction sampling with fixed σ. Store the exact
    `action_mask` (shape `(P*P,)`), `action_id` (flat pair index), `frac_sample`,

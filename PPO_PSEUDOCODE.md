@@ -119,19 +119,28 @@ def run_peer(run_dir):
 
 ## Actor-critic wrapper
 
-**Actor = existing PairHead outputs. Critic = single new `value_head` on
-L2's `glob`.** No new actor heads, no learnable σ, no NOOP slot.
+**Actor = existing PairHead outputs. Critic = a new 3-Linear MLP `value_head`
+on L2's `glob`.** No new actor heads, no learnable σ, no NOOP slot.
 
 ```python
 class PPOActorCritic(nn.Module):
-    def __init__(self, entity_model, sigma: float = 0.35):
+    def __init__(self, entity_model, sigma: float = 0.35,
+                  value_hidden: int | None = None):
         super().__init__()
-        self.entity_model = entity_model           # supervised, partial-freeze
-        self.value_head   = nn.Linear(entity_model.d_model, 1)  # ONLY new param
-        self.sigma        = sigma                                # fixed hyperparam
+        self.entity_model = entity_model              # supervised, partial-freeze
+        d = entity_model.d_model
+        H = value_hidden or d                          # default H = d_model = 256
+
+        # CRITIC — 3-Linear MLP on L2's glob. ~132 k new params at H=256.
+        # Two GELU non-linearities so V(s) can be non-linear in glob.
+        self.value_head = nn.Sequential(
+            nn.Linear(d, H), nn.GELU(),
+            nn.Linear(H, H), nn.GELU(),
+            nn.Linear(H, 1),
+        )
+        self.sigma = sigma                             # fixed hyperparam (CLI)
 
     def forward(self, feats):
-        # Run the supervised stack once.
         out = self.entity_model.forward_with_context(feats)
         # out exposes: glob (B, d), ctx_now (B, P, d),
         #              pair_logits (B, P, P), pair_frac (B, P, P).
@@ -145,6 +154,15 @@ class PPOActorCritic(nn.Module):
             "sigma":       self.sigma,                                 # fixed
         }
 ```
+
+**Preconditions on the supervised PairHead ckpt** (these depths must be
+baked in before PPO starts — see also the protocol doc):
+
+| Module | Minimum depth | `pair_head.py` flag |
+|---|---|---|
+| FiLM conditioner | ≥ 3 Linears | `conditioner_n_layers >= 2` |
+| `pair_logits` head | ≥ 3 Linears | `head_n_layers >= 3` |
+| `pair_frac` head   | ≥ 3 Linears | `head_n_layers >= 3` |
 
 Gradient flow:
 
@@ -589,7 +607,7 @@ added to the self-play pool and is **not** considered for submission.
 
 | Phase | Trainable | Frozen | New params | Notes |
 |---|---|---|---:|---|
-| 0 | `value_head` + PairHead `pair_logits` output Linear + PairHead `pair_frac` output Linear | L0-L2 world perception, ActionLearner trunk (L3/L4 + PairHead trunk + FiLM) | ~257 + ~512 existing | "PPO plumbing" — prove the value head learns V(s), the actor output Linears can be PPO-updated, and BC anchor prevents collapse. The only NEW parameter is `value_head`. |
+| 0 | `value_head` (3-Linear MLP, ~132 k) + PairHead `pair_logits` head (3-Linear MLP) + PairHead `pair_frac` head (3-Linear MLP) | L0-L2 world perception, ActionLearner trunk (L3/L4 + PairHead trunk + FiLM) | ~132 k new + existing 3-Linear action heads | "PPO plumbing" — prove the value head learns V(s), the actor heads can be PPO-updated, BC anchor prevents collapse. `value_head` is the only NEW module; actor heads are existing supervised parameters. |
 | 1 | + PairHead trunk + FiLM + L3 + L4 + planned PlayerContext/Strategy | L0-L2 | + 2–10 M | Post-perception adaptation. PPO output Linears stay at `1e-4`, trunk at `1e-5`. If PlayerContext/Strategy are still identity stubs, reduces to unfreezing L3 + L4 + full PairHead. |
 | 2 | + CrossEntityAttention (L2); L1 only with evidence | L0 specialists | + ~1–2 M | Only if diagnostics show world perception is stale or missing facts. L0 always stays frozen. |
 
