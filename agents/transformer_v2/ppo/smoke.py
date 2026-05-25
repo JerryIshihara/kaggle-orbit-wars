@@ -95,8 +95,14 @@ class StepRecord:
     done: float = 0.0
     invalid_launch: int = 0
     emitted_launch: int = 0
+    n_selected_targets: int = 0            # count of target_bits True; for soft cap
+    invalid_reasons: list = None           # list[str] — per-target failure reasons
     score_my: int = 0           # total ships of learner at end of THIS turn
     score_enemy_max: int = 0
+
+    def __post_init__(self):
+        if self.invalid_reasons is None:
+            self.invalid_reasons = []
 
 
 @dataclass
@@ -419,6 +425,7 @@ def _make_learner_closure(
         env_moves: list[list[float]] = []
         n_invalid = 0
         n_emitted = 0
+        invalid_reasons: list[str] = []
         if action.source_id >= 0 and action.target_bits.sum().item() > 0:
             src_idx = action.source_id
             src_pid = slot_to_pid[src_idx]
@@ -445,16 +452,19 @@ def _make_learner_closure(
                     ships = floored[slot_i]
                     if ships < int(min_launch):
                         n_invalid += 1
+                        invalid_reasons.append("min_launch")
                         continue
                     tgt_pid = slot_to_pid[sel_i]
                     if tgt_pid < 0:
                         n_invalid += 1
+                        invalid_reasons.append("pad_slot")
                         continue
                     tgt_planet = next(
                         (p for p in planets if int(p.id) == tgt_pid), None,
                     )
                     if tgt_planet is None:
                         n_invalid += 1
+                        invalid_reasons.append("no_planet")
                         continue
                     # Compute aim angle.
                     dx = tgt_planet.x - src_planet.x
@@ -494,6 +504,8 @@ def _make_learner_closure(
             value=value,
             invalid_launch=n_invalid,
             emitted_launch=n_emitted,
+            n_selected_targets=int(action.target_bits.sum().item()),
+            invalid_reasons=list(invalid_reasons),
             score_my=score_my,
             score_enemy_max=score_enemy_max,
         )
@@ -518,6 +530,9 @@ def run_episode(
     max_fleets: int,
     sigma: float,
     noop_logit_bias: float,
+    # Soft cap on target count — penalises excess(k - k_max)^2 per step.
+    target_cap_k_max: int = 4,
+    target_cap_lambda: float = 0.0,
 ) -> EpisodeBuffer:
     """Roll out one learner episode.
 
@@ -559,6 +574,9 @@ def run_episode(
     buffer.winner = int(max(range(len(ranked)), key=lambda i: ranked[i]))
 
     # Compute per-step rewards: potential-based shaping + terminal +/- 1.
+    # Soft cap on excess targets per source ("Known problems" #3 mitigation):
+    # subtract `target_cap_lambda * max(0, k - k_max)^2`. NEVER truncates the
+    # sampled action — the penalty just shapes future logit distributions.
     # Pull per-step scores from the buffered records (already computed at
     # turn time, so they are the LEARNER-turn snapshots).
     prev_potential = 0.0
@@ -566,7 +584,9 @@ def run_episode(
         potential = float(step.score_my) - float(step.score_enemy_max)
         dense = (potential - prev_potential) / 200.0
         dense = max(-0.02, min(0.02, dense))
-        r = dense - 0.01 * float(step.invalid_launch)
+        excess = max(0, step.n_selected_targets - int(target_cap_k_max))
+        cap_penalty = float(target_cap_lambda) * (excess * excess)
+        r = dense - 0.01 * float(step.invalid_launch) - cap_penalty
         prev_potential = potential
         step.reward = r
         step.done = 0.0
