@@ -43,6 +43,16 @@ from .smoke import (
 )
 
 
+def _aggregate_invalid_reasons(episodes) -> dict[str, int]:
+    """Histogram of invalid-launch reasons across all steps of the iter."""
+    hist: dict[str, int] = {}
+    for ep in episodes:
+        for step in ep.steps:
+            for r in step.invalid_reasons:
+                hist[r] = hist.get(r, 0) + 1
+    return hist
+
+
 def _iso_now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -61,7 +71,9 @@ def main():
                          help="Run id; outputs go to data/runs/ppo/<run_id>/.")
     parser.add_argument("--iters", type=int, default=10,
                          help="Number of PPO iterations to run.")
-    parser.add_argument("--episodes-per-iter", type=int, default=10)
+    parser.add_argument("--episodes-per-iter", type=int, default=32,
+                         help="Default 32 (vs old 10) — kills the 15pp std-err "
+                              "noise floor on winrate metrics.")
     parser.add_argument("--opponent", default=None,
                          help="Registered agent id (e.g. random_v1, sniper_v1). "
                               "If unset (default), opponent is a FROZEN snapshot of "
@@ -76,6 +88,25 @@ def main():
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument("--sigma", type=float, default=0.35)
     parser.add_argument("--noop-logit-bias", type=float, default=0.0)
+    # Soft cap on target count per chosen source — fix for high invalid rate.
+    parser.add_argument("--target-cap-k-max", type=int, default=4,
+                         help="Soft target-count cap. Penalty kicks in when "
+                              "Bernoulli selects more than k_max targets per "
+                              "source; the production runner typically launches "
+                              "<=3 from one source.")
+    parser.add_argument("--target-cap-lambda", type=float, default=0.005,
+                         help="Quadratic coefficient: penalty = "
+                              "lambda * max(0, k - k_max)^2 subtracted from "
+                              "per-step reward. Default 0.005; set 0 to disable.")
+    # BC anchor (factorized) — pulls actor heads toward supervised pair set.
+    parser.add_argument("--pair-cache-path", type=Path, default=None,
+                         help="Path to a _pair_cache .pt file. If set, the "
+                              "factorized BC anchor (bc_source + bc_target) is "
+                              "enabled at --bc-coef.")
+    parser.add_argument("--bc-coef", type=float, default=0.05,
+                         help="BC anchor coefficient. Ignored if "
+                              "--pair-cache-path is unset.")
+    parser.add_argument("--bc-target-weight", type=float, default=1.0)
     parser.add_argument("--seed-base", type=int, default=100_000)
     parser.add_argument("--max-planets", type=int, default=64)
     parser.add_argument("--max-fleets", type=int, default=1024)
@@ -131,6 +162,19 @@ def main():
 
     train_policy = _PPOWithL0(policy, planet_enc, fleet_enc, comet_enc).to(args.device)
 
+    # BC anchor sampler — built once if a pair cache path is given.
+    bc_sampler = None
+    bc_coef = 0.0
+    if args.pair_cache_path is not None:
+        from .bc_cache import BCCacheSampler
+        bc_sampler = BCCacheSampler(args.pair_cache_path, device=args.device,
+                                     acted_only=True)
+        bc_coef = float(args.bc_coef)
+        print(f"[train] BC anchor enabled (bc_coef={bc_coef}) — "
+              f"{len(bc_sampler)} acted snapshots available.", flush=True)
+    else:
+        print(f"[train] BC anchor DISABLED (no --pair-cache-path).", flush=True)
+
     cfg_ppo = PPOConfig(
         clip=args.clip,
         target_kl=args.target_kl,
@@ -140,7 +184,8 @@ def main():
         lr_trunk=None,
         value_coef=args.value_coef,
         ent_coef=args.ent_coef,
-        bc_coef=0.0,                      # no BC anchor in this smoke train
+        bc_coef=bc_coef,
+        bc_target_weight=args.bc_target_weight,
     )
 
     # Save v0 (the bootstrap state).
@@ -212,6 +257,8 @@ def main():
                     device=args.device,
                     max_planets=args.max_planets, max_fleets=args.max_fleets,
                     sigma=args.sigma, noop_logit_bias=args.noop_logit_bias,
+                    target_cap_k_max=args.target_cap_k_max,
+                    target_cap_lambda=args.target_cap_lambda,
                 )
             except Exception as e:
                 print(f"[train] iter {K} ep {i} FAILED: {e}", flush=True)
@@ -243,9 +290,13 @@ def main():
 
         # ---- Update ----
         t_upd = time.time()
+        bc_source = (
+            (lambda n, _s=bc_sampler: _s.sample(n)) if bc_sampler is not None
+            else (lambda _n: None)
+        )
         metrics = ppo_update_local(
             train_policy, ep_objs, mbs,
-            bc_minibatch_source=lambda _n: None,
+            bc_minibatch_source=bc_source,
             cfg=cfg_ppo,
         )
         update_sec = time.time() - t_upd
@@ -263,6 +314,20 @@ def main():
             / max(1, sum(1 for ep in episodes if ep.steps))
         )
 
+        # Invalid-reason histogram across all steps in this iter's episodes.
+        inv_hist = _aggregate_invalid_reasons(episodes)
+
+        # Bernoulli target-count distribution (helps tune the soft cap).
+        all_k = [s.n_selected_targets for ep in episodes for s in ep.steps]
+        if all_k:
+            k_mean = sum(all_k) / len(all_k)
+            sorted_k = sorted(all_k)
+            k_p50 = sorted_k[len(sorted_k) // 2]
+            k_p95 = sorted_k[min(len(sorted_k) - 1, int(0.95 * len(sorted_k)))]
+            k_over_cap = sum(1 for k in all_k if k > args.target_cap_k_max)
+        else:
+            k_mean = k_p50 = k_p95 = k_over_cap = 0
+
         log_row = {
             "iter": K,
             "policy_version": K + 1,
@@ -271,6 +336,12 @@ def main():
             "opponent": opp_label,
             "n_wins": n_wins,
             "winrate": n_wins / args.episodes_per_iter,
+            "invalid_reasons": inv_hist,
+            "target_count_mean": k_mean,
+            "target_count_p50": k_p50,
+            "target_count_p95": k_p95,
+            "n_steps_over_cap": k_over_cap,
+            "bc_enabled": bc_sampler is not None,
             "n_learner_steps": total_steps,
             "n_noop_steps": total_noop,
             "n_emitted_launches": total_emitted,
