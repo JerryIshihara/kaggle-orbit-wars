@@ -50,7 +50,13 @@ def _iso_now() -> str:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt", required=True, type=Path,
-                         help="Supervised PairHead .pt to bootstrap from.")
+                         help="Supervised PairHead .pt to bootstrap from. "
+                              "Always required (needed for L0 + entity_model config).")
+    parser.add_argument("--resume-ppo-ckpt", type=Path, default=None,
+                         help="Optional PPO checkpoint to resume from "
+                              "(e.g. policy_v10.pt). Loads policy weights AFTER "
+                              "the supervised bootstrap. Use this to continue a "
+                              "prior training run.")
     parser.add_argument("--run-id", required=True,
                          help="Run id; outputs go to data/runs/ppo/<run_id>/.")
     parser.add_argument("--iters", type=int, default=10,
@@ -103,6 +109,21 @@ def main():
           f"head_n_layers={cfg.get('head_n_layers', 1)})", flush=True)
 
     policy = PPOActorCritic(entity_model, sigma=args.sigma).to(args.device)
+
+    # Resume from a prior PPO checkpoint (overrides the supervised bootstrap
+    # for the policy weights; supervised ckpt was still needed for L0 + the
+    # entity_model config).
+    if args.resume_ppo_ckpt is not None:
+        resume = torch.load(args.resume_ppo_ckpt, map_location=args.device,
+                             weights_only=False)
+        result = policy.load_state_dict(resume["policy"], strict=False)
+        miss = len(result.missing_keys) if hasattr(result, "missing_keys") else 0
+        unexp = len(result.unexpected_keys) if hasattr(result, "unexpected_keys") else 0
+        print(f"[train] resumed from {args.resume_ppo_ckpt} "
+              f"(missing={miss} unexpected={unexp} "
+              f"sigma={resume.get('sigma', 'n/a')} "
+              f"prev_iter={resume.get('iter', 'n/a')})", flush=True)
+
     breakdown = policy.freeze_for_phase(0)
     n_trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print(f"[train] freeze_for_phase(0) → trainable={n_trainable:,} "
