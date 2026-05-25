@@ -153,6 +153,154 @@ def load_supervised(
 # --------------------------------------------------------------------------- #
 # Rollout episode via env.run                                                 #
 # --------------------------------------------------------------------------- #
+def make_opponent_closure(
+    *,
+    opponent_policy: PPOActorCritic,
+    planet_enc: Any,
+    fleet_enc: Any,
+    comet_enc: Any,
+    opponent_slot: int,
+    device: str,
+    max_planets: int,
+    max_fleets: int,
+    sigma: float,
+    noop_logit_bias: float,
+    num_players: int = 2,
+):
+    """Build an env-compatible opponent fn that samples from a FROZEN
+    PPOActorCritic using the same source_multi_target_v1 contract as the
+    learner. No buffering — opponent moves are not tracked for PPO.
+
+    Use this for self-play: load a frozen snapshot of the learner (or any
+    other PPOActorCritic), wrap it here, pass the returned callable as the
+    opponent_fn to run_episode.
+    """
+    tracker = FleetTracker()
+    comet_input_dim = comet_enc.input_dim
+    opponent_policy.eval()
+
+    def opp_fn(obs):
+        batch, pid_to_idx = featurize_observation(
+            obs,
+            learner_slot=opponent_slot,
+            tracker=tracker,
+            num_players=num_players,
+            max_planets=max_planets,
+            max_fleets=max_fleets,
+            device=device,
+        )
+        B, P, _ = batch["planet_features"].shape
+        comet_features = torch.zeros(
+            (B, P, comet_input_dim),
+            device=device,
+            dtype=batch["planet_features"].dtype,
+        )
+        comet_features[..., :18] = batch["planet_features"][..., :18]
+        is_comet = batch["planet_features"][..., 0] > 0.5
+
+        with torch.inference_mode():
+            planet_tok = planet_enc(batch["planet_features"])
+            comet_tok = comet_enc(comet_features)
+            fleet_tok = fleet_enc(batch["fleet_features"])
+            entity_self = _build_entity_self_tokens(planet_tok, comet_tok, is_comet)
+            routing = {
+                "fleet_target_idx": batch["fleet_target_idx"],
+                "fleet_source_idx": batch["fleet_source_idx"],
+                "fleet_owner_slot": batch["fleet_owner_slot"],
+                "fleet_ships_log": batch["fleet_ships_log"],
+                "fleet_eta_norm": batch["fleet_eta_norm"],
+                "fleet_mask": batch["fleet_mask"],
+            }
+            pair_type_ids = build_pair_type_ids(
+                batch["planet_features"], batch["planet_mask"],
+            )
+            out = opponent_policy(
+                entity_self, fleet_tok, routing, batch["planet_mask"],
+                is_comet=is_comet, pair_type_ids=pair_type_ids,
+            )
+            pair_logits = out["pair_logits"][0].detach().cpu()
+            frac_loc = out["frac_loc"][0].detach().cpu()
+            sigma_val = float(out["sigma"].item())
+
+        get = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
+        raw_planets = get("planets") or []
+        raw_fleets = get("fleets") or []
+        step = int(get("step") or 0)
+        _nb, defense_buffer, min_launch, _s, _fw, _et = PHASE_TABLE[phase_of(step)]
+
+        planet_owner_rel = torch.full((P,), 99, dtype=torch.long)
+        planet_surplus = torch.zeros(P, dtype=torch.float32)
+        planet_exists = torch.zeros(P, dtype=torch.bool)
+        slot_to_pid = [-1] * P
+        planets: list = []
+        if raw_planets:
+            from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
+            planets = [Planet(*p) for p in raw_planets]
+            fleets = [Fleet(*f) for f in raw_fleets]
+            enemy_fleets = [f for f in fleets if f.owner != opponent_slot and f.owner >= 0]
+            for planet in planets:
+                pid = int(planet.id)
+                if pid in pid_to_idx:
+                    idx = pid_to_idx[pid]
+                    planet_exists[idx] = True
+                    slot_to_pid[idx] = pid
+                    planet_owner_rel[idx] = 0 if int(planet.owner) == opponent_slot else 1
+                    surplus = compute_surplus(planet, enemy_fleets, defense_buffer)
+                    planet_surplus[idx] = float(surplus)
+
+        pair_mask, source_mask = legality_masks(
+            planet_owner=planet_owner_rel,
+            surplus=planet_surplus,
+            planet_exists=planet_exists,
+            min_launch=int(min_launch),
+        )
+        action = sample_source_multi_target(
+            pair_logits, frac_loc, sigma_val,
+            pair_mask=pair_mask, source_mask=source_mask,
+            noop_logit_bias=noop_logit_bias,
+        )
+
+        env_moves: list[list[float]] = []
+        if action.source_id < 0 or action.target_bits.sum().item() == 0:
+            return env_moves
+        src_idx = action.source_id
+        src_pid = slot_to_pid[src_idx]
+        src_planet = next((p for p in planets if int(p.id) == src_pid), None)
+        if src_planet is None:
+            return env_moves
+        surplus_b = int(planet_surplus[src_idx].item())
+        budget = max(0, surplus_b)
+        selected = action.target_bits.nonzero(as_tuple=False).flatten().tolist()
+        raws = torch.stack([action.frac_raw[i] for i in selected])
+        weights = (raws / raws.sum().clamp_min(1e-8)).tolist()
+        raw_alloc = [w * budget for w in weights]
+        floored = [int(x) for x in raw_alloc]
+        remainder = budget - sum(floored)
+        frac_rem = sorted(
+            ((raw_alloc[i] - floored[i], i) for i in range(len(floored))),
+            reverse=True,
+        )
+        for r, idx in frac_rem[:max(0, remainder)]:
+            floored[idx] += 1
+        for slot_i, sel_i in enumerate(selected):
+            ships = floored[slot_i]
+            if ships < int(min_launch):
+                continue
+            tgt_pid = slot_to_pid[sel_i]
+            if tgt_pid < 0:
+                continue
+            tgt_planet = next((p for p in planets if int(p.id) == tgt_pid), None)
+            if tgt_planet is None:
+                continue
+            dx = tgt_planet.x - src_planet.x
+            dy = tgt_planet.y - src_planet.y
+            angle = math.atan2(dy, dx)
+            env_moves.append([int(src_pid), float(angle), int(ships)])
+        return env_moves
+
+    return opp_fn
+
+
 def _make_learner_closure(
     *,
     policy: PPOActorCritic,
@@ -363,13 +511,23 @@ def run_episode(
     comet_enc: Any,
     seed: int,
     learner_seat: int,
-    opponent_id: str,
+    opponent_id: str | None,
+    opponent_fn=None,
     device: str,
     max_planets: int,
     max_fleets: int,
     sigma: float,
     noop_logit_bias: float,
 ) -> EpisodeBuffer:
+    """Roll out one learner episode.
+
+    Opponent selection (exactly one of):
+      * ``opponent_fn``: an env-compatible callable ``fn(obs) -> moves``,
+        used as-is. For self-play, pass the result of
+        :func:`make_opponent_closure` here.
+      * ``opponent_id``: a registered heuristic agent id (random_v1, …),
+        looked up via ``agents.Agent(id=...)``.
+    """
     from kaggle_environments import make
     import agents as _agents
 
@@ -381,8 +539,11 @@ def run_episode(
         max_planets=max_planets, max_fleets=max_fleets,
         sigma=sigma, noop_logit_bias=noop_logit_bias,
     )
-    opp_agent = _agents.Agent(id=opponent_id)
-    opp_fn = opp_agent.fn
+    if opponent_fn is None and opponent_id is None:
+        raise ValueError("must pass exactly one of opponent_fn / opponent_id")
+    if opponent_fn is not None and opponent_id is not None:
+        raise ValueError("pass only one of opponent_fn / opponent_id")
+    opp_fn = opponent_fn if opponent_fn is not None else _agents.Agent(id=opponent_id).fn
 
     fns = [None, None]
     fns[learner_seat] = learner_fn
