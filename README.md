@@ -312,9 +312,22 @@ This section is the design overview.
 ### What PPO adds
 
 **Actor = the existing `pair_logits` and `pair_frac` outputs from `PairHead`.
-No new actor heads.** Critic is a single new `value_head` reading L2's `glob`.
-The whole PPO addition is one `Linear(256 → 1)` (~257 new params); everything
-else PPO trains is an existing supervised parameter.
+No new actor heads.** Critic is a new 3-Linear MLP `value_head` reading L2's
+`glob`. PPO's only new parameters are `value_head` (~132 k); everything else
+PPO trains is an existing supervised parameter.
+
+**Preconditions on the supervised PairHead ckpt that PPO bootstraps from:**
+
+| Module | Minimum depth | `pair_head.py` flag |
+|---|---|---|
+| FiLM-conditioned adaptor | ≥ 3 Linear stages | `conditioner_n_layers >= 2` |
+| `pair_logits` head | ≥ 3 Linear stages | `head_n_layers >= 3` |
+| `pair_frac` head   | ≥ 3 Linear stages | `head_n_layers >= 3` |
+
+PPO trains the actor *through* these modules in Phase 1+, so the capacity
+has to be in the ckpt — depths can't be added post hoc. Any candidate
+supervised ckpt trained with shallower defaults must be retrained before
+starting PPO. Details in "PairHead minimum depths" below.
 
 ```
                  INPUT  (per learner turn)
@@ -355,19 +368,19 @@ else PPO trains is an existing supervised parameter.
    ═══════════════ │ ══════════════ │ ═══════════ │ ════════════════════
    PPO WRAPPER      │                 │             │
                     ▼                 ▼             ▼
-            ┌────────────────┐  ┌──────────────────────────────────────┐
-            │   CRITIC       │  │   ACTOR (no new heads)               │
-            │                │  │                                      │
-            │ value_head     │  │  Categorical(logits =                │
-            │ Linear(256→1)  │  │    where(legality_mask,              │
-            │   ↑ ONLY new   │  │          pair_logits.flatten(),      │
-            │   ↑ parameter  │  │          −inf))                      │
-            │   ↑ (~257)     │  │       ▼  sample (s, t)               │
-            │                │  │                                      │
-            │  V(s) scalar   │  │  LogitNormal(loc = pair_frac[s,t],   │
-            │                │  │              σ = 0.35 fixed)         │
-            │                │  │       ▼  sample frac via sigmoid(z)  │
-            └────────┬───────┘  └───────┬──────────────────────────────┘
+            ┌─────────────────┐ ┌──────────────────────────────────────┐
+            │   CRITIC        │ │   ACTOR (no new heads)               │
+            │                 │ │                                      │
+            │ value_head      │ │  Categorical(logits =                │
+            │  Linear(256→256)│ │    where(legality_mask,              │
+            │  GELU           │ │          pair_logits.flatten(),      │
+            │  Linear(256→256)│ │          −inf))                      │
+            │  GELU           │ │       ▼  sample (s, t)               │
+            │  Linear(256→1)  │ │                                      │
+            │   ↑ NEW (~132k) │ │  LogitNormal(loc = pair_frac[s,t],   │
+            │                 │ │              σ = 0.35 fixed)         │
+            │  V(s) scalar    │ │       ▼  sample frac via sigmoid(z)  │
+            └────────┬────────┘ └───────┬──────────────────────────────┘
                      │                  │
                      │                  ▼
                      │     project_to_env: plan_launch(s, t,
@@ -409,11 +422,58 @@ else PPO trains is an existing supervised parameter.
 - **glob is the right signal for V(s).** L2's CLS already summarizes the board
   (frontiers, balance, threats). Pulling role-aware or pair-aware tokens into
   the value head would add variance without changing what's predictable.
-- **Cheaper critic.** `Linear(256 → 1)` = 257 params. Fast to train, easy to
-  swap, no interference with the (much larger) actor pathway.
+- **3-Linear value MLP.** `glob` is a 256-d summary; a single Linear is too
+  shallow to model V(s) as a non-linear function of board state. Two GELU
+  non-linearities + 3 weight matrices give the critic enough capacity to
+  learn "this board geometry / ship balance is winning" without leaking into
+  the actor.
 - **Cleaner Phase-2 transition.** When L2 eventually unfreezes, value-loss
   on L2 is a single well-conditioned scalar-regression signal — much
   friendlier than the multi-head action zoo PairHead would dump on L2.
+
+### PairHead minimum depths (FiLM + action heads)
+
+PPO trains the actor *through* PairHead's FiLM conditioner and the two
+output heads in Phase 1+. Each of those modules needs enough capacity to
+adapt strategy, not just apply small additive corrections. The supervised
+ckpt must be trained with the depths below — depths can't be added later.
+
+**FiLM conditioner — `conditioner_n_layers >= 2` (≥ 3 Linears):**
+
+```text
+conditioner_n_layers = 2  →  Linear(cond_in → H) → GELU →
+                             Linear(H → H)       → GELU →
+                             Linear(H → 2·trunk_h)        # γ + β, zero-init
+                                                           = 3 Linears total
+```
+
+`conditioner_n_layers = 1` (2 Linears) is too thin once PPO starts adapting
+strategy through the FiLM and is **not** supported as a bootstrap source.
+
+The identity-init for the final Linear (`γ = β = 0` at step 0) is preserved
+regardless of depth, so loading a deeper ckpt is bit-stable on the first
+forward.
+
+**`pair_logits` and `pair_frac` heads — `head_n_layers >= 3` (3 Linears each):**
+
+```text
+head_n_layers = 3  →  Linear(trunk_h → H) → GELU →
+                      Linear(H → H)       → GELU →
+                      Linear(H → 1)                       = 3 Linears total
+```
+
+`head_n_layers = 1` (single Linear) was the legacy supervised default — it
+is **not** enough capacity for PPO to fine-tune the action distribution on
+top of strategy/role-aware tokens. With `head_n_layers = 3`, the actor heads
+can express richer per-`(s, t)` decisions when L3/L4/PairHead-trunk gradients
+land in Phase 1+. The same `nn.init.normal_(std=0.02)` initialization on the
+final Linear is preserved, so initial pair_logits remain near-chance and
+training is stable.
+
+**Bootstrap rule:** any supervised PairHead checkpoint PPO consumes must
+have been trained with `--conditioner-n-layers 2` (or higher) **and**
+`--head-n-layers 3` (or higher). Train (or retrain) the supervised ckpt
+with both flags before starting PPO.
 
 ### Freeze schedule (three phases)
 
@@ -423,7 +483,7 @@ eval is stable.
 
 | Phase | Trainable | Frozen | New params | Goal |
 |---|---|---|---:|---|
-| **0 — Plumbing** | `value_head` + PairHead `pair_logits` output Linear + PairHead `pair_frac` output Linear | L0–L2, ActionLearner trunk (L3 + L4 + PairHead trunk + FiLM) | ~257 + ~512 existing | Prove PPO update + GAE + eval gate + distributed loop work without destroying the BC policy. |
+| **0 — Plumbing** | `value_head` (3-Linear MLP) + PairHead `pair_logits` output Linear + PairHead `pair_frac` output Linear | L0–L2, ActionLearner trunk (L3 + L4 + PairHead trunk + FiLM) | ~132 k + ~512 existing | Prove PPO update + GAE + eval gate + distributed loop work without destroying the BC policy. |
 | **1 — Action adaptation** | + PairHead trunk + FiLM + L3 + L4 + PlayerContext/Strategy when implemented | L0–L2 | + 2–10 M | Post-perception adaptation. If PlayerContext/Strategy are still identity stubs, reduces to unfreezing L3+L4+full PairHead. |
 | **2 — Perception** | + L2 `CrossEntityAttention`; L1 only with strong evidence | L0 always | + ~1–2 M | Only if diagnostics show world perception is stale. L0 stays frozen — it was pretrained on per-entity multitask supervision and should not be rewritten by sparse PPO rewards. |
 
