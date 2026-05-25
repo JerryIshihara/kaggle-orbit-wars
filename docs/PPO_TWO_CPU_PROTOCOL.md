@@ -27,6 +27,164 @@ launches safe through `physics_utils.plan_launch`, keep rollouts strictly
 on-policy, and measure policy quality with deterministic A/B evaluation after
 every PPO iteration.
 
+## Design summary
+
+One-page reference for the design decisions captured across this doc.
+Each item links to the section with full detail.
+
+### Model wrapper — `PPOActorCritic`
+
+**Actor = the existing `pair_logits` and `pair_frac` outputs from `PairHead`.
+Critic = a new 3-Linear MLP `value_head` on L2's `glob`.** The only new PPO
+module is `value_head` (~132 k params at H = d_model = 256); everything else
+PPO trains is an existing supervised parameter.
+
+```
+                          glob (B, 256)  ──►  value_head (3-Linear MLP) ──► V(s)   [CRITIC]
+
+   L0 → L1 → L2 ──►  ctx_now ──►  post-L2 stack ──►  PairHead
+                                  (PlayerContext, Strategy,           ├─► pair_logits  ──┐
+                                   L3 DualRoleAttention,              │   (B, P, P)      │ [ACTOR]
+                                   L4 JointRoleAttention,             └─► pair_frac      │
+                                   PairHead trunk + FiLM)                  (B, P, P)     │
+                                                                                          │
+                  Categorical(logits = where(legality_mask, flat(pair_logits), −inf))  ◄──┘
+                  LogitNormal(loc = pair_frac[s, t], σ = 0.35 fixed)
+                  NOOP = plan_launch.ok == False (invalid penalty)
+```
+
+Forward pseudo:
+
+```text
+out = entity_model.forward_with_context(feats)
+return {
+    "value":       value_head(out.glob).squeeze(-1),    # CRITIC ← L2 only
+    "pair_logits": out.pair_logits,                      # ACTOR ← existing
+    "frac_loc":    out.pair_frac,                        # ACTOR ← existing
+    "sigma":       0.35,                                 # fixed hyperparam
+}
+```
+
+See "Actor-critic wrapper" for the full module + the 3-Linear value_head
+shape; see "Phase 0 semantic action" + "Fraction distribution" for sampling.
+
+### Why this split
+
+- **Decoupled gradients.** `value_loss` enters `value_head`, stops at L2
+  (frozen Phase 0/1). `policy_loss + entropy + bc_loss` enters actor heads,
+  propagates through post-L2 as freezes lift. No cross-talk.
+- **`glob` is the right signal for V(s).** L2's CLS already summarizes the
+  board. Pulling role-aware or pair-aware tokens into the value head adds
+  variance without changing what is predictable.
+- **No NOOP slot.** NOOP comes from `plan_launch.ok == False` (existing
+  invalid-launch penalty). Saves the actor a dimension and a head.
+- **σ fixed, not learned.** Keeps the actor's parameter set exactly equal
+  to the supervised PairHead's. Anneal σ between runs (start 0.35, lower
+  toward 0.15 as PPO converges).
+
+### Freeze schedule
+
+| Phase | Trainable | Frozen | New params |
+|---|---|---|---:|
+| **0 — Plumbing** | `value_head` (3-Linear MLP) + PairHead `pair_logits` head + PairHead `pair_frac` head | L0–L2, ActionLearner trunk (L3 + L4 + PairHead trunk + FiLM) | ~132 k |
+| **1 — Action adaptation** | + PairHead trunk + FiLM + L3 + L4 + planned PlayerContext / Strategy (identity stub OK) | L0–L2 | + 2–10 M |
+| **2 — Perception** | + L2 `CrossEntityAttention`; L1 only with evidence | L0 always | + ~1–2 M |
+
+L0 never unfreezes. See "Freeze schedule" for per-phase details.
+
+### PairHead bootstrap preconditions
+
+PPO trains the actor *through* PairHead's FiLM and the two heads in
+Phase 1+. The supervised ckpt PPO loads **must** have been trained with:
+
+| Module | Minimum depth | `pair_head.py` flag |
+|---|---|---|
+| FiLM conditioner | ≥ 3 Linears | `conditioner_n_layers >= 2` |
+| `pair_logits` head | ≥ 3 Linears | `head_n_layers >= 3` |
+| `pair_frac` head   | ≥ 3 Linears | `head_n_layers >= 3` |
+
+Depths can't be added post hoc; retrain the supervised ckpt with both
+flags before starting PPO. Identity-init is preserved at any depth, so
+loading the deeper ckpt is bit-stable on the first PPO forward. PPO
+startup refuses to load shallower ckpts. See "PairHead bootstrap
+preconditions" for the rationale and shapes.
+
+### Training topology — two CPU machines
+
+```
+Machine A  (dev box, /Users/agent/dev/kaggle-orbit-wars, user "agent")
+  • owns run dir, advantages, optim state, promotion gate, archive
+  • ~50% of rollout episodes
+  • Phase 0: full training locally
+  • Phase 1+: half of each paired minibatch + applies optimizer step
+
+Machine B  (Tailscale 100.109.180.124, same workdir path, user "hirotakaishihara")
+  • ~50% of rollout episodes
+  • Phase 1+: half of each paired minibatch + writes grad to file (no optim)
+  • cold storage for archived rollouts, out-of-pool checkpoints, eval JSON
+
+Connectivity: A → B SSH works; B → A is not reachable.
+All sync is rsync over SSH, initiated from A.
+```
+
+Phase 1+ training is data-parallel via **file-mediated gradient
+averaging** (one-way SSH rules out NCCL all-reduce):
+
+```
+A: forward+backward on mb_A         ┐  parallel
+B: forward+backward on mb_B → file  ┘
+A: rsync-pull grad_B; grad = (grad_A + grad_B) / 2
+A: optimizer.step(); write new weights to file
+B: rsync-pull weights; reload; proceed to next minibatch
+```
+
+BC anchor lives only on A's gradient (the 47 GB `_pair_cache` stays on A);
+A doubles `bc_coef` from `0.05 → 0.10` so the averaged gradient sees the
+same effective `0.05`. See "Machine roles", "Distributed training",
+"CPU performance".
+
+### Self-play opponent pool (100% self-play)
+
+Per-episode opponent sampling — all opponents are frozen promoted
+checkpoints, never the current learner `policy_vK`:
+
+```
+50%  latest promoted PPO ckpt          (baseline fallback until first promotion)
+30%  transformer_v2_baseline           (the load-bearing floor)
+20%  uniform older promoted PPO ckpt   (prevents cyclic chasing; baseline fallback)
+```
+
+Pool cap `N_pool = 8`. Promoted only — failed iters stay on disk for
+debug but do not enter the rollout pool. See "Self-play pool".
+
+### Promotion gate (5 conditions)
+
+After every PPO iteration, deterministic quick-eval (32 seeds × both
+seats × 3 mandatory opponents) decides whether `policy_v(K+1)` is
+promoted. A candidate is promoted **only if all five hold**:
+
+```
+1. winrate vs previous_promoted ≥ 50%  with non-negative paired seed-seat score
+2. winrate vs transformer_v2_baseline ≥ previous_promoted's baseline winrate − 2pp
+3. winrate vs physical_v4 drops by ≤ 5pp
+4. invalid_launch_rate ≤ 1.1 × previous_promoted's rate
+5. no new high-severity launch-miss-matrix regression
+```
+
+A startup calibration eval bootstraps `metrics_of(baseline)` so the
+iter-1 relative thresholds are defined. See "Startup calibration" and
+"Evaluation gate".
+
+### Archive policy
+
+Hot on A: active pool ckpts, current + previous rollouts, recent eval,
+`_pair_cache` (47 GB, BC anchor source), train log. Cold to B's
+`archive/`: ckpts older than the pool (manifest-based, not arithmetic),
+rollouts ≤ K−2, eval JSONs older than K−10, replays, ~15 GB of
+pretraining datasets no longer read. `scripts/ppo_archive.sh` runs
+after each iteration's promotion gate, uses `rsync --remove-source-files`
+for atomic move. See "Archive policy".
+
 ## Design critique / corrections
 
 The earlier version of this plan was directionally useful but too optimistic
