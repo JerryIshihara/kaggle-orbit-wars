@@ -38,6 +38,7 @@ from .smoke import (
     _PPOWithL0,
     episodes_to_ppo,
     load_supervised,
+    make_opponent_closure,
     run_episode,
 )
 
@@ -55,7 +56,10 @@ def main():
     parser.add_argument("--iters", type=int, default=10,
                          help="Number of PPO iterations to run.")
     parser.add_argument("--episodes-per-iter", type=int, default=10)
-    parser.add_argument("--opponent", default="random_v1")
+    parser.add_argument("--opponent", default=None,
+                         help="Registered agent id (e.g. random_v1, sniper_v1). "
+                              "If unset (default), opponent is a FROZEN snapshot of "
+                              "the learner at the start of each iter — true self-play.")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--minibatch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=3)
@@ -127,7 +131,34 @@ def main():
     seed_cursor = args.seed_base
     for K in range(args.iters):
         t_iter = time.time()
-        print(f"\n[train] === iter {K:03d} (vs {args.opponent}) ===", flush=True)
+        opp_label = args.opponent if args.opponent else f"self@v{K}"
+        print(f"\n[train] === iter {K:03d} (vs {opp_label}) ===", flush=True)
+
+        # ---- Self-play: snapshot the learner's current weights into a
+        #      frozen opponent policy at the start of this iter ----
+        opp_policy = None
+        if args.opponent is None:
+            opp_policy = PPOActorCritic(
+                # Build a fresh entity_model with the SAME config.
+                entity_model=type(entity_model)(
+                    d_model=cfg.get("d_model", 256),
+                    n_steps=cfg.get("n_steps", 6),
+                    d_pair=cfg.get("d_pair", cfg.get("d_model", 256)),
+                    entity_n_heads=cfg.get("entity_n_heads", 4),
+                    cross_n_heads=cfg.get("cross_n_heads", 8),
+                    cross_n_layers=cfg.get("cross_n_layers", 2),
+                    dual_n_heads=cfg.get("dual_n_heads", 4),
+                    conditioner_n_layers=cfg.get("conditioner_n_layers", 1),
+                    head_n_layers=cfg.get("head_n_layers", 1),
+                ),
+                sigma=args.sigma,
+            ).to(args.device)
+            # Copy weights from the learner; from this point on the
+            # opponent is frozen for the entire iter's rollouts.
+            opp_policy.load_state_dict(policy.state_dict())
+            opp_policy.eval()
+            for p in opp_policy.parameters():
+                p.requires_grad_(False)
 
         # ---- Rollout ----
         episodes = []
@@ -141,11 +172,23 @@ def main():
             seed = seed_cursor
             seed_cursor += 1
             learner_seat = i % 2
+            opp_fn = None
+            if opp_policy is not None:
+                opp_fn = make_opponent_closure(
+                    opponent_policy=opp_policy,
+                    planet_enc=planet_enc, fleet_enc=fleet_enc, comet_enc=comet_enc,
+                    opponent_slot=1 - learner_seat,
+                    device=args.device,
+                    max_planets=args.max_planets, max_fleets=args.max_fleets,
+                    sigma=args.sigma, noop_logit_bias=args.noop_logit_bias,
+                )
             try:
                 ep = run_episode(
                     policy=policy, planet_enc=planet_enc, fleet_enc=fleet_enc,
                     comet_enc=comet_enc, seed=seed, learner_seat=learner_seat,
-                    opponent_id=args.opponent, device=args.device,
+                    opponent_id=args.opponent if opp_fn is None else None,
+                    opponent_fn=opp_fn,
+                    device=args.device,
                     max_planets=args.max_planets, max_fleets=args.max_fleets,
                     sigma=args.sigma, noop_logit_bias=args.noop_logit_bias,
                 )
@@ -204,7 +247,8 @@ def main():
             "policy_version": K + 1,
             "timestamp": _iso_now(),
             "n_episodes": args.episodes_per_iter,
-            "n_wins_vs_random": n_wins,
+            "opponent": opp_label,
+            "n_wins": n_wins,
             "winrate": n_wins / args.episodes_per_iter,
             "n_learner_steps": total_steps,
             "n_noop_steps": total_noop,
