@@ -66,6 +66,10 @@ class PPOMinibatch:
 class BCMinibatch:
     """Factorized BC anchor minibatch (sampled from the supervised pair_cache).
 
+    source_mask: (B, P) bool — legal source rows under the PPO source
+        categorical approximation. This is intentionally stricter than
+        pair_mask.any(dim=2): source rows must be learner-owned, otherwise
+        the BC source classifier is trained on impossible PPO source choices.
     expert_source_idx_or_noop: (B,) long ∈ {0..P}. 0 means "no expert
         launched from any source this snapshot" (NOOP); k>0 means the
         expert launched from source (k-1). For coalition turns with
@@ -78,6 +82,7 @@ class BCMinibatch:
 
     feats: dict[str, torch.Tensor]
     pair_mask: torch.Tensor                  # (B, P, P) bool
+    source_mask: torch.Tensor                # (B, P) bool
     expert_source_idx_or_noop: torch.Tensor  # (B,) long
     expert_target_bits: torch.Tensor         # (B, P, P) bool
 
@@ -241,9 +246,11 @@ def source_target_entropy(
 def factorized_bc(
     pair_logits: torch.Tensor,         # (B, P, P)
     pair_mask: torch.Tensor,            # (B, P, P) bool
+    source_mask: torch.Tensor,           # (B, P) bool
     expert_src_idx: torch.Tensor,       # (B,) long ∈ {0..P}; 0 = no expert launch
     expert_target_bits: torch.Tensor,   # (B, P, P) bool
     *,
+    source_weight: float = 1.0,
     target_weight: float = 1.0,
     noop_logit_bias: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -251,6 +258,9 @@ def factorized_bc(
 
     bc_source: CE over (P+1) source choices (NOOP + P sources), where the
                source score is the SAME ``row_max`` formula the actor uses.
+               ``source_mask`` must match the PPO source legality mask
+               approximation; using only ``pair_mask.any(dim=2)`` trains
+               impossible non-learner-owned sources as categorical choices.
     bc_target: Bernoulli BCE on the EXPERT's source row only — does not
                bleed across rows, so it cannot fight the source categorical.
 
@@ -263,7 +273,7 @@ def factorized_bc(
     masked_pairs = torch.where(pair_mask, pair_logits, neg_inf)
     src_scores = masked_pairs.max(dim=2).values                       # (B, P)
     src_scores = torch.where(
-        torch.isfinite(src_scores), src_scores,
+        source_mask & torch.isfinite(src_scores), src_scores,
         torch.full_like(src_scores, float("-inf")),
     )
     noop_col = torch.full((B, 1), float(noop_logit_bias), device=device)
@@ -322,7 +332,7 @@ def factorized_bc(
                 sum(recalls) / max(1, len(recalls)), device=device,
             )
 
-    bc_loss = bc_source + float(target_weight) * bc_target
+    bc_loss = float(source_weight) * bc_source + float(target_weight) * bc_target
     diagnostics = {
         "bc_source_loss": float(bc_source.detach().item()),
         "bc_target_loss": float(bc_target.detach().item()),
@@ -386,6 +396,7 @@ def ppo_minibatch_loss(
         bc_loss, bc_diag = factorized_bc(
             pair_logits=bc_out["pair_logits"],
             pair_mask=bc_mb.pair_mask,
+            source_mask=bc_mb.source_mask,
             expert_src_idx=bc_mb.expert_source_idx_or_noop,
             expert_target_bits=bc_mb.expert_target_bits,
             target_weight=bc_target_weight,

@@ -13,6 +13,7 @@ and color is the seat we played from (slot 0 = blue, 1 = orange).
 Run:
     python scripts/play_transformer_v2_vs_physical_v4.py --num-games 5
     python scripts/play_transformer_v2_vs_physical_v4.py --num-games 5 --seeds 1729,42,1,7,100
+    python scripts/play_transformer_v2_vs_physical_v4.py --num-games 32 --both-seats
 """
 from __future__ import annotations
 
@@ -57,6 +58,10 @@ def main() -> None:
                     help="Opponent agent id.")
     ap.add_argument("--seat", type=int, default=0, choices=(0, 1),
                     help="Which seat the learner plays from.")
+    ap.add_argument("--both-seats", action="store_true",
+                    help="For each seed, play both learner seat 0 and learner "
+                         "seat 1. This is the recommended eval-panel mode "
+                         "because it cancels first-seat/home-position bias.")
     ap.add_argument("--out-dir", type=Path, default=None,
                     help="Output run directory. Defaults to "
                          "data/runs/play_<learner>_vs_<opponent>_<TS>.")
@@ -78,11 +83,14 @@ def main() -> None:
     replay_dir = run_dir / "replays"
     replay_dir.mkdir(parents=True, exist_ok=True)
 
-    color = "blue" if args.seat == 0 else "orange"
-    agent_slots = [args.opponent, args.opponent]
-    agent_slots[args.seat] = args.learner
+    jobs = [
+        (seed, seat)
+        for seed in seeds
+        for seat in ((0, 1) if args.both_seats else (args.seat,))
+    ]
 
-    print(f"learner: {args.learner} (seat {args.seat}, {color})")
+    seat_desc = "both seats" if args.both_seats else f"seat {args.seat}"
+    print(f"learner: {args.learner} ({seat_desc})")
     print(f"opponent: {args.opponent}")
     print(f"run dir:  {run_dir}")
     print(f"seeds:    {seeds}")
@@ -91,10 +99,13 @@ def main() -> None:
     wins = losses = draws = 0
     results = []
     t0 = time.time()
-    for g, seed in enumerate(seeds, 1):
+    for g, (seed, seat) in enumerate(jobs, 1):
         t_game = time.time()
+        color = "blue" if seat == 0 else "orange"
+        agent_slots = [args.opponent, args.opponent]
+        agent_slots[seat] = args.learner
         result = run_match(agent_slots, seed=seed)
-        outcome = _outcome_for_seat(result, args.seat)
+        outcome = _outcome_for_seat(result, seat)
         if outcome == "win":
             wins += 1
         elif outcome == "draw":
@@ -105,17 +116,17 @@ def main() -> None:
         name = f"{outcome}_iter000_ep{ep_tag}_{color}.html"
         path = save_replay(result.env, replay_dir / name)
         elapsed = time.time() - t_game
-        learner_reward = result.rewards[args.seat]
-        opp_reward = result.rewards[1 - args.seat]
+        learner_reward = result.rewards[seat]
+        opp_reward = result.rewards[1 - seat]
         scoreboard = "  ".join(
             f"{aid}={r}" for aid, r in zip(result.agent_ids, result.rewards)
         )
         print(
-            f"  game {g}/{args.num_games}  seed={seed}  {outcome:<5s}  "
+            f"  game {g}/{len(jobs)}  seed={seed}  seat={seat}  {outcome:<5s}  "
             f"({scoreboard})  → {path.name}  [{elapsed:.1f}s]"
         )
         results.append(dict(
-            game=g, seed=seed, outcome=outcome,
+            game=g, seed=seed, seat=seat, outcome=outcome,
             learner_reward=learner_reward, opp_reward=opp_reward,
             replay=str(path),
         ))
@@ -123,7 +134,7 @@ def main() -> None:
     total = time.time() - t0
     print()
     print(f"summary: wins={wins}  draws={draws}  losses={losses}  "
-          f"({wins}/{args.num_games}); total {total:.1f}s")
+          f"({wins}/{len(jobs)}); total {total:.1f}s")
     print(f"replays under: {replay_dir}")
 
 

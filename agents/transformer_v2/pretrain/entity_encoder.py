@@ -1220,6 +1220,9 @@ class EntityPretrainModel(nn.Module):
 # (``source_act`` / ``target_aim`` / ``glob_act``) were dropped: at
 # inference only ``pair_logits`` and ``pair_frac`` are consumed.
 _HEAD_NAMES: tuple[str, ...] = ("pair_logits", "pair_frac")
+_PPO_ALIGNMENT_LOSS_NAMES: tuple[str, ...] = (
+    "ppo_source", "ppo_target", "ppo_frac_logit",
+)
 
 # Planet feature layout from ``PlanetFeaturizer.to_vector``:
 #   f000 = is_comet
@@ -1378,11 +1381,88 @@ def _pair_frac_targets_from_batch(
     return (ships / denom).clamp(min=0.0, max=1.0)
 
 
+def _ppo_source_mask_from_batch(
+    batch: dict[str, torch.Tensor],
+    pair_valid: torch.Tensor,
+) -> torch.Tensor:
+    """Approximate PPO source legality for supervised pair-cache rows.
+
+    PPO's runtime source mask also requires surplus after inbound-defense
+    accounting. The cache does not store that dynamic surplus, but it does
+    store learner-relative owner one-hots. Masking to learner-owned source
+    rows removes the bad distribution shift where the source categorical is
+    trained to choose planets the PPO actor could never legally launch from.
+    """
+    planet_features = batch.get("planet_features")
+    planet_mask = batch.get("planet_mask")
+    fallback = pair_valid.any(dim=2)
+    if planet_features is None or planet_mask is None:
+        return fallback
+    pf = _current_planet_features(planet_features)
+    pm = planet_mask[:, -1] if planet_mask.dim() == 3 else planet_mask
+    own_source = pf[..., _PLANET_OWNER_START_IDX] > 0.5
+    return own_source & pm.bool() & fallback
+
+
+def _ppo_expert_source_from_batch(
+    batch: dict[str, torch.Tensor],
+    pair_labels: torch.Tensor,
+    source_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return PPO source CE labels: 0=NOOP, else 1+canonical source.
+
+    Coalition turns can contain several expert source rows. For PPO's
+    single-source categorical we choose the legal source with the largest
+    shipped volume, falling back to positive-cell count for legacy caches
+    without ``pair_ships``.
+    """
+    if "pair_ships" in batch:
+        row_scores = batch["pair_ships"].float().sum(dim=2)
+    else:
+        row_scores = pair_labels.float().sum(dim=2)
+    row_scores = row_scores.masked_fill(~source_mask, 0.0)
+    has_any = row_scores.sum(dim=1) > 0
+    argmax_src = row_scores.argmax(dim=1)
+    return torch.where(
+        has_any, argmax_src + 1, torch.zeros_like(argmax_src),
+    ).long()
+
+
+def _ppo_frac_logit_loss(
+    preds: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    pair_labels: torch.Tensor,
+    pair_valid: torch.Tensor,
+) -> torch.Tensor:
+    """Logit-space row-share target for PPO's normalized frac projection.
+
+    PPO samples one source, samples target bits on that row, then treats the
+    sampled ``frac_raw`` values as positive allocation weights normalized to
+    the source budget. The old supervised frac loss trains absolute
+    ``ships/source_ships``. This auxiliary loss teaches the PPO-compatible
+    row share on positive cells without removing the greedy-inference frac
+    objective.
+    """
+    ships = batch["pair_ships"].float()
+    row_sum = ships.sum(dim=2, keepdim=True).clamp(min=1.0)
+    target_share = (ships / row_sum).clamp(min=1e-4, max=1.0 - 1e-4)
+    pos_mask = pair_labels & pair_valid & (ships > 0)
+    if not bool(pos_mask.any()):
+        return torch.zeros((), device=preds["pair_frac"].device,
+                           dtype=preds["pair_frac"].dtype)
+    target_logit = torch.logit(target_share).to(preds["pair_frac"].dtype)
+    sq_err = (preds["pair_frac"] - target_logit).pow(2)
+    return sq_err[pos_mask].mean()
+
+
 def compute_multi_loss(
     preds: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
     *,
     pair_pos_weight: float = 600.0,
+    ppo_source_weight: float = 1.0,
+    ppo_target_weight: float = 1.0,
+    ppo_frac_logit_weight: float = 0.0,
     enabled_heads: tuple[str, ...] | None = None,
     # Accepted-but-ignored knobs from the legacy aux-head API. Kept so the
     # train CLI + Colab notebook can still pass them as no-ops while older
@@ -1405,6 +1485,10 @@ def compute_multi_loss(
         ``pair_ships / source_ships_before_launch``.
         Masked to positive cells (pair_labels & pair_valid). Skipped
         entirely when ``pair_ships`` is missing from the batch.
+      * PPO alignment     optional source CE + expert-row target BCE using
+        the same source-categorical / row-Bernoulli factorization as PPO.
+        This reduces the pretrain→PPO distribution shift while preserving
+        the original whole-grid BCE used by greedy threshold inference.
 
     Returns ``(total_loss, per_head_dict)`` where ``per_head_dict``
     maps head name → unweighted scalar loss (for logging). The total
@@ -1446,6 +1530,43 @@ def compute_multi_loss(
     elif "pair_frac" in enabled_heads:
         per_head["pair_frac"] = float("nan")
 
+    # 3) PPO action-factorization alignment. The existing pair BCE trains
+    # independent grid cells, which is the right objective for greedy
+    # threshold inference but not for PPO's source-categorical action
+    # contract. Add a source CE + chosen-row target BCE over learner-owned
+    # source rows so a pretrained actor has calibrated PPO logits on step 1.
+    if (ppo_source_weight > 0.0 or ppo_target_weight > 0.0) and "pair_logits" in enabled_heads:
+        from agents.transformer_v2.ppo.loss import factorized_bc
+
+        source_mask = _ppo_source_mask_from_batch(batch, pair_valid)
+        expert_src = _ppo_expert_source_from_batch(batch, pair_labels, source_mask)
+        ppo_bc, ppo_diag = factorized_bc(
+            pair_logits=pair_logits,
+            pair_mask=pair_valid,
+            source_mask=source_mask,
+            expert_src_idx=expert_src,
+            expert_target_bits=pair_labels,
+            source_weight=ppo_source_weight,
+            target_weight=ppo_target_weight,
+        )
+        per_head["ppo_source"] = ppo_diag["bc_source_loss"]
+        per_head["ppo_target"] = ppo_diag["bc_target_loss"]
+        total = total + ppo_bc
+
+    # 4) Optional PPO-compatible frac target. Kept off by default because
+    # greedy inference still consumes pair_frac as an absolute fraction of
+    # source ships, while PPO consumes it as a normalized allocation weight.
+    if (
+        ppo_frac_logit_weight > 0.0
+        and "pair_frac" in enabled_heads
+        and "pair_ships" in batch
+    ):
+        loss_ppo_frac = _ppo_frac_logit_loss(
+            preds, batch, pair_labels, pair_valid,
+        )
+        per_head["ppo_frac_logit"] = float(loss_ppo_frac.detach())
+        total = total + float(ppo_frac_logit_weight) * loss_ppo_frac
+
     return total, per_head
 
 
@@ -1467,6 +1588,9 @@ def compute_pair_loss(
     return compute_multi_loss(
         preds, batch,
         pair_pos_weight=pos_weight,
+        ppo_source_weight=0.0,
+        ppo_target_weight=0.0,
+        ppo_frac_logit_weight=0.0,
         enabled_heads=("pair_logits",),
     )
 
@@ -1500,6 +1624,10 @@ def evaluate(
     comet_enc: CometEncoder,
     loader: DataLoader,
     device: str,
+    *,
+    ppo_source_weight: float = 1.0,
+    ppo_target_weight: float = 1.0,
+    ppo_frac_logit_weight: float = 0.0,
 ) -> dict[str, dict[str, float]]:
     """2-head metrics over the validation set.
 
@@ -1517,6 +1645,11 @@ def evaluate(
     # pair_frac (regression): MSE on positive cells.
     frac_se_sum = 0.0
     frac_n = 0
+    ppo_source_sum = 0.0
+    ppo_target_sum = 0.0
+    ppo_frac_sum = 0.0
+    ppo_n = 0
+    ppo_frac_n = 0
 
     # pair_logits-specific top-k accounting.
     rk_hits: dict[int, int] = {1: 0, 5: 0, 10: 0}
@@ -1599,6 +1732,32 @@ def evaluate(
             frac_se_sum += float((sq * pos_mask).sum())
             frac_n += int(pos_mask.sum())
 
+        # ---- PPO-alignment validation losses ----
+        if ppo_source_weight > 0.0 or ppo_target_weight > 0.0:
+            from agents.transformer_v2.ppo.loss import factorized_bc
+
+            source_mask = _ppo_source_mask_from_batch(batch, pair_valid)
+            expert_src = _ppo_expert_source_from_batch(
+                batch, pair_labels, source_mask,
+            )
+            _ppo_bc, ppo_diag = factorized_bc(
+                pair_logits=pair_logits,
+                pair_mask=pair_valid,
+                source_mask=source_mask,
+                expert_src_idx=expert_src,
+                expert_target_bits=pair_labels,
+                source_weight=1.0,
+                target_weight=1.0,
+            )
+            ppo_source_sum += ppo_diag["bc_source_loss"] * B
+            ppo_target_sum += ppo_diag["bc_target_loss"] * B
+            ppo_n += B
+        if ppo_frac_logit_weight > 0.0 and "pair_ships" in batch:
+            ppo_frac_sum += float(_ppo_frac_logit_loss(
+                preds, batch, pair_labels, pair_valid,
+            )) * B
+            ppo_frac_n += B
+
     pos = bce_stats["tp"] + bce_stats["fn"]
     neg = bce_stats["tn"] + bce_stats["fp"]
     total_cells = max(1, pos + neg)
@@ -1621,6 +1780,21 @@ def evaluate(
         frac_entry = {"loss": float("nan"), "n_pos": 0.0}
 
     ordered = {"pair_logits": pair_entry, "pair_frac": frac_entry}
+    if ppo_n > 0 and ppo_source_weight > 0.0:
+        ordered["ppo_source"] = {
+            "loss": ppo_source_sum / max(1, ppo_n),
+            "weight": float(ppo_source_weight),
+        }
+    if ppo_n > 0 and ppo_target_weight > 0.0:
+        ordered["ppo_target"] = {
+            "loss": ppo_target_sum / max(1, ppo_n),
+            "weight": float(ppo_target_weight),
+        }
+    if ppo_frac_n > 0 and ppo_frac_logit_weight > 0.0:
+        ordered["ppo_frac_logit"] = {
+            "loss": ppo_frac_sum / max(1, ppo_frac_n),
+            "weight": float(ppo_frac_logit_weight),
+        }
     model.train()
     return ordered
 
@@ -1633,8 +1807,8 @@ def _format_summary(summary: dict[str, dict[str, float]]) -> str:
     return "\n".join(lines)
 
 
-# Canonical print order matches ``_HEAD_NAMES``.
-_HEAD_PRINT_ORDER: tuple[str, ...] = _HEAD_NAMES
+# Print real heads first, followed by optional PPO-alignment losses.
+_HEAD_PRINT_ORDER: tuple[str, ...] = _HEAD_NAMES + _PPO_ALIGNMENT_LOSS_NAMES
 
 
 def _format_heads_table(
@@ -1975,6 +2149,9 @@ def train(
     pair_history_offsets: tuple[int, ...] | None = None,
     drop_invalid_source_episodes: bool = False,
     pair_pos_weight: float = 600.0,
+    ppo_source_weight: float = 1.0,
+    ppo_target_weight: float = 1.0,
+    ppo_frac_logit_weight: float = 0.0,
     source_act_pos_weight: float = 1.0,
     target_aim_pos_weight: float = 1.0,
     glob_act_pos_weight: float = 1.0,
@@ -2319,6 +2496,9 @@ def train(
         "comet_run_dir": str(comet_run_dir),
         "pair_cache_path": str(pair_cache_path),
         "pair_pos_weight": pair_pos_weight,
+        "ppo_source_weight": ppo_source_weight,
+        "ppo_target_weight": ppo_target_weight,
+        "ppo_frac_logit_weight": ppo_frac_logit_weight,
         "pair_type_num_classes": PAIR_TYPE_NUM_CLASSES,
         "history_offsets": list(history_offsets) if history_offsets is not None else None,
         "n_steps": n_steps,
@@ -2332,6 +2512,17 @@ def train(
         print(
             f"[entity-pretrain] pair-BCE pos_weight = {pair_pos_weight} "
             f"(applied to train loss; val/test loss stays unweighted)"
+        )
+    if ppo_source_weight > 0.0 or ppo_target_weight > 0.0:
+        print(
+            "[entity-pretrain] PPO-alignment loss enabled: "
+            f"source_ce_weight={ppo_source_weight} "
+            f"target_row_bce_weight={ppo_target_weight}"
+        )
+    if ppo_frac_logit_weight > 0.0:
+        print(
+            "[entity-pretrain] PPO frac row-share logit loss enabled: "
+            f"weight={ppo_frac_logit_weight}"
         )
     log: list[dict[str, Any]] = []
     best_val = float("inf")
@@ -2371,6 +2562,9 @@ def train(
             total_loss, per_head = compute_multi_loss(
                 preds, batch,
                 pair_pos_weight=pair_pos_weight,
+                ppo_source_weight=ppo_source_weight,
+                ppo_target_weight=ppo_target_weight,
+                ppo_frac_logit_weight=ppo_frac_logit_weight,
                 source_act_pos_weight=source_act_pos_weight,
                 target_aim_pos_weight=target_aim_pos_weight,
                 glob_act_pos_weight=glob_act_pos_weight,
@@ -2402,7 +2596,7 @@ def train(
 
         train_total = running_total / max(1, n_batches)
         train_per_head: dict[str, float] = {}
-        for k in _HEAD_NAMES:
+        for k in _HEAD_PRINT_ORDER:
             n = running_per_head.get(f"_n_{k}", 0)
             if n > 0:
                 train_per_head[k] = running_per_head[k] / n
@@ -2413,12 +2607,20 @@ def train(
         }
 
         if epoch % eval_every == 0 or epoch == epochs:
-            val = evaluate(model, fleet_enc, planet_enc, comet_enc, val_loader, device)
+            val = evaluate(
+                model, fleet_enc, planet_enc, comet_enc, val_loader, device,
+                ppo_source_weight=ppo_source_weight,
+                ppo_target_weight=ppo_target_weight,
+                ppo_frac_logit_weight=ppo_frac_logit_weight,
+            )
             # Average across heads whose loss is finite. ``pair_frac``
             # emits NaN on caches without ``pair_ships``; skip those so
             # the mean isn't poisoned.
-            losses = [m["loss"] for m in val.values()
-                      if not (isinstance(m["loss"], float) and math.isnan(m["loss"]))]
+            losses = [
+                float(m.get("weight", 1.0)) * m["loss"]
+                for m in val.values()
+                if not (isinstance(m["loss"], float) and math.isnan(m["loss"]))
+            ]
             mean = sum(losses) / max(1, len(losses))
             entry["val_mean_loss"] = mean
             entry["val"] = val
@@ -2450,7 +2652,12 @@ def train(
     print("\n[entity-pretrain] evaluating best on test ...")
     ckpt = torch.load(best_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
-    test = evaluate(model, fleet_enc, planet_enc, comet_enc, test_loader, device)
+    test = evaluate(
+        model, fleet_enc, planet_enc, comet_enc, test_loader, device,
+        ppo_source_weight=ppo_source_weight,
+        ppo_target_weight=ppo_target_weight,
+        ppo_frac_logit_weight=ppo_frac_logit_weight,
+    )
     print(_format_summary(test))
     (out_dir / "test_summary.json").write_text(json.dumps(test, indent=2))
     print(f"\n[entity-pretrain] outputs in {out_dir}")
@@ -2621,6 +2828,27 @@ def main() -> None:
              "Set to 1.0 to disable.",
     )
     parser.add_argument(
+        "--ppo-source-weight", type=float, default=1.0,
+        help="Auxiliary PPO-alignment source CE weight. This trains "
+             "row_max(pair_logits) as the same NOOP-or-source categorical "
+             "used by PPO, masking source rows to learner-owned planets. "
+             "Set to 0 to recover the pure independent-pair BCE objective.",
+    )
+    parser.add_argument(
+        "--ppo-target-weight", type=float, default=1.0,
+        help="Auxiliary PPO-alignment target-row BCE weight. This trains "
+             "only the canonical expert source row with the same per-target "
+             "Bernoulli factorization used by PPO. Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--ppo-frac-logit-weight", type=float, default=0.0,
+        help="Optional PPO-compatible frac loss weight. When enabled, "
+             "pair_frac also learns logit(row_share(pair_ships)) on "
+             "positive cells, matching PPO's normalized budget allocation. "
+             "Default 0 keeps greedy inference's absolute-fraction target "
+             "as the only frac objective.",
+    )
+    parser.add_argument(
         "--source-act-pos-weight", type=float, default=1.0,
         help="Legacy no-op retained for old launch cells/scripts. "
              "The current 2-head model has no source_act head.",
@@ -2693,6 +2921,9 @@ def main() -> None:
         pair_history_offsets=pair_history_offsets,
         drop_invalid_source_episodes=args.drop_invalid_source_episodes,
         pair_pos_weight=args.pair_pos_weight,
+        ppo_source_weight=args.ppo_source_weight,
+        ppo_target_weight=args.ppo_target_weight,
+        ppo_frac_logit_weight=args.ppo_frac_logit_weight,
         source_act_pos_weight=args.source_act_pos_weight,
         target_aim_pos_weight=args.target_aim_pos_weight,
         glob_act_pos_weight=args.glob_act_pos_weight,

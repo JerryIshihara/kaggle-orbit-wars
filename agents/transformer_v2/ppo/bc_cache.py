@@ -15,10 +15,13 @@ The cache stores per-snapshot:
 For the factorized BC:
   * ``expert_target_bits = pair_labels`` (the full P×P matrix; the loss
     masks to the chosen source's row at compute time).
+  * ``source_mask`` is derived from current-frame planet owner features so
+    the source categorical never trains on non-learner-owned rows.
   * ``expert_source_idx_or_noop`` is derived per snapshot:
         0  if no positives (NOOP — expert took no launch action)
-        1 + argmax_s(pair_labels[s, :].sum())  otherwise (the source
-        with the most expert targets — canonical for coalition turns)
+        1 + argmax_s(pair_ships[s, :].sum())  otherwise (the source
+        with the largest launched ship total among learner-owned rows,
+        canonical for coalition turns)
 
 ``pair_type_ids`` is computed on the fly via
 :func:`build_pair_type_ids` since the cache doesn't store it.
@@ -33,7 +36,11 @@ from typing import Any
 
 import torch
 
-from agents.transformer_v2.pretrain.entity_encoder import build_pair_type_ids
+from agents.transformer_v2.pretrain.entity_encoder import (
+    _PLANET_OWNER_START_IDX,
+    _current_planet_features,
+    build_pair_type_ids,
+)
 
 from .loss import BCMinibatch
 
@@ -118,12 +125,30 @@ class BCCacheSampler:
         pair_labels = torch.stack([it["pair_labels"].bool() for it in items]).to(self.device)
         pair_valid = torch.stack([it["pair_valid"].bool() for it in items]).to(self.device)
 
+        # PPO source-categorical legality approximation. The rollout source
+        # mask also checks launch surplus, but the cache has no inbound-threat
+        # surplus calculation. Owner legality is the important invariant here:
+        # non-learner-owned rows are impossible source choices in PPO.
+        pf_now = _current_planet_features(planet_features)
+        source_mask = (
+            (pf_now[..., _PLANET_OWNER_START_IDX] > 0.5)
+            & planet_mask_now
+            & pair_valid.any(dim=2)
+        )
+
         # expert_source_idx_or_noop:
-        #   0 if no positives (snapshot is NOOP),
-        #   1 + argmax_s(pair_labels[s, :].sum())  otherwise.
-        row_pos_counts = pair_labels.sum(dim=2)            # (B, P)
-        has_any = row_pos_counts.sum(dim=1) > 0            # (B,)
-        argmax_src = row_pos_counts.argmax(dim=1)          # (B,)
+        #   0 if no legal positives (snapshot is NOOP for PPO source CE),
+        #   1 + argmax_s(total launched ships from legal source s) otherwise.
+        if "pair_ships" in items[0]:
+            pair_ships = torch.stack([
+                it["pair_ships"].float() for it in items
+            ]).to(self.device)
+            row_scores = pair_ships.sum(dim=2)
+        else:
+            row_scores = pair_labels.float().sum(dim=2)
+        row_scores = row_scores.masked_fill(~source_mask, 0.0)       # (B, P)
+        has_any = row_scores.sum(dim=1) > 0                          # (B,)
+        argmax_src = row_scores.argmax(dim=1)                        # (B,)
         expert_src = torch.where(
             has_any, argmax_src + 1, torch.zeros_like(argmax_src),
         ).long()
@@ -139,6 +164,7 @@ class BCCacheSampler:
         return BCMinibatch(
             feats=feats,
             pair_mask=pair_valid,
+            source_mask=source_mask,
             expert_source_idx_or_noop=expert_src,
             expert_target_bits=pair_labels,
         )

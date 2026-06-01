@@ -66,14 +66,25 @@ def run_match(
     from kaggle_environments import make
 
     players = _validate_and_load(agent_ids)
-    # orbit_wars 1.28.x builds maps with Python's module-level random,
-    # not env.configuration.seed. Seed it here so eval panels are actually
-    # reproducible across runs and machines.
-    if seed is not None:
-        random.seed(seed)
     config: dict = {"seed": seed} if seed is not None else {}
-    env = make("orbit_wars", configuration=config, debug=debug)
-    env.run([p.fn for p in players])
+    if seed is None:
+        env = make("orbit_wars", configuration=config, debug=debug)
+        env.run([p.fn for p in players])
+    else:
+        # orbit_wars 1.28.x ignores env.configuration.seed for map/comet RNG
+        # and instead reads the module global named ``random``. Patch that
+        # module binding to a local RNG for the whole episode, then restore it
+        # so eval seeding does not perturb process-global Python random state
+        # used by other tools or stochastic agents.
+        import kaggle_environments.envs.orbit_wars.orbit_wars as orbit_wars
+
+        prev_random = orbit_wars.random
+        orbit_wars.random = random.Random(seed)
+        try:
+            env = make("orbit_wars", configuration=config, debug=debug)
+            env.run([p.fn for p in players])
+        finally:
+            orbit_wars.random = prev_random
 
     scores = compute_scores(env)
     final = env.steps[-1]
