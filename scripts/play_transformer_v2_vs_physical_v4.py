@@ -18,6 +18,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -42,6 +43,21 @@ def _outcome_for_seat(result, seat: int) -> str:
         if rewards[seat] == max_r and ties > 1:
             return "draw"
     return "loss"
+
+
+def _wilson_ci(successes: int, total: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for a Bernoulli win rate."""
+    if total <= 0:
+        return 0.0, 0.0
+    phat = successes / total
+    denom = 1.0 + z * z / total
+    center = (phat + z * z / (2.0 * total)) / denom
+    half = (
+        z
+        * math.sqrt((phat * (1.0 - phat) + z * z / (4.0 * total)) / total)
+        / denom
+    )
+    return max(0.0, center - half), min(1.0, center + half)
 
 
 def main() -> None:
@@ -132,9 +148,22 @@ def main() -> None:
         ))
 
     total = time.time() - t0
+    n_jobs = len(jobs)
+    wr_lo, wr_hi = _wilson_ci(wins, n_jobs)
     print()
     print(f"summary: wins={wins}  draws={draws}  losses={losses}  "
-          f"({wins}/{len(jobs)}); total {total:.1f}s")
+          f"({wins}/{n_jobs}); winrate={wins / max(1, n_jobs):.3f}  "
+          f"95% Wilson CI=[{wr_lo:.3f}, {wr_hi:.3f}]; total {total:.1f}s")
+    if args.both_seats:
+        for seat in (0, 1):
+            seat_results = [r for r in results if r["seat"] == seat]
+            seat_wins = sum(1 for r in seat_results if r["outcome"] == "win")
+            lo, hi = _wilson_ci(seat_wins, len(seat_results))
+            print(
+                f"  seat {seat}: wins={seat_wins}/{len(seat_results)}  "
+                f"winrate={seat_wins / max(1, len(seat_results)):.3f}  "
+                f"95% CI=[{lo:.3f}, {hi:.3f}]"
+            )
     print(f"replays under: {replay_dir}")
 
 
