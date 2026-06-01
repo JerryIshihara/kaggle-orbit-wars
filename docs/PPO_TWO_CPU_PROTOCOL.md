@@ -8,6 +8,13 @@ Current repo status: `agents/transformer_v2/ppo.py` is intentionally still a
 stub. This document defines the protocol to implement next; it is not a claim
 that the PPO CLI already exists.
 
+> **Design correction, 2026-05-30:** the PPO critic must branch from **L1**.
+> Older text in this document described a 3-Linear `value_head` on actor L2
+> `glob`; that path is now debug-only. The production critic is:
+> `actor L1 tokens -> separate critic L2 -> PlayerConsolidator -> ValueDecoder`.
+> Actor L2/L3/L4 remain actor-side perception/action modules, not the critic
+> attachment point.
+
 ## Goal
 
 Use PPO to fine-tune the learned source→target policy against the actual game
@@ -19,7 +26,7 @@ L1-L2 world perception            frozen at first, touched only with evidence
 PlayerContext/Strategy learners   planned post-L2 trainable modules
 ActionLearner (current L3/L4)      trainable after PPO plumbing
 PairHead output layers            trainable (the actor IS these layers)
-value_head                        trainable (the ONLY new PPO parameter)
+critic ValueDecoder               trainable (critic branches from L1)
 ```
 
 The first PPO version should be conservative: keep the environment-facing
@@ -35,14 +42,15 @@ Each item links to the section with full detail.
 ### Model wrapper — `PPOActorCritic`
 
 **Actor = the existing `pair_logits` and `pair_frac` outputs from `PairHead`.
-Critic = a new 3-Linear MLP `value_head` on L2's `glob`.** The only new PPO
-module is `value_head` (~132 k params at H = d_model = 256); everything else
-PPO trains is an existing supervised parameter.
+Critic = separate `CrossEntityCriticModel` attached to actor L1.** The critic
+does not read actor L2 `glob`. It receives the frozen actor L1 tokens, runs its
+own critic L2 + `PlayerConsolidator`, and trains only the `ValueDecoder` in
+Phase 0.
 
 ```
-                          glob (B, 256)  ──►  value_head (3-Linear MLP) ──► V(s)   [CRITIC]
-
-   L0 → L1 → L2 ──►  ctx_now ──►  post-L2 stack ──►  PairHead
+             ┌──► critic L2 + PlayerConsolidator ──► ValueDecoder ──► V(s) [CRITIC]
+             │
+   L0 → L1 ──┴──► actor L2 ──►  ctx_now ──►  post-L2 stack ──►  PairHead
                                   (PlayerContext, Strategy,           ├─► pair_logits  ──┐
                                    L3 DualRoleAttention,              │   (B, P, P)      │ [ACTOR]
                                    L4 JointRoleAttention,             └─► pair_frac      │
@@ -59,8 +67,9 @@ Forward pseudo:
 
 ```text
 out = entity_model.forward_with_context(feats)
+critic_value = critic_model(out.l1_now[:, None], mask[:, None], owner_oh)
 return {
-    "value":       value_head(out.glob).squeeze(-1),    # CRITIC ← L2 only
+    "value":       2 * sigmoid(critic_value[:, 0]) - 1, # CRITIC ← L1 branch
     "pair_logits": out.pair_logits,                      # ACTOR ← existing
     "frac_loc":    out.pair_frac,                        # ACTOR ← existing
     "sigma":       0.35,                                 # fixed hyperparam
@@ -637,15 +646,17 @@ manifest, not version arithmetic, enforces this. Promotion is sparse, so
 ### Actor-critic wrapper
 
 **Actor = the existing `pair_logits` and `pair_frac` outputs from PairHead.
-Critic = a new 3-Linear MLP `value_head` reading L2's `glob`.** PPO's only
-new module is `value_head` (~132 k params); no `noop_head`, no learnable σ
-for the fraction.
+Critic = separate `CrossEntityCriticModel` branching from actor L1.** The
+legacy `value_head(glob)` path is debug-only; production PPO uses actor L1
+tokens as input to critic L2 + `PlayerConsolidator` + `ValueDecoder`. No
+`noop_head`, no learnable σ for the fraction.
 
 The active `EntityPretrainModel` forward returns:
 
 ```text
 pair_logits  (B, P, P)
 pair_frac    (B, P, P) raw logit; runtime uses sigmoid(pair_frac)
+l1_now       (B, P, 256) current actor L1 tokens; critic branch input
 glob         (B, 256)  CLS readout from L2 CrossEntityAttention
 ctx_now      (B, P, 256)
 ```
@@ -653,16 +664,15 @@ ctx_now      (B, P, 256)
 The wrapper is therefore minimal:
 
 ```text
-PPOActorCritic(EntityPretrainModel, sigma: float = 0.35,
-                value_hidden: int | None = None):
-  # CRITIC — 3-Linear MLP on glob. ~132 k new params at H=d_model=256.
-  H = value_hidden or d_model
-  value_head = Sequential(
-      Linear(d_model -> H), GELU,
-      Linear(H -> H),       GELU,
-      Linear(H -> 1),
+PPOActorCritic(EntityPretrainModel, critic_model: CrossEntityCriticModel,
+                sigma: float = 0.35):
+  # CRITIC — actor L1 branch, not actor L2/L3/L4.
+  critic_out = critic_model(
+      entity_tokens = base_out["l1_now"].unsqueeze(1),  # (B, 1, P, d)
+      entity_mask   = planet_mask.unsqueeze(1),         # (B, 1, P)
+      owner_oh      = planet_owner_oh,                  # (B, P, 5)
   )
-  value        = value_head(glob).squeeze(-1)
+  value = 2 * sigmoid(critic_out["value_logit"][:, 0]) - 1
 
   # ACTOR — existing PairHead outputs; no new heads.
   pair_logits  = base_out["pair_logits"]
@@ -670,10 +680,10 @@ PPOActorCritic(EntityPretrainModel, sigma: float = 0.35,
   sigma        = sigma                                   # fixed hyperparameter
 ```
 
-**Why 3 Linears for the value head:** a single Linear is too shallow to
-model V(s) as a non-linear function of `glob`. Two GELU non-linearities +
-3 weight matrices give the critic enough capacity to learn the board
-geometry ↔ winning-state mapping without leaking into the actor.
+**Why branch at L1:** L1 is the last shared local/entity representation before
+actor-specific temporal/world aggregation and source-target specialization.
+The critic owns its own L2 + `PlayerConsolidator`, so value gradients do not
+reuse actor L2/L3/L4 as a value scaffold.
 
 ### PairHead bootstrap preconditions (depths)
 
@@ -712,13 +722,11 @@ saturate the thin heads almost immediately.
 
 **Why split this way:**
 
-- **Decoupled gradients.** `value_loss` enters `value_head` and stops at L2
-  because L2 stays frozen throughout PPO. `policy_loss +
-  entropy + bc_loss` enters the actor heads and propagates back through the
-  post-L2 stack as freezes lift.
-- **`glob` is the right signal for V(s).** L2's CLS already summarizes the
-  board (frontiers, balance, threats). Pulling role-aware or pair-aware tokens
-  into the value head would add variance without changing what is predictable.
+- **Decoupled gradients.** `value_loss` enters the critic `ValueDecoder` and
+  can fine-tune only explicitly allowed critic modules. Actor loss enters the
+  PairHead path. Actor L2/L3/L4 are not shared with the critic.
+- **L1 is the critic branch point.** It preserves entity/fleet perception
+  without committing the critic to actor-side source-target/action features.
 - **Cheap, depth-appropriate critic.** A 3-Linear MLP (~132 k at H=256) is
   thick enough to model V(s) non-linearly in `glob` but still cheap to
   train and trivially serializable. A single Linear would saturate fast
@@ -1712,13 +1720,9 @@ revisits start from the same context.
    them trained, not try to learn strategy through them from sparse PPO
    reward. Out of scope for the PPO MVP.
 
-10. **Value head may be underconditioned — diagnostic + fallback flag.** The
-    3-Linear MLP on `glob` is sized for V(s) ≈ f(board state). If
+10. **Critic may still be underconditioned — diagnose the L1 branch.** If
     `value_explained_variance` stays poor for ~5 iterations after policy KL
-    and entropy stabilize, concat seat one-hot + opponent-id embedding into
-    the `value_head` input: `value_head(concat[glob, seat_emb, opp_emb])`.
-    This is a minimal extension (still no L3/L4 coupling) gated on evidence.
-    Add `--value-condition-seat`, `--value-condition-opponent` flags now so
-    the toggle is one-line later. Rejected per-opponent value baselines for
-    v1: more code, less interpretable, and the seat/opp-conditioned single
-    head is usually enough.
+    and entropy stabilize, fix the separate critic path first: improve
+    `PlayerConsolidator` labels, add richer player/opponent context to the
+    critic `ValueDecoder`, or unfreeze critic L2/consolidator at a small LR.
+    Do not move the critic back onto actor L2 `glob`; that path is debug-only.

@@ -208,9 +208,15 @@ class TransformerAgent:
         comet_run_dir: Path | None = None,
         inference_mode: str = "threshold",
         logit_threshold: float = 2.0,
+        disable_film: bool = False,
     ) -> "TransformerAgent":
         """Reconstruct the L0 frozen specialists + the trainable
         L1-L4 + PairHead stack from a v2 entity-pretrain ckpt.
+
+        ``disable_film=True`` flips the PairHead's runtime FiLM bypass on
+        after loading — the trained FiLM weights stay in the ckpt but the
+        modulation is skipped at inference (h_film = h). Used to A/B the
+        FiLM contribution head-to-head on identical weights.
 
         ``ckpt_path`` defaults to the newest ``entity_encoder_best.pt``
         under ``data/runs/entity/<run>/``. The L0 ckpt dirs default to
@@ -259,6 +265,25 @@ class TransformerAgent:
         # so old single-Linear ckpts loaded into a deeper-MLP module
         # leave the heads at random init rather than mid-loading shapes.
         head_n_layers = int(cfg.get("head_n_layers", 1))
+        # Architecture flags (skip_l34 / with_consolidator). Prefer the saved
+        # config, but older ablation ckpts (e.g. the noL34 run) did NOT save
+        # these — so DETECT from the state_dict keys: no dual_role/joint_role
+        # keys ⇒ skip_l34; no consolidator keys ⇒ with_consolidator=False.
+        # Without this, a skip-L3/L4 ckpt would build a full model and leave
+        # L3/L4 at RANDOM INIT (the PairHead would then read garbage), making
+        # the loaded agent silently broken.
+        _sd_keys = ckpt["model"].keys()
+        if "skip_l34" in cfg:
+            skip_l34 = bool(cfg["skip_l34"])
+        else:
+            skip_l34 = not any(
+                k.startswith("dual_role.") or k.startswith("joint_role.")
+                for k in _sd_keys
+            )
+        if "with_consolidator" in cfg:
+            with_consolidator = bool(cfg["with_consolidator"])
+        else:
+            with_consolidator = any(k.startswith("consolidator.") for k in _sd_keys)
 
         # Load L0 frozen specialists by their run dirs. _load_encoders
         # reads each ckpt's config for d_model + use_traj_branch.
@@ -277,6 +302,8 @@ class TransformerAgent:
             dual_n_heads=dual_n_heads,
             conditioner_n_layers=conditioner_n_layers,
             head_n_layers=head_n_layers,
+            skip_l34=skip_l34,
+            with_consolidator=with_consolidator,
         )
         # ``strict=False`` so legacy 5-head ckpts (with ``source_act_head`` /
         # ``target_aim_head`` / ``glob_act_head`` keys and no ``film_proj`` /
@@ -286,6 +313,10 @@ class TransformerAgent:
         # at start, but trainable immediately; old ckpt behavior is
         # preserved bit-for-bit on the pair_logits / pair_frac heads).
         model.load_state_dict(ckpt["model"], strict=False)
+
+        # Inference-time FiLM ablation toggle (does not affect loaded weights).
+        if disable_film:
+            model.pair_head.disable_film = True
 
         return cls(
             model,

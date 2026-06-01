@@ -1,6 +1,13 @@
 # `transformer_v2/` — current learned line
 
-Pair-score policy for Orbit Wars. Three frozen L0 specialist encoders feed a four-layer trainable stack (L1 → L2 → L3 → L4), capped by a `PairHead` that emits two `(B, P, P)` outputs through an L1-conditioned FiLM block: `pair_logits` (source→target compatibility) and `pair_frac` (fraction of source's ships to send). Behavior-cloned on top-leaderboard replays with a T=6 history window.
+Pair-score policy for Orbit Wars. Three frozen L0 specialist encoders feed a
+world-perception stack (`L1 PlanetEntityEncoder` → `L2 CrossEntityAttention`).
+After L2, the model has a contextualized world state; everything above that
+line is decision learning, not perception. The current compact implementation
+uses `L3 DualRoleAttention` + `L4 JointRoleAttention` + `PairHead` as the
+post-perception action learner. The next architecture should split that
+post-L2 decision learner into explicit player-context, strategy, and action
+learners.
 
 ## TL;DR
 
@@ -13,7 +20,13 @@ L0 (frozen, per-entity MLP encoders)
 L1 PlanetEntityEncoder  (cross-attn: planets ←→ relation-aware fleet tokens)
                                                                                      ▼ entity_tokens (B, T, P, 256)
 L2 CrossEntityAttention (planet ↔ planet, multi-step Pre-LN encoder + CLS)
-                                                                                     ▼ ctx_now (B, P, 256)
+                                                                                     ▼ ctx_now (B, P, 256), glob (B, 256)
+──────────────────────────────── world perception complete ────────────────────────────────
+PlayerContextLearner    (planned: per-player summaries + learner_ctx)
+                                                                                     ▼ player_ctx, learner_ctx
+StrategyLearner         (planned: doctrine / phase / risk latent)
+                                                                                     ▼ strategy_ctx
+ActionLearner           (current compact path: role-aware pair scorer)
 L3 DualRoleAttention    (parallel source-to-target / target-to-source branches)
                                                                                      ▼ source_aware, target_aware
 L4 JointRoleAttention   (concat both, self-attn on 2P sequence, split back)
@@ -31,7 +44,9 @@ PairHead                ([src_r, ctx_r, tgt_r, ctx_r, src⊙tgt, ctx⊙ctx] → 
                                           pair_valid         cells only
 ```
 
-**Trainable:** ~3.70M params (L1: 658k, L2: 1.05M, L3: 528k, L4: 528k, PairHead: 929k incl. FiLM). **Frozen L0:** 374k params.
+**Trainable:** ~3.70M params in the current compact stack (L1: 658k, L2:
+1.05M, L3: 528k, L4: 528k, PairHead: 929k incl. FiLM). **Frozen L0:** 374k
+params.
 
 ## Architecture details
 
@@ -70,7 +85,32 @@ Outputs:
 - `ctx_now (B, P, 256)` — per-planet contextual embedding at the current step (slice `[:, -1]` from `(B, T, P, d)`)
 - `glob (B, 256)` — snapshot CLS readout (reserved for future snapshot-level heads)
 
-### L3 — `DualRoleAttention` (`aggregator/dual_role_attention.py`)
+### Post-L2 Boundary — World Perception Is Done
+
+Treat `ctx_now` and `glob` as the completed world model for the current turn:
+which objects exist, where they are, who owns them, what pressure is inbound,
+what frontier shape the board has, and what the global balance looks like.
+The model should not spend L3/L4 capacity rediscovering perception. Above L2,
+the job is to answer learner-relative questions:
+
+- **PlayerContextLearner**: summarize each player and the learner's position.
+  Inputs: `ctx_now`, `glob`, owner-slot masks, production/ship scalars. Outputs
+  `player_ctx (B, S, d)` and `learner_ctx (B, d)`. It should learn "what is my
+  economy, threat, expansion room, and opponent pressure?" rather than "where
+  are planets?"
+- **StrategyLearner**: convert `glob + learner_ctx + player_ctx` into a small
+  strategic latent (`strategy_ctx` or K strategy tokens): expand, defend,
+  attack, reinforce, evacuate, race, stall. This should be supervised with
+  cheap auxiliary labels where possible and later tuned by PPO.
+- **ActionLearner**: condition source/target decisions on
+  `ctx_now + learner_ctx + strategy_ctx` and produce action distributions. The
+  current `DualRoleAttention` → `JointRoleAttention` → `PairHead` path is this
+  action learner in compact form.
+
+This boundary matters for PPO: freeze L0-L2 first to preserve world perception;
+adapt the post-L2 learner stack before touching perception.
+
+### Current ActionLearner L3 — `DualRoleAttention` (`aggregator/dual_role_attention.py`)
 
 Two parallel cross-attention branches with **additive role embeddings**:
 
@@ -83,7 +123,7 @@ target_aware = LayerNorm(target_tok + MHA(Q=target_tok, K=V=source_tok))
 
 Each branch is a single `MultiheadAttention` block with explicit residual + LayerNorm. 528k params total. The role embeddings disambiguate the same per-planet token in source vs target use.
 
-### L4 — `JointRoleAttention` (`aggregator/joint_role_attention.py`)
+### Current ActionLearner L4 — `JointRoleAttention` (`aggregator/joint_role_attention.py`)
 
 Concatenates the two role-aware streams into a `(B, 2P, d)` sequence and runs a 1-layer Pre-LN `TransformerEncoder` so source-mode and target-mode slots attend to each other globally:
 
@@ -97,7 +137,7 @@ source_joint = out[:, :P]    target_joint = out[:, P:]
 
 528k params.
 
-### PairHead (`aggregator/pair_head.py`)
+### Current ActionLearner Head — `PairHead` (`aggregator/pair_head.py`)
 
 Per-`(source, target)` compatibility scorer + ship-size regressor. Projects role and context tokens to `d_pair=d_model=256` (no down-projection by default), broadcasts to `(B, P, P, 6·d_pair=1536)`, runs a 2-Linear MLP trunk → `h`, then **L1-conditioned FiLM** → 2 heads:
 
@@ -173,11 +213,11 @@ agents/transformer_v2/
 │   ├── fleet_encoder.py        # 3-Linear MLP
 │   └── entity_encoder.py       # PlanetEntityEncoder (L1) + QueryConditionedPool (legacy)
 │
-├── aggregator/            # L2 / L3 / L4 / head modules
-│   ├── cross_entity.py         # CrossEntityAttention (L2)
-│   ├── dual_role_attention.py  # DualRoleAttention (L3)
-│   ├── joint_role_attention.py # JointRoleAttention (L4)
-│   └── pair_head.py            # PairHead (output)
+├── aggregator/            # L2 world perception + post-L2 decision modules
+│   ├── cross_entity.py         # CrossEntityAttention (L2, end of perception)
+│   ├── dual_role_attention.py  # current ActionLearner role split (L3)
+│   ├── joint_role_attention.py # current ActionLearner role mixer (L4)
+│   └── pair_head.py            # current ActionLearner pair output
 │
 └── pretrain/              # training scripts (each is a self-contained CLI)
     ├── planet_encoder.py       # L0 planet specialist pretrain
@@ -269,7 +309,8 @@ pretrain/entity_encoder.py
               │
               ▼ episode-level 80/10/10 split (train_eps disjoint from val/test eps)
               ▼
-              train(): L0 frozen forward → entity_self → L1 → L2 → L3 → L4 → PairHead
+              train(): L0 frozen forward → entity_self → L1 → L2
+                       → post-L2 ActionLearner (current L3 → L4 → PairHead)
                        → compute_pair_loss → backward → AdamW step
 ```
 
@@ -309,10 +350,12 @@ Default `--pair-cache-path` already points at the OO T=6 cache, so no flag overr
 |---|---|
 | L0 specialists (Planet / Fleet / Comet) | trained, ckpts under `data/runs/{planet,fleet,comet}/specialist_*_d256_*` |
 | L1 PlanetEntityEncoder | cross-attn rewrite (replaced the dense owner-slot pool); smoke-tested |
-| L2 CrossEntityAttention | 2-layer Pre-LN encoder; T=6 multi-step verified |
-| L3 DualRoleAttention | 2-branch parallel cross-attn; gradient flow verified |
-| L4 JointRoleAttention | 1-layer concat+self-attn+split; smoke-tested |
-| PairHead | wired, smoke-tested; first full training run pending |
+| L2 CrossEntityAttention | 2-layer Pre-LN encoder; T=6 multi-step verified; end of world perception |
+| PlayerContextLearner | planned post-L2 module: player/learner summaries |
+| StrategyLearner | planned post-L2 module: doctrine/risk/phase latent |
+| Current ActionLearner L3 DualRoleAttention | 2-branch parallel cross-attn; gradient flow verified |
+| Current ActionLearner L4 JointRoleAttention | 1-layer concat+self-attn+split; smoke-tested |
+| Current ActionLearner PairHead | wired, smoke-tested; first full training run pending |
 | Orbital Occle pair cache | built (18,582 acted snapshots, 100% comet coverage, 40% multi-positive) |
 | Single-player generalization | OO done; the same pipeline can rebuild for any player in `data/replays/<name>/` by editing the cache build script's player constant |
 
@@ -337,9 +380,13 @@ docs/PPO_TWO_CPU_PROTOCOL.md
 ```
 
 Key constraint from that protocol: keep rollouts synchronous and strictly
-on-policy at first, use `plan_launch` as the environment projection gate, and
-track launch-miss matrices during eval so PPO does not learn unsafe semantic
-actions that the launcher silently drops.
+on-policy at first, use the `source_multi_target_v1` contract (fixed-logit
+source NOOP, one acting source, Bernoulli target bits from that source's logits,
+fixed-sigma fraction raws), use `plan_launch` as the environment projection
+gate, and track launch-miss matrices during eval so PPO does not learn unsafe
+semantic actions that the launcher silently drops. The self-play pool must
+contain only frozen promoted checkpoints plus `transformer_v2_baseline`; the
+current learner checkpoint is never its own rollout opponent.
 
 ## Memory & runtime notes
 

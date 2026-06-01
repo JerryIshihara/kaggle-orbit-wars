@@ -9,16 +9,19 @@ ends up contextualized by the global game state.
 See ``README.md`` for design + label rationale.
 """
 
-from .cross_entity import CrossEntityAttention
+from .cross_entity import CrossEntityAttention, TemporalCrossEntityAttention
 from .dual_role_attention import DualRoleAttention
 from .joint_role_attention import JointRoleAttention
 from .pair_head import PAIR_TYPE_EMBED_DIM, PAIR_TYPE_NUM_CLASSES, PairHead
+from .player_consolidator import PlayerConsolidator
 
 __all__ = [
     "CrossEntityAttention",
+    "TemporalCrossEntityAttention",
     "DualRoleAttention",
     "JointRoleAttention",
     "PAIR_TYPE_EMBED_DIM",
     "PAIR_TYPE_NUM_CLASSES",
     "PairHead",
+    "PlayerConsolidator",
 ]

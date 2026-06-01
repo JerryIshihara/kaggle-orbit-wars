@@ -96,10 +96,16 @@ def action_logprob(
     frac_raw: torch.Tensor,            # (B, P) float
     *,
     noop_logit_bias: float = 0.0,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Recompute the action's logprob under the CURRENT policy.
 
     Matches :func:`sample_source_multi_target` exactly. Used for the PPO ratio.
+
+    Returns ``(logp, n_terms)`` where ``logp`` is the summed action logprob and
+    ``n_terms`` is the per-sample count of summed logprob components (1 source +
+    valid target Bernoulli cells + selected-target frac terms). ``n_terms`` lets
+    the caller normalize the KL to a PER-COMPONENT scale — the raw KL is a sum
+    over ~30 sub-actions, so a scalar ``target_kl`` is otherwise ~30× too tight.
     """
     if pair_logits.dim() != 3:
         raise ValueError("expected pair_logits (B, P, P)")
@@ -127,6 +133,7 @@ def action_logprob(
     acted = source_id_plus > 0                                        # (B,)
     logp_targets = torch.zeros(B, device=device)
     logp_frac = torch.zeros(B, device=device)
+    n_terms = torch.ones(B, device=device)   # summed-logp component count (source=1)
 
     if acted.any():
         # Gather the chosen source's row for each acted sample.
@@ -170,7 +177,13 @@ def action_logprob(
         logp_f = per_target_frac_logp.sum(dim=1)                      # (B,)
         logp_frac = torch.where(acted, logp_f, logp_frac)
 
-    return logp_source + logp_targets + logp_frac
+        # Per-sample component count: valid target Bernoulli cells + selected
+        # frac terms (the source's 1 is already in n_terms). Used to normalize
+        # the PPO KL to a per-component scale.
+        acted_n = row_mask.float().sum(dim=1) + sel.float().sum(dim=1)  # (B,)
+        n_terms = n_terms + torch.where(acted, acted_n, torch.zeros_like(acted_n))
+
+    return logp_source + logp_targets + logp_frac, n_terms
 
 
 # --------------------------------------------------------------------------- #
@@ -342,7 +355,7 @@ def ppo_minibatch_loss(
     out = policy(**mb.feats)
     sigma = out["sigma"]
 
-    new_logp = action_logprob(
+    new_logp, n_terms = action_logprob(
         pair_logits=out["pair_logits"],
         frac_loc=out["frac_loc"],
         sigma=sigma,
@@ -387,7 +400,10 @@ def ppo_minibatch_loss(
     )
 
     with torch.no_grad():
-        approx_kl = (mb.old_logp - new_logp).mean().item()
+        # PER-COMPONENT KL: divide the summed-over-sub-actions logp diff by the
+        # action's component count so target_kl is a sensible per-decision scale
+        # (raw KL summed over ~30 targets made target_kl=0.01 fire after 1 epoch).
+        approx_kl = ((mb.old_logp - new_logp) / n_terms.clamp_min(1.0)).mean().item()
         clip_frac = (
             ((ratio - 1.0).abs() > clip).float().mean().item()
         )

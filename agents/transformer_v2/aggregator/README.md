@@ -22,6 +22,93 @@ planet feats ► PlanetEncoder ► planet tokens  ──┘     │
                                        global_token      (B, d)
 ```
 
+## Boundary: Perception Ends Here
+
+`CrossEntityAttention` is the last world-perception layer. Its job is to
+produce a coherent, learner-relative world state:
+
+- `contextual_tokens (B, P, d)` answer "what is each planet/comet in the
+  context of the whole board?"
+- `global_token (B, d)` answers "what does this snapshot look like overall?"
+
+Do not push action-role, player-intent, or doctrine learning back into this
+layer unless diagnostics show perception itself is wrong. Above this boundary,
+the architecture should split into decision learners:
+
+```text
+CrossEntityAttention
+  -> ctx_now, glob
+        |
+        ├─ PlayerContextLearner
+        |    player_ctx (B, S, d), learner_ctx (B, d)
+        |
+        ├─ StrategyLearner
+        |    strategy_ctx (B, d) or K strategy tokens
+        |
+        └─ ActionLearner
+             source/target role tokens + PairHead/PPO heads
+```
+
+The current code uses `DualRoleAttention`, `JointRoleAttention`, and
+`PairHead` as a compact `ActionLearner`. The planned refactor should insert
+explicit `PlayerContextLearner` and `StrategyLearner` modules between L2 and
+the action learner rather than adding more generic self-attention to L2.
+
+### PlayerContextLearner
+
+Purpose: summarize the learner and opponents after perception is complete.
+
+Inputs:
+- `ctx_now`, `glob`, `planet_mask`
+- owner-slot masks derived from learner-relative ownership features
+- cheap scalar totals: ships, production, planet count, frontier pressure
+
+Outputs:
+- `player_ctx (B, S, d)` for learner + enemy slots
+- `learner_ctx (B, d)` as the policy's point-of-view token
+
+Good auxiliary labels:
+- current and future ship/production/planet totals by player slot
+- learner advantage margin at horizons 10/25/50
+- per-player aggression/launch-rate summaries from recent turns when history
+  is available
+
+### StrategyLearner
+
+Purpose: choose the strategic mode before selecting concrete launches.
+
+Inputs:
+- `glob`
+- `learner_ctx`
+- `player_ctx`
+- optional pooled frontier/opportunity tokens from `ctx_now`
+
+Outputs:
+- `strategy_ctx (B, d)` or a small set of strategy tokens
+- optional interpretable strategy logits: expand, defend, attack, reinforce,
+  evacuate, race/endgame
+
+Good auxiliary labels:
+- phase bucket from turn/remaining turns
+- expert action archetype from replay launches
+- future delta labels: gained planet, lost planet, defended threatened planet,
+  net ship/production swing
+
+### ActionLearner
+
+Purpose: translate world + player + strategy context into executable semantic
+actions.
+
+The current action learner is:
+
+```text
+ctx_now -> DualRoleAttention -> JointRoleAttention -> PairHead
+```
+
+The refactored action learner should condition that path on
+`learner_ctx + strategy_ctx`, preferably by FiLM or cross-attention, instead of
+asking PairHead to infer strategic mode only from pair tokens.
+
 ## Architecture
 
 Vanilla `nn.TransformerEncoder` over `(B, P, d_model)` entity tokens,
@@ -189,10 +276,9 @@ reasoning even though the per-step labels are dense.
 ### Tier 4 — Pairwise (skip in this layer)
 
 `(src, tgt)` capture probability is the natural cross-entity label,
-but P² pairs are sparse and big. Handled instead by the
-action-conditioned `LaunchOutcomeDecoder` (in
-`encoder/entity_encoder.py`), which queries the cross-attention
-output per pair as needed.
+but P² pairs are sparse and big. Handle it in the post-L2 ActionLearner
+(`DualRoleAttention` / `JointRoleAttention` / `PairHead` today), which
+queries the cross-attention output per pair as needed.
 
 ## Implementation order
 
@@ -220,10 +306,10 @@ output per pair as needed.
   planned as the first follow-up after the single-snapshot MVP
   trains cleanly. Step embedding + cold-start padding+mask, no
   architectural branching.
-- **Per-player CLS tokens.** A single CLS summarizes the snapshot
-  but mixes perspectives. Could swap for `K` learned tokens (one
-  per player slot) so each player's value/decision heads get a
-  dedicated summary. Helps multi-seat play.
+- **PlayerContextLearner.** A single CLS summarizes the snapshot but mixes
+  perspectives. The post-L2 `PlayerContextLearner` should replace the old
+  "per-player CLS" idea with explicit per-player summary tokens built from
+  owner-slot masks and `ctx_now`.
 - **Sparsity.** Most snapshots have ~30 real planets but we pad to
   64. With `P ≤ 64` the O(P²) attention is fine; if `P` grows we'd
   switch to flash-attention or local-windowed attention.

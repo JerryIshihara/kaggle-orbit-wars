@@ -1,18 +1,16 @@
 """History window offsets for transformer_v2.
 
 v1 used a dense 3-step window (offsets [2, 1, 0]: t-2, t-1, t). v2
-widens this to a **9-step sparse window**:
+ships a **10-step uniform-spaced window** at 5-turn spacing:
 
-    slot:        0    1    2    3    4    5    6    7    8
-    offset:      26   21   16   11   8    5    2    1    0
-    meaning:    t-26 t-21 t-16 t-11 t-8  t-5  t-2  t-1   t
+    slot:        0    1    2    3    4    5    6    7    8    9
+    offset:      45   40   35   30   25   20   15   10   5    0
+    meaning:    t-45 t-40 t-35 t-30 t-25 t-20 t-15 t-10 t-5   t
 
-The dense recent triplet (t, t-1, t-2) captures short-horizon dynamics
-(acceleration, direction). The medium anchors at t-5, t-8, t-11 carry
-fleet-launch and territory-flip context before arrival. The long
-anchors at t-16, t-21, t-26 give the model a strategic-scale view —
-roughly one full inbound-fleet cycle for the typical map — so the
-ranker can condition on momentum across the whole engagement window.
+A typical Orbit Wars episode runs ~180 turns; this window covers ~25%
+of an episode and ~50 turns of lookback — wider than the earlier sparse
+9-step window (max lookback t-26) and easier for the per-step positional
+embedding to interpret linearly because the spacing is uniform.
 
 Order is **oldest → newest** so the model's per-step positional
 embedding indexing (``step_embed[-T:]`` in
@@ -28,7 +26,7 @@ it directly in ``__getitem__``; the model's ``n_steps`` is sized to
 from __future__ import annotations
 
 
-HISTORY_OFFSETS: tuple[int, ...] = (26, 21, 16, 11, 8, 5, 2, 1, 0)
+HISTORY_OFFSETS: tuple[int, ...] = (45, 40, 35, 30, 25, 20, 15, 10, 5, 0)
 
 # Derived for convenience — keep ``n_history`` semantics (= window
 # length) consistent with v1 call sites that take an integer count.

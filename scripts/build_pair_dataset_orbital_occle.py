@@ -514,7 +514,15 @@ def load_cache(path: Path) -> dict:
     an ``OOPairDataset``-like in-memory holder however it likes
     (typically ``CachedPairDataset(payload)`` wrapper).
     """
-    return torch.load(path, weights_only=False)
+    try:
+        return torch.load(path, weights_only=False, mmap=True)
+    except TypeError:
+        # Older PyTorch builds do not expose mmap.
+        return torch.load(path, weights_only=False)
+    except RuntimeError as exc:
+        if "mmap" not in str(exc).lower():
+            raise
+        return torch.load(path, weights_only=False)
 
 
 class CachedPairDataset(torch.utils.data.Dataset):

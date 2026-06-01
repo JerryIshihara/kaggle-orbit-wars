@@ -6,6 +6,12 @@ all numbers are derived from (a) the supervised training timing
 documented in `agents/transformer_v2/README.md`, (b) the model parameter
 counts, and (c) Apple-Silicon-CPU peak/sustained throughput.
 
+> **Critic correction:** older estimates below mention a 3-Linear
+> `value_head` on actor L2 `glob`. Current PPO uses an L1-branch
+> `CrossEntityCriticModel`; its `ValueDecoder` replaces `value_head` as the
+> trainable critic head. Actor rollout cost is unchanged; value update cost is
+> slightly higher when the separate critic is enabled.
+
 The "epoch" in the user-facing ask maps to **one PPO iteration** = one
 sync of `rollout → GAE → train → eval → archive`. The inner PPO `epochs`
 hyperparameter (default 3) is the number of times the train phase sweeps

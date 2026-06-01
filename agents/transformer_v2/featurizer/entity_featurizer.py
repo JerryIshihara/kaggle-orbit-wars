@@ -379,6 +379,23 @@ def _cross_entity_label_columns() -> list[str]:
         cols.append(f"score_advantage_t_plus_{h}_log")
         cols.append(f"is_ahead_t_plus_{h}")
         cols.append(f"valid_global_t_plus_{h}")
+    # Tier-3c per-player FINAL standing (learner-relative slots, 0 = best) +
+    # a validity mask (1 for the real player slots, 0 for padding). Used by
+    # the critic/value pretrain's ListMLE ranking loss. Broadcast per snapshot.
+    for s in range(NUM_OWNER_SLOTS):
+        cols.append(f"final_rank_{s}")
+    for s in range(NUM_OWNER_SLOTS):
+        cols.append(f"player_valid_{s}")
+    # Tier-3d per-turn temporal momentum (anti-shortcut anchors for the
+    # prior/posterior critic). Vary with t (NOT broadcast).
+    for s in range(NUM_OWNER_SLOTS):
+        cols.append(f"dships_back_{s}")
+    cols.append("score_adv_slope_back")
+    for s in range(NUM_OWNER_SLOTS):
+        cols.append(f"dships_fwd_{s}")
+    for s in range(NUM_OWNER_SLOTS):
+        cols.append(f"survives_fwd_{s}")
+    cols.append("valid_fwd")
     # Tier-3b neutral game-level (player-perspective-independent)
     cols.append("total_ships_in_play_log")
     cols.append("ship_distribution_entropy")
@@ -549,6 +566,130 @@ def _score_advantage_from_totals(
         default=0,
     )
     return signed_log1p(learner_total - others_max) / SHIPS_LOG_MAX
+
+
+def _final_rank_from_steps(
+    steps: list,
+    *,
+    learner_slot: int,
+    num_players: int,
+) -> tuple[list[int], list[int]]:
+    """Per-player FINAL standing, learner-relative (slot 0 = learner), 0 = best.
+
+    Ranks players by elimination order then final ship count:
+      * survivors (alive at the final step) outrank all eliminated players;
+      * survivors are ordered by final ship count (more = better);
+      * eliminated players are ordered by elimination step (later = better);
+      * exact ties break deterministically by seat id (lower seat = better).
+
+    ``elim_step[p]`` is the last step at which player ``p`` had > 0 total
+    ships (robust to recapture oscillation); survivors get the final step.
+
+    Returns ``(final_rank, player_valid)``, each length ``NUM_OWNER_SLOTS``:
+    ``final_rank`` in learner-relative slot order, ``player_valid`` = 1 for
+    the ``num_players`` real slots (padding slots irrelevant — masked in the
+    ranking loss).
+    """
+    final_rank = [NUM_OWNER_SLOTS - 1] * NUM_OWNER_SLOTS
+    player_valid = [1 if rel < num_players else 0 for rel in range(NUM_OWNER_SLOTS)]
+
+    last = len(steps) - 1
+    while last >= 0 and not steps[last]:
+        last -= 1
+    if last < 0:
+        return final_rank, player_valid
+
+    elim_step = [0] * num_players
+    final_ships = [0] * num_players
+    for t in range(last + 1):
+        obs = _step_obs(steps, t, learner_slot=learner_slot)
+        if not obs:
+            continue
+        totals = _snapshot_totals(obs, num_players=num_players)
+        for p in range(num_players):
+            if totals[p] > 0:
+                elim_step[p] = t
+        if t == last:
+            final_ships = list(totals)
+
+    # Sort seats best -> worst. ``-p`` makes lower seat win exact ties.
+    order = sorted(
+        range(num_players),
+        key=lambda p: (elim_step[p], final_ships[p], -p),
+        reverse=True,
+    )
+    for rank, seat in enumerate(order):
+        rel = (seat - learner_slot) % num_players
+        final_rank[rel] = rank
+    return final_rank, player_valid
+
+
+# Temporal-delta horizons for the critic's anti-shortcut anchors. Backward
+# can be longer (no leakage); forward is shorter to limit outcome leakage in
+# 2-player games (where t+K often crosses the game end).
+DELTA_K_BACK: int = 20
+DELTA_K_FWD: int = 10
+
+
+def _temporal_deltas_from_steps(
+    steps: list,
+    t: int,
+    *,
+    learner_slot: int,
+    num_players: int,
+) -> dict[str, float]:
+    """Per-turn momentum labels that are UNcomputable from S_t alone.
+
+    Backward anchors (only the prior window S_{t-K..t} can predict them):
+      ``dships_back_{s}``      per-player signed-log Δ ships over [t-K_back, t]
+      ``score_adv_slope_back`` learner score-advantage slope over that window
+
+    Forward anchors (only the posterior window S_{t..t+K} can predict them):
+      ``dships_fwd_{s}``       per-player signed-log Δ ships over [t, t+K_fwd]
+      ``survives_fwd_{s}``     per-player: alive at t+K_fwd (1/0)
+      ``valid_fwd``            1 if t+K_fwd is within the episode
+
+    All per-player values are learner-relative (slot 0 = learner). These break
+    the prior/posterior "look only at the shared center frame S_t" shortcut:
+    a model that ignores its window fails these heads.
+    """
+    obs_t = _step_obs(steps, t, learner_slot=learner_slot)
+    totals_t = _snapshot_totals(obs_t, num_players=num_players)
+    tb = max(0, t - DELTA_K_BACK)
+    totals_b = _snapshot_totals(
+        _step_obs(steps, tb, learner_slot=learner_slot), num_players=num_players,
+    )
+    obs_f = _step_obs(steps, t + DELTA_K_FWD, learner_slot=learner_slot)
+    valid_fwd = 1.0 if obs_f else 0.0
+    totals_f = (
+        _snapshot_totals(obs_f, num_players=num_players) if obs_f else list(totals_t)
+    )
+
+    def _score_adv(totals: list[int]) -> float:
+        lt = totals[learner_slot] if 0 <= learner_slot < num_players else 0
+        om = max((totals[i] for i in range(num_players) if i != learner_slot), default=0)
+        return signed_log1p(lt - om) / SHIPS_LOG_MAX
+
+    out: dict[str, float] = {
+        "score_adv_slope_back": float(
+            (_score_adv(totals_t) - _score_adv(totals_b)) / max(1, t - tb)
+        ),
+        "valid_fwd": float(valid_fwd),
+    }
+    for s in range(NUM_OWNER_SLOTS):
+        out[f"dships_back_{s}"] = 0.0
+        out[f"dships_fwd_{s}"] = 0.0
+        out[f"survives_fwd_{s}"] = 0.0
+    for seat in range(num_players):
+        rel = (seat - learner_slot) % num_players
+        out[f"dships_back_{rel}"] = float(
+            signed_log1p(totals_t[seat] - totals_b[seat]) / SHIPS_LOG_MAX
+        )
+        out[f"dships_fwd_{rel}"] = float(
+            signed_log1p(totals_f[seat] - totals_t[seat]) / SHIPS_LOG_MAX
+        )
+        out[f"survives_fwd_{rel}"] = float(valid_fwd > 0.0 and totals_f[seat] > 0)
+    return out
 
 
 def _compute_future_global_labels(
@@ -756,6 +897,12 @@ def _compute_episode_summary(
     Returns a dict with both keys; same value for every snapshot in
     the episode (broadcast at row-write time).
     """
+    final_rank, player_valid = _final_rank_from_steps(
+        steps, learner_slot=learner_slot, num_players=num_players,
+    )
+    rank_cols = {f"final_rank_{s}": int(final_rank[s]) for s in range(NUM_OWNER_SLOTS)}
+    valid_cols = {f"player_valid_{s}": int(player_valid[s]) for s in range(NUM_OWNER_SLOTS)}
+
     last = len(steps) - 1
     while last >= 0 and not steps[last]:
         last -= 1
@@ -763,12 +910,14 @@ def _compute_episode_summary(
         return {
             "winner_seat": NUM_OWNER_SLOTS,
             "score_advantage_at_end_log": 0.0,
+            **rank_cols, **valid_cols,
         }
     obs = _step_obs(steps, last, learner_slot=learner_slot)
     if not obs:
         return {
             "winner_seat": NUM_OWNER_SLOTS,
             "score_advantage_at_end_log": 0.0,
+            **rank_cols, **valid_cols,
         }
     totals = _snapshot_totals(obs, num_players=num_players)
     winner_class = _winner_class_from_totals(
@@ -785,6 +934,7 @@ def _compute_episode_summary(
     return {
         "winner_seat": int(winner_class),
         "score_advantage_at_end_log": float(advantage),
+        **rank_cols, **valid_cols,
     }
 
 
@@ -1092,6 +1242,9 @@ def save_episode_cross_entity_csv(
                 learner_slot=learner_slot,
                 num_players=num_players,
             )
+            temporal_deltas = _temporal_deltas_from_steps(
+                steps, t, learner_slot=learner_slot, num_players=num_players,
+            )
             neutral_global = _compute_neutral_global_labels(
                 obs, num_players=num_players, turn=t,
             )
@@ -1127,6 +1280,13 @@ def save_episode_cross_entity_csv(
                             f"valid_global_t_plus_{h}",
                         )
                     ],
+                    *[episode_summary[f"final_rank_{s}"] for s in range(NUM_OWNER_SLOTS)],
+                    *[episode_summary[f"player_valid_{s}"] for s in range(NUM_OWNER_SLOTS)],
+                    *[temporal_deltas[f"dships_back_{s}"] for s in range(NUM_OWNER_SLOTS)],
+                    temporal_deltas["score_adv_slope_back"],
+                    *[temporal_deltas[f"dships_fwd_{s}"] for s in range(NUM_OWNER_SLOTS)],
+                    *[temporal_deltas[f"survives_fwd_{s}"] for s in range(NUM_OWNER_SLOTS)],
+                    temporal_deltas["valid_fwd"],
                     neutral_global["total_ships_in_play_log"],
                     neutral_global["ship_distribution_entropy"],
                     neutral_global["n_neutral_planets"],

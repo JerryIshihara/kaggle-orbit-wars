@@ -32,7 +32,7 @@ trap 'rm -rf "$STAGE"' EXIT
 
 # ---- code.tgz ----
 # Layout inside the tarball (extracted at /content/orbit-wars/):
-#   agents/{__init__.py, registry.py, physics_utils.py, transformer_v2/}
+#   agents/{__init__.py, registry.py, physics_utils.py, transformer_v2/, heuristic/}
 #   scripts/{__init__.py, build_pair_dataset_orbital_occle.py}
 echo "[pack] building code.tgz ..."
 STAGE_CODE="$STAGE/code"
@@ -57,6 +57,24 @@ PYEOF
 
 cp "$REPO_ROOT/agents/registry.py"      "$STAGE_CODE/agents/registry.py"
 cp "$REPO_ROOT/agents/physics_utils.py" "$STAGE_CODE/agents/physics_utils.py"
+
+# PPO rollout imports physical_v4 for phase/surplus helpers, and optional
+# heuristic-opponent smoke runs use random_v1 through agents.Agent(id=...).
+# Ship only those two heuristic modules, with a lightweight package init that
+# registers them without importing the whole heuristic roster.
+mkdir -p "$STAGE_CODE/agents/heuristic"
+cat > "$STAGE_CODE/agents/heuristic/__init__.py" <<'PYEOF'
+"""Minimal heuristic package for Colab PPO rollout."""
+
+from . import physical_v4, random_v1  # noqa: F401
+PYEOF
+for heuristic_name in physical_v4 random_v1; do
+  mkdir -p "$STAGE_CODE/agents/heuristic/$heuristic_name"
+  cp "$REPO_ROOT/agents/heuristic/$heuristic_name/__init__.py" \
+     "$STAGE_CODE/agents/heuristic/$heuristic_name/__init__.py"
+  cp "$REPO_ROOT/agents/heuristic/$heuristic_name/agent.py" \
+     "$STAGE_CODE/agents/heuristic/$heuristic_name/agent.py"
+done
 
 # transformer_v2 tree, minus __pycache__ + .pyc.
 (cd "$REPO_ROOT" && tar cf - \

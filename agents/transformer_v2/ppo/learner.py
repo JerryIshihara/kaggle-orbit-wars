@@ -35,14 +35,20 @@ class PPOConfig:
 
 def build_optimizer(policy: nn.Module, cfg: PPOConfig) -> torch.optim.Optimizer:
     """Build a 2-group AdamW: heads at lr_heads, trunk (if unfrozen) at lr_trunk."""
+    # ``value_head`` is the debug glob fallback; ``pair_compare`` is the
+    # post-L2 player_state critic. Access both defensively and skip whichever
+    # is absent or frozen.
     head_modules = [
-        policy.value_head,
+        getattr(policy, "value_head", None),
+        getattr(policy, "pair_compare", None),
         policy.entity_model.pair_head.pair_head,
         policy.entity_model.pair_head.pair_frac_head,
     ]
     head_param_ids = set()
     head_params: list[torch.nn.Parameter] = []
     for mod in head_modules:
+        if mod is None:
+            continue
         for p in mod.parameters():
             if p.requires_grad and id(p) not in head_param_ids:
                 head_param_ids.add(id(p))

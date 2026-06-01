@@ -1,9 +1,10 @@
 """Joint source/target self-attention over the concatenated role tokens.
 
-Sits one level above :class:`DualRoleAttention`. The dual-role layer
-gives each planet two role-conditioned views — ``source_aware`` and
-``target_aware`` — by attending across roles (sources query targets and
-vice versa). This layer concatenates both streams into one
+Sits one level above :class:`DualRoleAttention` in the current compact
+post-perception ActionLearner. The dual-role layer gives each planet two
+role-conditioned views — ``source_aware`` and ``target_aware`` — by attending
+across roles (sources query targets and vice versa). This layer concatenates
+both streams into one
 ``(B, 2P, d_model)`` sequence and runs a single Pre-LN
 ``TransformerEncoder`` over it, so every (slot, role) token attends to
 every other (slot, role):

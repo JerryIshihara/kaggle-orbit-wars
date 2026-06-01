@@ -16,13 +16,13 @@ Usage::
 
 What this validates:
 
-  * The full forward through PPOActorCritic (incl. value_head on glob).
+  * The full debug forward through PPOActorCritic (incl. legacy value_head on glob).
   * `sample_source_multi_target` produces well-typed Actions.
   * `project_to_env` emits valid env action triples that `plan_launch` accepts.
   * Episodes terminate; per-step rewards are computed from score deltas.
   * `compute_advantages` runs on real rollouts (not synthetic).
-  * `ppo_update_local` applies a gradient step on `value_head` + the two
-    PairHead output heads.
+  * `ppo_update_local` applies a gradient step on debug `value_head` + the
+    two PairHead output heads.
 
 Out of scope for the smoke: BC anchor (no pair cache load), distributed
 training, eval gate, archive.
@@ -50,6 +50,8 @@ from agents.transformer_v2.featurizer.fleet_featurizer import FleetTracker
 from agents.transformer_v2.featurizer.inference import featurize_observation
 from agents.transformer_v2.pretrain.entity_encoder import (
     EntityPretrainModel,
+    _PLANET_OWNER_NEUTRAL_IDX,
+    _PLANET_OWNER_START_IDX,
     _build_entity_self_tokens,
     _load_encoders,
     build_pair_type_ids,
@@ -59,6 +61,7 @@ from agents.transformer_v2.runner import (
     DEFAULT_FLEET_RUN_DIR,
     DEFAULT_PLANET_RUN_DIR,
 )
+from agents.transformer_v2.history import HISTORY_OFFSETS
 
 from .actor_critic import PPOActorCritic
 from .gae import Episode, compute_advantages
@@ -116,6 +119,46 @@ class EpisodeBuffer:
 # --------------------------------------------------------------------------- #
 # Loader                                                                       #
 # --------------------------------------------------------------------------- #
+def _resolve_l0_run_dir(
+    *,
+    label: str,
+    ckpt_name: str,
+    requested: Path | None,
+    default_dir: Path,
+) -> Path:
+    """Resolve an L0 specialist run dir across local repo and Colab layouts."""
+    if requested is not None:
+        p = Path(requested)
+        if (p / ckpt_name).exists():
+            return p
+        raise FileNotFoundError(
+            f"{label} encoder checkpoint not found at {p / ckpt_name}. "
+            f"Pass the directory containing {ckpt_name}, not the file path."
+        )
+
+    repo_root = Path(__file__).resolve().parents[3]
+    candidates = [
+        repo_root / "ckpts" / label,
+        Path("/content/orbit-wars") / "ckpts" / label,
+        default_dir,
+    ]
+    seen: set[Path] = set()
+    checked: list[Path] = []
+    for p in candidates:
+        p = p.resolve() if p.exists() else p
+        if p in seen:
+            continue
+        seen.add(p)
+        checked.append(p / ckpt_name)
+        if (p / ckpt_name).exists():
+            return p
+
+    raise FileNotFoundError(
+        f"{label} encoder checkpoint {ckpt_name} was not found. "
+        "Checked:\n  - " + "\n  - ".join(str(p) for p in checked)
+    )
+
+
 def load_supervised(
     ckpt_path: Path,
     device: str,
@@ -136,12 +179,58 @@ def load_supervised(
     conditioner_n_layers = int(cfg.get("conditioner_n_layers", 1))
     head_n_layers = int(cfg.get("head_n_layers", 1))
 
+    fleet_run_dir = _resolve_l0_run_dir(
+        label="fleet",
+        ckpt_name="fleet_encoder_best.pt",
+        requested=fleet_run_dir,
+        default_dir=DEFAULT_FLEET_RUN_DIR,
+    )
+    planet_run_dir = _resolve_l0_run_dir(
+        label="planet",
+        ckpt_name="planet_encoder_best.pt",
+        requested=planet_run_dir,
+        default_dir=DEFAULT_PLANET_RUN_DIR,
+    )
+    comet_run_dir = _resolve_l0_run_dir(
+        label="comet",
+        ckpt_name="comet_past_best.pt",
+        requested=comet_run_dir,
+        default_dir=DEFAULT_COMET_RUN_DIR,
+    )
+
     fleet_enc, planet_enc, comet_enc = _load_encoders(
-        fleet_run_dir or DEFAULT_FLEET_RUN_DIR,
-        planet_run_dir or DEFAULT_PLANET_RUN_DIR,
-        comet_run_dir or DEFAULT_COMET_RUN_DIR,
+        fleet_run_dir,
+        planet_run_dir,
+        comet_run_dir,
         device=device,
     )
+
+    cfg = dict(cfg)
+    cfg["_l0_run_dirs"] = {
+        "fleet": str(fleet_run_dir),
+        "planet": str(planet_run_dir),
+        "comet": str(comet_run_dir),
+    }
+
+    # Architecture flags — RESPECT the ckpt so a no-consolidator / skip-L3L4
+    # actor does not get fresh RANDOM modules under strict=False. Mirror
+    # TransformerAgent.load (runner.py:275-286): prefer saved config, else
+    # detect from state_dict keys. Without this, a no-consolidator actor builds
+    # a random PlayerConsolidator, forward_with_context returns garbage
+    # player_state, and the PPO critic silently trains PairCompareHead on it
+    # instead of falling back to the glob value_head for debug runs.
+    model_state = ckpt["model"]
+    _keys = list(model_state.keys())
+    if "skip_l34" in cfg:
+        skip_l34 = bool(cfg["skip_l34"])
+    else:
+        skip_l34 = not any(
+            k.startswith("dual_role.") or k.startswith("joint_role.") for k in _keys
+        )
+    if "with_consolidator" in cfg:
+        with_consolidator = bool(cfg["with_consolidator"])
+    else:
+        with_consolidator = any(k.startswith("consolidator.") for k in _keys)
 
     model = EntityPretrainModel(
         d_model=d_model, n_steps=n_steps, d_pair=d_pair,
@@ -151,14 +240,217 @@ def load_supervised(
         dual_n_heads=dual_n_heads,
         conditioner_n_layers=conditioner_n_layers,
         head_n_layers=head_n_layers,
+        skip_l34=skip_l34,
+        with_consolidator=with_consolidator,
     )
-    model.load_state_dict(ckpt["model"], strict=False)
+    model.load_state_dict(model_state, strict=False)
     return model.to(device), fleet_enc, planet_enc, comet_enc, cfg
 
 
 # --------------------------------------------------------------------------- #
 # Rollout episode via env.run                                                 #
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# T=10 rollout history (per-env ring of featurized frames)                    #
+# --------------------------------------------------------------------------- #
+# Model-input fields stacked across the HISTORY_OFFSETS window (current frame
+# last). pair_mask / source_mask / the sampled action stay single-frame.
+_TEMPORAL_KEYS = (
+    "planet_features", "fleet_features",
+    "fleet_target_idx", "fleet_source_idx", "fleet_owner_slot",
+    "fleet_ships_log", "fleet_eta_norm", "fleet_mask",
+    "planet_mask", "is_comet", "pair_type_ids",
+)
+_ROUTING_KEYS = (
+    "fleet_target_idx", "fleet_source_idx", "fleet_owner_slot",
+    "fleet_ships_log", "fleet_eta_norm", "fleet_mask",
+)
+
+
+class _RolloutHistory:
+    """Per-env ring of single-frame featurized frames (no batch dim).
+
+    ``stack(step)`` returns each ``_TEMPORAL_KEYS`` field stacked along a new
+    leading T axis over the ``HISTORY_OFFSETS`` window (oldest..current); missing
+    early frames are zero-filled. The current frame is LAST, matching the
+    supervised cache + ``CrossEntityAttention.step_embed[-T:]`` (current = last
+    slot). ``window <= 1`` disables stacking (single-frame rollout).
+    """
+
+    def __init__(self, window: int):
+        self.window = int(window)
+        self.frames: dict[int, dict[str, torch.Tensor]] = {}
+
+    def push(self, step: int, frame: dict[str, torch.Tensor]) -> None:
+        self.frames[step] = frame
+        cutoff = step - (HISTORY_OFFSETS[0] + 5)
+        for s in [s for s in self.frames if s < cutoff]:
+            del self.frames[s]
+
+    def stack(self, step: int) -> dict[str, torch.Tensor]:
+        cur = self.frames[step]
+        out: dict[str, torch.Tensor] = {}
+        for k in _TEMPORAL_KEYS:
+            ref = cur[k]
+            seq = [self.frames.get(step - off) for off in HISTORY_OFFSETS]
+            out[k] = torch.stack(
+                [(f[k] if f is not None else torch.zeros_like(ref)) for f in seq],
+                dim=0,
+            )  # (T, ...)
+        return out
+
+
+def _frame_from_batch(batch, is_comet_cur, pair_type_cur) -> dict[str, torch.Tensor]:
+    """Single-frame (no batch dim) record of one turn's model-input fields."""
+    f = {k: batch[k][0].detach() for k in (
+        "planet_features", "fleet_features", "fleet_target_idx", "fleet_source_idx",
+        "fleet_owner_slot", "fleet_ships_log", "fleet_eta_norm", "fleet_mask",
+        "planet_mask",
+    )}
+    f["is_comet"] = is_comet_cur[0].detach()
+    f["pair_type_ids"] = pair_type_cur[0].detach()
+    return f
+
+
+def _forward_with_history(policy, planet_enc, fleet_enc, comet_enc, history, step, device):
+    """L0 + policy forward at the configured window. Returns ``(out, store)`` where
+    ``store`` holds the per-field tensors for a StepRecord — single-frame ``(P,...)``
+    when ``window <= 1``, the temporal stack ``(T,...)`` the learner replays when
+    ``window > 1``. Passes the learner-relative owner one-hot so the critic's
+    ``player_state`` matches the learner-side recompute (``_PPOWithL0``)."""
+    cur = history.frames[step]
+    store = {k: cur[k] for k in _TEMPORAL_KEYS} if history.window <= 1 else history.stack(step)
+    mdl = {k: store[k].unsqueeze(0).to(device) for k in _TEMPORAL_KEYS}  # add batch dim
+    comet_features = torch.zeros(
+        list(mdl["planet_features"].shape[:-1]) + [comet_enc.input_dim],
+        device=device, dtype=mdl["planet_features"].dtype,
+    )
+    comet_features[..., :18] = mdl["planet_features"][..., :18]
+    planet_tok = planet_enc(mdl["planet_features"])
+    comet_tok = comet_enc(comet_features)
+    fleet_tok = fleet_enc(mdl["fleet_features"])
+    entity_self = _build_entity_self_tokens(planet_tok, comet_tok, mdl["is_comet"])
+    routing = {k: mdl[k] for k in _ROUTING_KEYS}
+    owner_slice = mdl["planet_features"][
+        ..., _PLANET_OWNER_START_IDX:_PLANET_OWNER_NEUTRAL_IDX + 1
+    ]
+    out = policy(
+        entity_self, fleet_tok, routing, mdl["planet_mask"],
+        is_comet=mdl["is_comet"], pair_type_ids=mdl["pair_type_ids"],
+        planet_owner_oh=owner_slice,
+    )
+    return out, store
+
+
+def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
+                   store, learner_slot, num_players, noop_logit_bias):
+    """Legality masks -> sample -> project to env moves -> StepRecord. This is the
+    post-forward logic shared by the single-env closure (see agent_fn) and the
+    batched rollout (batched_rollout.py) so both produce IDENTICAL records.
+    ``store`` is the per-field tensors for the StepRecord (single-frame or the
+    T-window stack). Returns ``(env_moves, StepRecord)``."""
+    get = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
+    raw_planets = get("planets") or []
+    raw_fleets = get("fleets") or []
+    step = int(get("step") or 0)
+    _nb, defense_buffer, min_launch, _s, _fw, _et = PHASE_TABLE[phase_of(step)]
+    P = int(pair_logits.shape[0])
+    planet_owner_rel = torch.full((P,), 99, dtype=torch.long)
+    planet_surplus = torch.zeros(P, dtype=torch.float32)
+    planet_exists = torch.zeros(P, dtype=torch.bool)
+    slot_to_pid = [-1] * P
+    planets: list = []
+    fleets: list = []
+    if raw_planets:
+        from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
+        planets = [Planet(*p) for p in raw_planets]
+        fleets = [Fleet(*f) for f in raw_fleets]
+        enemy_fleets = [f for f in fleets if f.owner != learner_slot and f.owner >= 0]
+        for planet in planets:
+            pid = int(planet.id)
+            if pid in pid_to_idx:
+                idx = pid_to_idx[pid]
+                planet_exists[idx] = True
+                slot_to_pid[idx] = pid
+                planet_owner_rel[idx] = 0 if int(planet.owner) == learner_slot else 1
+                planet_surplus[idx] = float(compute_surplus(planet, enemy_fleets, defense_buffer))
+
+    pair_mask, source_mask = legality_masks(
+        planet_owner=planet_owner_rel, surplus=planet_surplus,
+        planet_exists=planet_exists, min_launch=int(min_launch),
+    )
+    action = sample_source_multi_target(
+        pair_logits, frac_loc, sigma_val, pair_mask=pair_mask,
+        source_mask=source_mask, noop_logit_bias=noop_logit_bias,
+    )
+
+    env_moves: list[list[float]] = []
+    n_invalid = 0
+    n_emitted = 0
+    invalid_reasons: list[str] = []
+    if action.source_id >= 0 and action.target_bits.sum().item() > 0:
+        src_idx = action.source_id
+        src_pid = slot_to_pid[src_idx]
+        src_planet = next((p for p in planets if int(p.id) == src_pid), None) if raw_planets else None
+        if src_planet is not None:
+            budget = max(0, int(planet_surplus[src_idx].item()))
+            selected = action.target_bits.nonzero(as_tuple=False).flatten().tolist()
+            raws = torch.stack([action.frac_raw[i] for i in selected])
+            weights = (raws / raws.sum().clamp_min(1e-8)).tolist()
+            raw_alloc = [w * budget for w in weights]
+            floored = [int(x) for x in raw_alloc]
+            remainder = budget - sum(floored)
+            frac_rem = sorted(
+                ((raw_alloc[i] - floored[i], i) for i in range(len(floored))), reverse=True,
+            )
+            for r, idx in frac_rem[:max(0, remainder)]:
+                floored[idx] += 1
+            for slot_i, sel_i in enumerate(selected):
+                ships = floored[slot_i]
+                if ships < int(min_launch):
+                    n_invalid += 1; invalid_reasons.append("min_launch"); continue
+                tgt_pid = slot_to_pid[sel_i]
+                if tgt_pid < 0:
+                    n_invalid += 1; invalid_reasons.append("pad_slot"); continue
+                tgt_planet = next((p for p in planets if int(p.id) == tgt_pid), None)
+                if tgt_planet is None:
+                    n_invalid += 1; invalid_reasons.append("no_planet"); continue
+                angle = math.atan2(tgt_planet.y - src_planet.y, tgt_planet.x - src_planet.x)
+                env_moves.append([int(src_pid), float(angle), int(ships)])
+                n_emitted += 1
+
+    score_my = sum(p.ships for p in planets if int(p.owner) == learner_slot) if raw_planets else 0
+    score_my += sum(f.ships for f in fleets if int(f.owner) == learner_slot) if raw_fleets else 0
+    score_enemy_max = 0
+    if raw_planets:
+        for seat in range(num_players):
+            if seat == learner_slot:
+                continue
+            s = sum(p.ships for p in planets if int(p.owner) == seat)
+            s += sum(f.ships for f in fleets if int(f.owner) == seat)
+            score_enemy_max = max(score_enemy_max, s)
+
+    record = StepRecord(
+        planet_features=store["planet_features"].detach().cpu(),
+        fleet_features=store["fleet_features"].detach().cpu(),
+        fleet_target_idx=store["fleet_target_idx"].detach().cpu(),
+        fleet_source_idx=store["fleet_source_idx"].detach().cpu(),
+        fleet_owner_slot=store["fleet_owner_slot"].detach().cpu(),
+        fleet_ships_log=store["fleet_ships_log"].detach().cpu(),
+        fleet_eta_norm=store["fleet_eta_norm"].detach().cpu(),
+        fleet_mask=store["fleet_mask"].detach().cpu(),
+        planet_mask=store["planet_mask"].detach().cpu(),
+        is_comet=store["is_comet"].detach().cpu(),
+        pair_type_ids=store["pair_type_ids"].detach().cpu(),
+        pair_mask=pair_mask, source_mask=source_mask, action=action, value=value,
+        invalid_launch=n_invalid, emitted_launch=n_emitted,
+        n_selected_targets=int(action.target_bits.sum().item()),
+        invalid_reasons=list(invalid_reasons),
+        score_my=score_my, score_enemy_max=score_enemy_max,
+    )
+    return env_moves, record
+
+
 def make_opponent_closure(
     *,
     opponent_policy: PPOActorCritic,
@@ -172,10 +464,13 @@ def make_opponent_closure(
     sigma: float,
     noop_logit_bias: float,
     num_players: int = 2,
+    history_window: int = 1,
 ):
     """Build an env-compatible opponent fn that samples from a FROZEN
     PPOActorCritic using the same source_multi_target_v1 contract as the
-    learner. No buffering — opponent moves are not tracked for PPO.
+    learner. Opponent moves are not tracked for PPO, but it keeps its own
+    ``history_window`` ring so a T=10 self-play opponent plays at the same
+    window as the learner (no T-asymmetry in self-play).
 
     Use this for self-play: load a frozen snapshot of the learner (or any
     other PPOActorCritic), wrap it here, pass the returned callable as the
@@ -184,8 +479,11 @@ def make_opponent_closure(
     tracker = FleetTracker()
     comet_input_dim = comet_enc.input_dim
     opponent_policy.eval()
+    history = _RolloutHistory(history_window)
 
     def opp_fn(obs):
+        get0 = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
+        step = int(get0("step") or 0)
         batch, pid_to_idx = featurize_observation(
             obs,
             learner_slot=opponent_slot,
@@ -196,33 +494,15 @@ def make_opponent_closure(
             device=device,
         )
         B, P, _ = batch["planet_features"].shape
-        comet_features = torch.zeros(
-            (B, P, comet_input_dim),
-            device=device,
-            dtype=batch["planet_features"].dtype,
-        )
-        comet_features[..., :18] = batch["planet_features"][..., :18]
         is_comet = batch["planet_features"][..., 0] > 0.5
+        pair_type_cur = build_pair_type_ids(
+            batch["planet_features"], batch["planet_mask"],
+        )
+        history.push(step, _frame_from_batch(batch, is_comet, pair_type_cur))
 
         with torch.inference_mode():
-            planet_tok = planet_enc(batch["planet_features"])
-            comet_tok = comet_enc(comet_features)
-            fleet_tok = fleet_enc(batch["fleet_features"])
-            entity_self = _build_entity_self_tokens(planet_tok, comet_tok, is_comet)
-            routing = {
-                "fleet_target_idx": batch["fleet_target_idx"],
-                "fleet_source_idx": batch["fleet_source_idx"],
-                "fleet_owner_slot": batch["fleet_owner_slot"],
-                "fleet_ships_log": batch["fleet_ships_log"],
-                "fleet_eta_norm": batch["fleet_eta_norm"],
-                "fleet_mask": batch["fleet_mask"],
-            }
-            pair_type_ids = build_pair_type_ids(
-                batch["planet_features"], batch["planet_mask"],
-            )
-            out = opponent_policy(
-                entity_self, fleet_tok, routing, batch["planet_mask"],
-                is_comet=is_comet, pair_type_ids=pair_type_ids,
+            out, _store = _forward_with_history(
+                opponent_policy, planet_enc, fleet_enc, comet_enc, history, step, device,
             )
             pair_logits = out["pair_logits"][0].detach().cpu()
             frac_loc = out["frac_loc"][0].detach().cpu()
@@ -320,15 +600,28 @@ def _make_learner_closure(
     max_fleets: int,
     sigma: float,
     noop_logit_bias: float,
+    history_window: int = 1,
+    num_players: int = 2,
+    on_step=None,
 ):
     """Build an env.run-compatible agent fn that samples policy actions and
-    accumulates per-step records into ``buffer``."""
+    accumulates per-step records into ``buffer``. With ``history_window > 1`` the
+    closure feeds the model the HISTORY_OFFSETS T-window and each StepRecord
+    carries the stacked ``(T, ...)`` inputs the learner replays. ``num_players``
+    is 2 or 4 — the orbit_wars env + featurizer support both.
+
+    ``on_step`` (optional): called once per LEARNER turn AFTER the step's scores are
+    computed, as ``on_step(step, num_players, score_my, score_enemy_max)``. No-op
+    when None (zero overhead for existing callers); any error it raises is swallowed
+    so live telemetry can never break a game."""
     tracker = FleetTracker()
     comet_input_dim = comet_enc.input_dim
-    num_players = 2
+    history = _RolloutHistory(history_window)
 
     def agent_fn(obs):
-        # 1. Featurize observation to model inputs.
+        get = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
+        step = int(get("step") or 0)
+        # 1. Featurize the current observation; buffer it for the T-window.
         batch, pid_to_idx = featurize_observation(
             obs,
             learner_slot=learner_slot,
@@ -339,39 +632,18 @@ def _make_learner_closure(
             device=device,
         )
         B, P, _ = batch["planet_features"].shape
-
-        # 2. Comet features stub + L0 specialists forward.
-        comet_features = torch.zeros(
-            (B, P, comet_input_dim),
-            device=device,
-            dtype=batch["planet_features"].dtype,
-        )
-        comet_features[..., :18] = batch["planet_features"][..., :18]
         is_comet = batch["planet_features"][..., 0] > 0.5
-
-        with torch.no_grad():
-            planet_tok = planet_enc(batch["planet_features"])
-            comet_tok = comet_enc(comet_features)
-            fleet_tok = fleet_enc(batch["fleet_features"])
-        entity_self = _build_entity_self_tokens(planet_tok, comet_tok, is_comet)
-
-        routing = {
-            "fleet_target_idx": batch["fleet_target_idx"],
-            "fleet_source_idx": batch["fleet_source_idx"],
-            "fleet_owner_slot": batch["fleet_owner_slot"],
-            "fleet_ships_log": batch["fleet_ships_log"],
-            "fleet_eta_norm": batch["fleet_eta_norm"],
-            "fleet_mask": batch["fleet_mask"],
-        }
-        pair_type_ids = build_pair_type_ids(
+        pair_type_cur = build_pair_type_ids(
             batch["planet_features"], batch["planet_mask"],
         )
+        history.push(step, _frame_from_batch(batch, is_comet, pair_type_cur))
 
-        # 3. Policy forward (no grad — rollout-time).
+        # 2-3. L0 + policy forward over the configured window (T=1 or T=10).
+        #      ``store`` holds the per-field tensors the StepRecord keeps — the
+        #      temporal stack the learner replays when history_window > 1.
         with torch.inference_mode():
-            out = policy(
-                entity_self, fleet_tok, routing, batch["planet_mask"],
-                is_comet=is_comet, pair_type_ids=pair_type_ids,
+            out, store = _forward_with_history(
+                policy, planet_enc, fleet_enc, comet_enc, history, step, device,
             )
             pair_logits = out["pair_logits"][0].detach().cpu()        # (P, P)
             frac_loc = out["frac_loc"][0].detach().cpu()              # (P, P)
@@ -485,19 +757,21 @@ def _make_learner_closure(
                 s += sum(f.ships for f in fleets if int(f.owner) == seat)
                 score_enemy_max = max(score_enemy_max, s)
 
-        # 8. Buffer the step.
+        # 8. Buffer the step. The 11 model-input fields carry the full T-window
+        #    stack (T, ...) so the learner replays the exact temporal forward;
+        #    pair_mask / source_mask / action stay single-frame (current turn).
         record = StepRecord(
-            planet_features=batch["planet_features"][0].detach().cpu(),
-            fleet_features=batch["fleet_features"][0].detach().cpu(),
-            fleet_target_idx=batch["fleet_target_idx"][0].detach().cpu(),
-            fleet_source_idx=batch["fleet_source_idx"][0].detach().cpu(),
-            fleet_owner_slot=batch["fleet_owner_slot"][0].detach().cpu(),
-            fleet_ships_log=batch["fleet_ships_log"][0].detach().cpu(),
-            fleet_eta_norm=batch["fleet_eta_norm"][0].detach().cpu(),
-            fleet_mask=batch["fleet_mask"][0].detach().cpu(),
-            planet_mask=batch["planet_mask"][0].detach().cpu(),
-            is_comet=is_comet[0].detach().cpu(),
-            pair_type_ids=pair_type_ids[0].detach().cpu(),
+            planet_features=store["planet_features"].detach().cpu(),
+            fleet_features=store["fleet_features"].detach().cpu(),
+            fleet_target_idx=store["fleet_target_idx"].detach().cpu(),
+            fleet_source_idx=store["fleet_source_idx"].detach().cpu(),
+            fleet_owner_slot=store["fleet_owner_slot"].detach().cpu(),
+            fleet_ships_log=store["fleet_ships_log"].detach().cpu(),
+            fleet_eta_norm=store["fleet_eta_norm"].detach().cpu(),
+            fleet_mask=store["fleet_mask"].detach().cpu(),
+            planet_mask=store["planet_mask"].detach().cpu(),
+            is_comet=store["is_comet"].detach().cpu(),
+            pair_type_ids=store["pair_type_ids"].detach().cpu(),
             pair_mask=pair_mask,
             source_mask=source_mask,
             action=action,
@@ -510,6 +784,13 @@ def _make_learner_closure(
             score_enemy_max=score_enemy_max,
         )
         buffer.steps.append(record)
+
+        # 9. Live per-step telemetry (best-effort; never break the game).
+        if on_step is not None:
+            try:
+                on_step(step, num_players, score_my, score_enemy_max)
+            except Exception:  # noqa: BLE001 — telemetry-grade
+                pass
         return env_moves
 
     return agent_fn
@@ -533,15 +814,23 @@ def run_episode(
     # Soft cap on target count — penalises excess(k - k_max)^2 per step.
     target_cap_k_max: int = 4,
     target_cap_lambda: float = 0.0,
+    history_window: int = 1,
+    num_players: int = 2,
+    opponent_policy=None,
+    on_step=None,
 ) -> EpisodeBuffer:
-    """Roll out one learner episode.
+    """Roll out one learner episode (2P or 4P — orbit_wars supports both).
 
     Opponent selection (exactly one of):
-      * ``opponent_fn``: an env-compatible callable ``fn(obs) -> moves``,
-        used as-is. For self-play, pass the result of
-        :func:`make_opponent_closure` here.
-      * ``opponent_id``: a registered heuristic agent id (random_v1, …),
-        looked up via ``agents.Agent(id=...)``.
+      * ``opponent_policy``: a frozen ``PPOActorCritic`` snapshot — self-play; a
+        fresh per-seat closure is built for each of the num_players-1 opponents.
+      * ``opponent_id``: a registered heuristic agent id (random_v1, …).
+      * ``opponent_fn``: a single env-compatible callable (2P back-compat only).
+
+    ``on_step`` (optional): forwarded to the learner closure; called once per
+    LEARNER turn as ``on_step(step, num_players, score_my, score_enemy_max)`` with
+    cheap stats. No-op when None — zero overhead and unchanged behaviour for every
+    existing caller. Used by the pool rollout to stream per-core live progress.
     """
     from kaggle_environments import make
     import agents as _agents
@@ -553,16 +842,34 @@ def run_episode(
         learner_slot=learner_seat, device=device, buffer=buffer,
         max_planets=max_planets, max_fleets=max_fleets,
         sigma=sigma, noop_logit_bias=noop_logit_bias,
+        history_window=history_window, num_players=num_players,
+        on_step=on_step,
     )
-    if opponent_fn is None and opponent_id is None:
-        raise ValueError("must pass exactly one of opponent_fn / opponent_id")
-    if opponent_fn is not None and opponent_id is not None:
-        raise ValueError("pass only one of opponent_fn / opponent_id")
-    opp_fn = opponent_fn if opponent_fn is not None else _agents.Agent(id=opponent_id).fn
+    n_opp = sum(x is not None for x in (opponent_fn, opponent_id, opponent_policy))
+    if n_opp != 1:
+        raise ValueError("pass exactly one of opponent_fn / opponent_id / opponent_policy")
+    if opponent_fn is not None and num_players != 2:
+        raise ValueError("opponent_fn is 2P-only; use opponent_policy/opponent_id for 4P")
 
-    fns = [None, None]
+    # One agent fn per seat: learner at ``learner_seat``; the other
+    # num_players-1 seats are opponents (per-seat self-play snapshot, heuristic,
+    # or the single 2P back-compat opponent_fn).
+    fns = [None] * num_players
     fns[learner_seat] = learner_fn
-    fns[1 - learner_seat] = opp_fn
+    for seat in range(num_players):
+        if seat == learner_seat:
+            continue
+        if opponent_policy is not None:
+            fns[seat] = make_opponent_closure(
+                opponent_policy=opponent_policy, planet_enc=planet_enc,
+                fleet_enc=fleet_enc, comet_enc=comet_enc, opponent_slot=seat,
+                device=device, max_planets=max_planets, max_fleets=max_fleets,
+                sigma=sigma, noop_logit_bias=noop_logit_bias, num_players=num_players,
+            )
+        elif opponent_id is not None:
+            fns[seat] = _agents.Agent(id=opponent_id).fn
+        else:
+            fns[seat] = opponent_fn
 
     env = make("orbit_wars", configuration={"seed": seed} if seed is not None else {})
     env.run(fns)
@@ -595,6 +902,23 @@ def run_episode(
         buffer.steps[-1].done = 1.0
         terminal = 1.0 if buffer.winner == learner_seat else (-1.0 if buffer.winner != -1 else 0.0)
         buffer.steps[-1].reward += terminal
+
+    # Best-effort per-game FD release: under a long fork-pool run the kaggle env
+    # (and any agent sub-process it spawned) can leak file descriptors per game,
+    # which compounds toward the soft RLIMIT_NOFILE. Drop our reference to the env
+    # AFTER winner/rewards are read so its objects (and any FDs they hold) become
+    # collectable now rather than at the next GC pause. If a future env grows an
+    # explicit close()/cleanup(), call it here too — guarded so it never raises.
+    # (The real safety is pool_rollout's file_system sharing strategy + the raised
+    # FD limit; this just keeps per-game pressure low.)
+    for _m in ("close", "cleanup"):
+        _fn = getattr(env, _m, None)
+        if callable(_fn):
+            try:
+                _fn()
+            except Exception:  # noqa: BLE001
+                pass
+    del env
 
     return buffer
 
@@ -721,6 +1045,7 @@ class _PPOWithL0(torch.nn.Module):
         self.fleet_enc = fleet_enc
         self.comet_enc = comet_enc
         self.value_head = policy.value_head    # for the learner's optimizer
+        self.pair_compare = getattr(policy, "pair_compare", None)
         self.entity_model = policy.entity_model
         self.sigma = policy.sigma
 
@@ -745,9 +1070,17 @@ class _PPOWithL0(torch.nn.Module):
             fleet_tok = self.fleet_enc(fleet_features)
             entity_self = _build_entity_self_tokens(planet_tok, comet_tok, is_comet)
 
+        # PlayerConsolidator needs the learner-relative owner one-hot. It
+        # lives at planet_features[..., 1:1+ENTITY_N_OWNER_CLASSES] per the
+        # PlanetFeaturizer layout. Slice (no grad needed — additive only).
+        owner_slice = planet_features[
+            ..., _PLANET_OWNER_START_IDX:_PLANET_OWNER_NEUTRAL_IDX + 1
+        ]
+
         return self.policy(
             entity_self, fleet_tok, routing, planet_mask,
             is_comet=is_comet, pair_type_ids=pair_type_ids,
+            planet_owner_oh=owner_slice,
         )
 
 
@@ -784,7 +1117,11 @@ def main():
           f"conditioner_n_layers={cfg.get('conditioner_n_layers',1)}, "
           f"head_n_layers={cfg.get('head_n_layers',1)})", flush=True)
 
-    policy = PPOActorCritic(entity_model, sigma=args.sigma).to(device)
+    policy = PPOActorCritic(
+        entity_model,
+        sigma=args.sigma,
+        allow_debug_glob_critic=True,
+    ).to(device)
     breakdown = policy.freeze_for_phase(0)
     n_trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     print(f"[smoke] freeze_for_phase(0) → trainable={n_trainable:,} | "

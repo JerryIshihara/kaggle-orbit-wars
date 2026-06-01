@@ -54,6 +54,7 @@ from ..aggregator import (
     JointRoleAttention,
     PAIR_TYPE_NUM_CLASSES,
     PairHead,
+    PlayerConsolidator,
 )
 from ..encoder.entity_encoder import PlanetEntityEncoder
 from ..encoder.fleet_encoder import FleetEncoder
@@ -755,6 +756,8 @@ class EntityPretrainModel(nn.Module):
         d_pair: int | None = None,
         conditioner_n_layers: int = 1,
         head_n_layers: int = 1,
+        skip_l34: bool = False,
+        with_consolidator: bool = True,
     ):
         super().__init__()
         self.d_model = d_model
@@ -783,6 +786,20 @@ class EntityPretrainModel(nn.Module):
         # 2-3 turns each head into a small MLP, useful when training only
         # the head side of the model.
         self.head_n_layers = int(head_n_layers)
+        # ``skip_l34``: when True, drop the L3 DualRoleAttention and L4
+        # JointRoleAttention layers entirely. PairHead is fed ``ctx_now``
+        # as both ``source_joint`` and ``target_joint``, so the model
+        # learns pair scores directly off L2's role-agnostic context. This
+        # is the "no-L3/L4" ablation requested for comparing whether the
+        # role-specialized intermediate stack actually helps the actor.
+        self.skip_l34 = bool(skip_l34)
+        # ``with_consolidator``: when False, skip the PlayerConsolidator
+        # entirely. The pair-supervised training (entity_encoder.train)
+        # never reads ``player_state``, so the Consolidator is dead code
+        # in that path and only adds ~1.5M params to the saved ckpt.
+        # PPO + Stage A supervised paths set this True (default). Pure
+        # actor-side ablations should pass False to keep the ckpt tight.
+        self.with_consolidator = bool(with_consolidator)
         self.entity = PlanetEntityEncoder(
             d_model=d_model, n_heads=self.entity_n_heads,
         )
@@ -798,21 +815,52 @@ class EntityPretrainModel(nn.Module):
             # so callers can pass T <= n_steps freely.
             n_steps=self.n_steps,
         )
-        self.dual_role = DualRoleAttention(
-            d_model=d_model, n_heads=dual_n_heads, dropout=dropout,
-        )
-        # L4: joint self-attention over the 2P concatenated role tokens.
-        # 1 layer is enough — most relational structure was already
-        # established by L1 (planet ↔ fleet) and L2 (planet ↔ planet);
-        # this layer's job is just to let same-role tokens see each
-        # other directly under the new role tagging.
-        self.joint_role = JointRoleAttention(
-            d_model=d_model,
-            n_heads=dual_n_heads,
-            n_layers=1,
-            ff_mult=cross_ff_mult,
-            dropout=dropout,
-        )
+        if self.skip_l34:
+            # Ablation: drop L3/L4 entirely. PairHead reads ctx_now twice.
+            self.dual_role = None
+            self.joint_role = None
+        else:
+            self.dual_role = DualRoleAttention(
+                d_model=d_model, n_heads=dual_n_heads, dropout=dropout,
+            )
+            # L4: joint self-attention over the 2P concatenated role tokens.
+            # 1 layer is enough — most relational structure was already
+            # established by L1 (planet ↔ fleet) and L2 (planet ↔ planet);
+            # this layer's job is just to let same-role tokens see each
+            # other directly under the new role tagging.
+            self.joint_role = JointRoleAttention(
+                d_model=d_model,
+                n_heads=dual_n_heads,
+                n_layers=1,
+                ff_mult=cross_ff_mult,
+                dropout=dropout,
+            )
+
+        # PlayerConsolidator: branches off L2 (after CrossEntityAttention)
+        # and compresses ``ctx_now (B, P, d)`` plus owner one-hots into one
+        # strategic embedding per learner-relative player slot:
+        # ``player_state (B, 4, d_model)``. The PPO critic reads
+        # ``player_state[:, 0]`` (the learner's own state). Pretraining
+        # heads attached to this output (CurrentStateHead etc.) are
+        # downstream; see ``docs/PPO_TWO_CPU_PROTOCOL.md`` for the design.
+        #
+        # ``ff_mult=4`` so the FFN hidden width is 4·d_model = 1024 at
+        # d_model=256, matching the design spec. (L2's ``cross_ff_mult``
+        # defaults to 2 and is intentionally narrower; the Consolidator
+        # wants more head-side capacity since it's the only post-L2
+        # block that compresses to per-player state.)
+        if self.with_consolidator:
+            self.consolidator = PlayerConsolidator(
+                d_model=d_model,
+                n_heads=dual_n_heads,
+                ff_mult=4,
+                dropout=dropout,
+            )
+        else:
+            # Actor-only ablation path: pair supervision never reads
+            # ``player_state``, so don't pay the ~1.5M param tax. The
+            # ``forward_with_context`` consumer must check before using.
+            self.consolidator = None
 
         # Pair-score head. Consumes the L4 joint role tokens plus L2
         # ctx_now and emits a dict of 2 logits/scores from a shared
@@ -850,18 +898,57 @@ class EntityPretrainModel(nn.Module):
         ``model.parameters()`` for the optimizer to update.
         """
         frozen = {}
-        for name, module in (
+        modules = [
             ("L1_entity", self.entity),
             ("L2_cross", self.cross),
             ("L3_dual_role", self.dual_role),
             ("L4_joint_role", self.joint_role),
-        ):
+        ]
+        for name, module in modules:
+            if module is None:
+                # Ablation may skip L3/L4 entirely; nothing to freeze.
+                frozen[name] = 0
+                continue
             count = 0
             for p in module.parameters():
                 if p.requires_grad:
                     p.requires_grad_(False)
                     count += p.numel()
             frozen[name] = count
+        return frozen
+
+    def freeze_l1_only(self) -> dict[str, int]:
+        """Stage-2 fine-tune freeze: freeze L1 only; leave L2/L3/L4 + PairHead
+        trainable.
+
+        Use after a stage-1 run that trained PairHead with all of L1-L4
+        frozen (``freeze_perception``): warm-start from that checkpoint,
+        freeze just the L1 world-perception encoder, and let L2 (cross),
+        L3 (dual-role), L4 (joint-role) and the PairHead co-adapt at a
+        lower LR. L0 specialists stay frozen externally (``_load_encoders``).
+        Returns ``{layer: param_count}`` (frozen for L1, trainable for the
+        rest) for the build log.
+        """
+        frozen = {}
+        # Freeze L1 (entity world-perception).
+        count = 0
+        for p in self.entity.parameters():
+            if p.requires_grad:
+                p.requires_grad_(False)
+                count += p.numel()
+        frozen["L1_entity (frozen)"] = count
+        # Report — but DO NOT freeze — the now-trainable upper stack.
+        for name, module in (
+            ("L2_cross", self.cross),
+            ("L3_dual_role", self.dual_role),
+            ("L4_joint_role", self.joint_role),
+        ):
+            if module is None:
+                frozen[f"{name} (trainable)"] = 0
+                continue
+            for p in module.parameters():
+                p.requires_grad_(True)
+            frozen[f"{name} (trainable)"] = sum(p.numel() for p in module.parameters())
         return frozen
 
     def forward(
@@ -948,13 +1035,18 @@ class EntityPretrainModel(nn.Module):
         else:
             pair_type_now = None
 
-        # L3: parallel source/target role-conditioned attention.
-        source_aware, target_aware = self.dual_role(ctx_now, planet_mask_now)
-
-        # L4: joint self-attention over the 2P concatenated role tokens.
-        source_joint, target_joint = self.joint_role(
-            source_aware, target_aware, planet_mask_now,
-        )                                                    # (B, P, d) each
+        if self.skip_l34:
+            # Ablation: PairHead reads ctx_now twice (as both source and
+            # target). No role specialization from L3/L4.
+            source_joint = ctx_now
+            target_joint = ctx_now
+        else:
+            # L3: parallel source/target role-conditioned attention.
+            source_aware, target_aware = self.dual_role(ctx_now, planet_mask_now)
+            # L4: joint self-attention over the 2P concatenated role tokens.
+            source_joint, target_joint = self.joint_role(
+                source_aware, target_aware, planet_mask_now,
+            )                                                # (B, P, d) each
 
         # Derive pair_valid from the current-step planet_mask: a pair
         # cell (s, t) is valid iff both endpoints are real planets and
@@ -987,15 +1079,27 @@ class EntityPretrainModel(nn.Module):
         planet_mask: torch.Tensor,
         is_comet: torch.Tensor | None = None,
         pair_type_ids: torch.Tensor | None = None,
+        planet_owner_oh: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Like :meth:`forward` but also returns ``glob`` and ``ctx_now``.
+        """Like :meth:`forward` but also returns ``glob``, ``ctx_now``,
+        and ``player_state``.
 
         Used by PPO (``agents.transformer_v2.ppo.PPOActorCritic``): the
-        critic reads ``glob`` (L2 CLS readout); diagnostics consume
-        ``ctx_now`` and the L4 joint role tokens.
+        critic reads ``player_state[:, 0]`` (the learner's strategic
+        state, per the learner-relative slot ordering — slot 0 = self).
+        ``glob`` is still returned for diagnostics. ``ctx_now`` and the
+        L4 joint role tokens stay available for other consumers.
 
-        Returns ``{pair_logits, pair_frac, glob, ctx_now, source_joint,
-        target_joint, l1_now}``.
+        ``planet_owner_oh`` is the 5-dim learner-relative owner one-hot
+        (``planet_features[..., 1:1+ENTITY_N_OWNER_CLASSES]``) needed by
+        the PlayerConsolidator's owner additive encoding. If a temporal
+        ``(B, T, P, 5)`` is passed, the last timestep is used. If None
+        (legacy callers), a zero tensor is used and the Consolidator runs
+        without owner cues — produces a coarse global summary biased by
+        the learned per-slot CLS only.
+
+        Returns ``{pair_logits, pair_frac, glob, ctx_now, player_state,
+        source_joint, target_joint, l1_now}``.
         """
         is_temporal = planet_tokens.dim() == 4
         if is_temporal:
@@ -1052,10 +1156,34 @@ class EntityPretrainModel(nn.Module):
         else:
             pair_type_now = None
 
-        source_aware, target_aware = self.dual_role(ctx_now, planet_mask_now)
-        source_joint, target_joint = self.joint_role(
-            source_aware, target_aware, planet_mask_now,
-        )
+        # PlayerConsolidator: branch off L2. Build per-player strategic
+        # state from ``ctx_now`` + planet owner one-hots + planet_mask.
+        # Skipped when ``with_consolidator=False``; ``player_state`` in
+        # the return dict becomes None so callers can branch on absence.
+        if self.consolidator is None:
+            player_state = None
+        else:
+            if planet_owner_oh is None:
+                owner_oh_now = torch.zeros(
+                    planet_mask_now.shape + (ENTITY_N_OWNER_CLASSES,),
+                    dtype=ctx_now.dtype, device=ctx_now.device,
+                )
+            elif planet_owner_oh.dim() == 4:
+                owner_oh_now = planet_owner_oh[:, -1].to(ctx_now.dtype)
+            else:
+                owner_oh_now = planet_owner_oh.to(ctx_now.dtype)
+            player_state = self.consolidator(
+                ctx_now, planet_mask_now, owner_oh_now,
+            )
+
+        if self.skip_l34:
+            source_joint = ctx_now
+            target_joint = ctx_now
+        else:
+            source_aware, target_aware = self.dual_role(ctx_now, planet_mask_now)
+            source_joint, target_joint = self.joint_role(
+                source_aware, target_aware, planet_mask_now,
+            )
 
         B_now, P_now = planet_mask_now.shape
         pair_valid = (
@@ -1077,6 +1205,7 @@ class EntityPretrainModel(nn.Module):
             "pair_frac": heads["pair_frac"],
             "glob": glob,
             "ctx_now": ctx_now,
+            "player_state": player_state,
             "source_joint": source_joint,
             "target_joint": target_joint,
             "l1_now": l1_now,
@@ -1704,6 +1833,115 @@ def _load_encoders(
     return fenc, penc, cenc
 
 
+def _history_offsets_for_step_embed(
+    *,
+    n_rows: int,
+    config: dict[str, Any] | None,
+) -> tuple[int, ...]:
+    """Infer oldest-first history offsets for a checkpoint step table."""
+    if config:
+        raw = config.get("history_offsets")
+        if raw:
+            return tuple(int(x) for x in raw)
+    # Legacy T6 pair checkpoints used dense offsets (5, 4, ..., 0) but
+    # older configs did not always persist them.
+    return tuple(range(n_rows - 1, -1, -1))
+
+
+def _adapt_cross_step_embed(
+    *,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_offsets: tuple[int, ...],
+    dst_offsets: tuple[int, ...],
+) -> torch.Tensor:
+    """Resize ``cross.step_embed`` by copying nearest offset rows.
+
+    ``strict=False`` does not tolerate shape mismatches. For T6->T10
+    warm-starts, preserve exact rows where offsets overlap and fill new
+    older offsets from the nearest available source row instead of
+    leaving them random. This matters when ``--freeze-perception``
+    immediately freezes L2.
+    """
+    if src.dim() != 2 or dst.dim() != 2 or src.shape[1] != dst.shape[1]:
+        return dst
+    if len(src_offsets) != src.shape[0]:
+        src_offsets = _history_offsets_for_step_embed(
+            n_rows=src.shape[0], config=None,
+        )
+    if len(dst_offsets) != dst.shape[0]:
+        dst_offsets = _history_offsets_for_step_embed(
+            n_rows=dst.shape[0], config=None,
+        )
+
+    out = dst.clone()
+    src_by_offset = {off: i for i, off in enumerate(src_offsets)}
+    for j, off in enumerate(dst_offsets):
+        if off in src_by_offset:
+            i = src_by_offset[off]
+        else:
+            i = min(
+                range(len(src_offsets)),
+                key=lambda k: abs(src_offsets[k] - off),
+            )
+        out[j].copy_(src[i])
+    return out
+
+
+def _prepare_entity_warm_start_state(
+    *,
+    model: EntityPretrainModel,
+    ckpt_model: dict[str, torch.Tensor],
+    ckpt_config: dict[str, Any] | None,
+    history_offsets: tuple[int, ...] | None,
+) -> tuple[dict[str, torch.Tensor], list[str], list[str]]:
+    """Filter/adapt checkpoint tensors before ``load_state_dict``.
+
+    PyTorch's ``strict=False`` allows missing/unexpected keys but still
+    raises on same-name shape mismatches. The no-L3/L4 T10 ablation
+    warm-starts from a T6 checkpoint, so ``cross.step_embed`` needs an
+    explicit resize.
+    """
+    model_state = model.state_dict()
+    prepared = dict(ckpt_model)
+    adapted: list[str] = []
+    skipped: list[str] = []
+    dst_offsets = (
+        tuple(history_offsets)
+        if history_offsets is not None
+        else _history_offsets_for_step_embed(
+            n_rows=model.cross.step_embed.shape[0], config=None,
+        )
+    )
+    for key in list(prepared.keys()):
+        if key not in model_state:
+            continue
+        src = prepared[key]
+        dst = model_state[key]
+        if not torch.is_tensor(src) or tuple(src.shape) == tuple(dst.shape):
+            continue
+        if key == "cross.step_embed":
+            src_offsets = _history_offsets_for_step_embed(
+                n_rows=src.shape[0], config=ckpt_config,
+            )
+            prepared[key] = _adapt_cross_step_embed(
+                src=src.to(device=dst.device, dtype=dst.dtype),
+                dst=dst,
+                src_offsets=src_offsets,
+                dst_offsets=dst_offsets,
+            )
+            adapted.append(
+                f"{key}: {tuple(src.shape)}->{tuple(dst.shape)} "
+                f"src_offsets={src_offsets} dst_offsets={dst_offsets}"
+            )
+        else:
+            del prepared[key]
+            skipped.append(
+                f"{key}: ckpt{tuple(src.shape)} != model{tuple(dst.shape)}"
+            )
+    return prepared, adapted, skipped
+
+
 def train(
     *,
     out_dir: Path,
@@ -1718,7 +1956,10 @@ def train(
     dual_n_heads: int = 8,
     conditioner_n_layers: int = 1,
     head_n_layers: int = 1,
+    skip_l34: bool = False,
+    with_consolidator: bool = True,
     freeze_perception: bool = False,
+    freeze_l1_only: bool = False,
     init_from_entity_ckpt: Path | None = None,
     batch_size: int = 16,
     epochs: int = 30,
@@ -1731,6 +1972,8 @@ def train(
     device: str | None = None,
     seed: int = 0,
     pair_cache_path: Path = DATASETS_ROOT / "_pair_cache" / "bowwowforeach_Ebi_T6" / "bowwowforeach_Ebi_T6_p64_f1024_all.pt",
+    pair_history_offsets: tuple[int, ...] | None = None,
+    drop_invalid_source_episodes: bool = False,
     pair_pos_weight: float = 600.0,
     source_act_pos_weight: float = 1.0,
     target_aim_pos_weight: float = 1.0,
@@ -1762,6 +2005,14 @@ def train(
 
     print(f"[entity-pretrain] loading pair cache from {pair_cache_path} ...")
     full_ds = CachedPairDataset(pair_cache_path)
+    if pair_history_offsets is not None:
+        full_ds.history_offsets = tuple(int(x) for x in pair_history_offsets)
+        full_ds.config = dict(full_ds.config)
+        full_ds.config["history_offsets"] = list(full_ds.history_offsets)
+        print(
+            f"  overriding pair-cache history_offsets -> "
+            f"{full_ds.config['history_offsets']}"
+        )
     print(
         f"  cache config: player={full_ds.config.get('player')!r}  "
         f"keep_non_acted={full_ds.config.get('keep_non_acted')}  "
@@ -1775,11 +2026,52 @@ def train(
             i for i, snap in enumerate(full_ds.snapshots)
             if bool(snap["pair_labels"].any())
         ]
+    invalid_source_episodes: set[str] = set()
+    invalid_source_cells = 0
+    if drop_invalid_source_episodes:
+        for i, snap in enumerate(full_ds.snapshots):
+            pair_labels = snap["pair_labels"].bool()
+            if not bool(pair_labels.any()):
+                continue
+            nz = torch.nonzero(pair_labels, as_tuple=False)
+            source_idx = nz[:, 0]
+            # Planet features use f001..f005 as learner-relative owner
+            # one-hot. A positive launch whose source is not owner slot 0
+            # is not a valid learner action for the actor being trained.
+            source_owner0 = snap["planet_features"][source_idx, 1]
+            bad = source_owner0 < 0.5
+            if bool(bad.any()):
+                invalid_source_episodes.add(str(full_ds.keys[i][0]))
+                invalid_source_cells += int(bad.sum().item())
+        if invalid_source_episodes:
+            print(
+                f"  drop_invalid_source_episodes=True: found "
+                f"{invalid_source_cells:,} positive cells with non-learner "
+                f"sources across {len(invalid_source_episodes):,} episodes; "
+                "excluding those episodes from supervised train/val/test rows"
+            )
     train_row_indices = (
         list(range(len(full_ds)))
         if bool(full_ds.config.get("keep_non_acted", False))
         else acted_indices
     )
+    if invalid_source_episodes:
+        before = len(train_row_indices)
+        train_row_indices = [
+            i for i in train_row_indices
+            if str(full_ds.keys[i][0]) not in invalid_source_episodes
+        ]
+        acted_indices = [
+            i for i in acted_indices
+            if str(full_ds.keys[i][0]) not in invalid_source_episodes
+        ]
+        print(
+            f"  after invalid-source episode drop: "
+            f"{len(train_row_indices):,}/{before:,} supervised rows remain; "
+            f"{len(acted_indices):,} acted rows remain"
+        )
+    if not train_row_indices:
+        raise ValueError("no supervised rows remain after pair-cache filtering")
     print(
         f"  snapshots: {len(full_ds):,} context rows; "
         f"{len(acted_indices):,} acted rows; "
@@ -1908,6 +2200,8 @@ def train(
         dual_n_heads=dual_n_heads,
         conditioner_n_layers=conditioner_n_layers,
         head_n_layers=head_n_layers,
+        skip_l34=skip_l34,
+        with_consolidator=with_consolidator,
     ).to(device)
     print(
         f"  entity model params: "
@@ -1932,7 +2226,22 @@ def train(
             )
         print(f"[entity-pretrain] warm-start from {init_path}")
         ckpt_init = torch.load(init_path, map_location=device, weights_only=False)
-        load_result = model.load_state_dict(ckpt_init["model"], strict=False)
+        prepared_state, adapted_keys, skipped_shape = _prepare_entity_warm_start_state(
+            model=model,
+            ckpt_model=ckpt_init["model"],
+            ckpt_config=ckpt_init.get("config", {}),
+            history_offsets=history_offsets,
+        )
+        if adapted_keys:
+            print("  adapted warm-start tensors:")
+            for msg in adapted_keys:
+                print(f"    {msg}")
+        if skipped_shape:
+            print(
+                f"  skipped {len(skipped_shape)} shape-mismatched tensors "
+                f"before load_state_dict. First few: {skipped_shape[:5]}"
+            )
+        load_result = model.load_state_dict(prepared_state, strict=False)
         # The PairHead shim has already deleted incompatible keys; what
         # remains in ``missing`` is the genuinely-untouched parameters
         # (e.g. deeper film_proj layers when growing depth).
@@ -1945,15 +2254,20 @@ def train(
         )
         if missing_film:
             print(f"    FiLM branch kept at identity init ({len(missing_film)} keys re-init).")
-        if missing_other and freeze_perception:
+        if missing_other and (freeze_perception or freeze_l1_only):
             # Anything missing OUTSIDE film_proj/pair_type_embed when we're
-            # about to freeze perception is a real problem — we'd freeze
-            # random init for those weights.
+            # about to freeze part of the stack is a real problem — we'd
+            # freeze random init for those weights (L1 under freeze_l1_only;
+            # L1-L4 under freeze_perception).
             print(
                 f"    WARNING: {len(missing_other)} non-FiLM keys are at random "
-                f"init AND will be frozen below. First few: {missing_other[:5]}"
+                f"init AND (some) will be frozen below. First few: {missing_other[:5]}"
             )
 
+    if freeze_perception and freeze_l1_only:
+        raise ValueError(
+            "--freeze-perception and --freeze-l1-only are mutually exclusive"
+        )
     if freeze_perception:
         frozen = model.freeze_perception()
         n_frozen = sum(frozen.values())
@@ -1963,6 +2277,14 @@ def train(
         )
         for layer, count in frozen.items():
             print(f"    {layer:<14s} frozen: {count:,} params")
+    elif freeze_l1_only:
+        frozen = model.freeze_l1_only()
+        print(
+            "[entity-pretrain] freeze_l1_only=True  →  L1 frozen; "
+            "L2/L3/L4 + PairHead trainable (stage-2 fine-tune)"
+        )
+        for layer, count in frozen.items():
+            print(f"    {layer:<24s} {count:,} params")
 
     # Only optimize parameters that still require grad. With
     # ``freeze_perception=True`` this collapses the optimizer to the
@@ -1985,7 +2307,10 @@ def train(
         "dual_n_heads": dual_n_heads,
         "conditioner_n_layers": conditioner_n_layers,
         "head_n_layers": head_n_layers,
+        "skip_l34": bool(skip_l34),
+        "with_consolidator": bool(with_consolidator),
         "freeze_perception": bool(freeze_perception),
+        "freeze_l1_only": bool(freeze_l1_only),
         "init_from_entity_ckpt": str(init_from_entity_ckpt) if init_from_entity_ckpt else None,
         "lr": lr, "weight_decay": weight_decay,
         "batch_size": batch_size, "epochs": epochs,
@@ -2062,6 +2387,18 @@ def train(
                 running_per_head[k] += v
                 running_per_head[f"_n_{k}"] = running_per_head.get(f"_n_{k}", 0) + 1
             n_batches += 1
+            # Periodic in-epoch progress so long single-epoch waits
+            # (e.g., MPS at b=8) don't look hung. Cheap: only every
+            # 200 batches, with the running mean loss so the user
+            # sees the trajectory before val.
+            if n_batches % 200 == 0:
+                elapsed_now = round(time.time() - t0, 1)
+                print(
+                    f"    [ep {epoch} batch {n_batches}]  "
+                    f"running_train_loss={running_total / n_batches:.4f}  "
+                    f"(elapsed {elapsed_now}s)",
+                    flush=True,
+                )
 
         train_total = running_total / max(1, n_batches)
         train_per_head: dict[str, float] = {}
@@ -2185,6 +2522,25 @@ def main() -> None:
              "Linear+GELU layers and a final Linear → 1 projection.",
     )
     parser.add_argument(
+        "--no-consolidator", action="store_true",
+        help="Skip the PlayerConsolidator module entirely. Pair "
+             "supervision (entity_encoder.train) never reads "
+             "``player_state``, so the Consolidator is dead code in that "
+             "training path and only inflates the ckpt by ~1.5M params. "
+             "PPO + Stage A supervised paths should NOT use this flag.",
+    )
+    parser.add_argument(
+        "--skip-l34", action="store_true",
+        help="Ablation: drop L3 DualRoleAttention and L4 JointRoleAttention "
+             "entirely. PairHead receives ctx_now as both source_joint and "
+             "target_joint, so pair scores come directly from L2's "
+             "role-agnostic context. Use this to test whether the "
+             "role-specialized intermediate stack is load-bearing for the "
+             "actor. Compatible with --freeze-perception + "
+             "--init-from-entity-ckpt (the L3/L4 weights in the source "
+             "ckpt are reported as `unexpected` and ignored).",
+    )
+    parser.add_argument(
         "--freeze-perception", action="store_true",
         help="Freeze L1-L4 (entity / cross / dual_role / joint_role) so "
              "only the PairHead (trunk + FiLM + 2 output heads + input "
@@ -2194,6 +2550,15 @@ def main() -> None:
              "cache or trying a deeper conditioner. **Pair with "
              "--init-from-entity-ckpt** — otherwise you'd freeze L1-L4 "
              "at random init.",
+    )
+    parser.add_argument(
+        "--freeze-l1-only", action="store_true",
+        help="Stage-2 fine-tune: freeze ONLY L1 (entity world-perception); "
+             "leave L2 (cross), L3 (dual_role), L4 (joint_role) and the "
+             "PairHead trainable. Pair with --init-from-entity-ckpt (a "
+             "stage-1 frozen-perception run) and a LOWER --lr so the upper "
+             "stack co-adapts to the already-trained head without "
+             "destabilizing. Mutually exclusive with --freeze-perception.",
     )
     parser.add_argument(
         "--init-from-entity-ckpt", type=Path, default=None,
@@ -2234,6 +2599,20 @@ def main() -> None:
              "config; we read those at startup.",
     )
     parser.add_argument(
+        "--pair-history-offsets", type=str, default=None,
+        help="Optional comma-separated history-offset override for an "
+             "existing single-frame pair cache, e.g. "
+             "'45,40,35,30,25,20,15,10,5,0' for T=10. Labels remain "
+             "current-turn-only; only lazy input stacking changes.",
+    )
+    parser.add_argument(
+        "--drop-invalid-source-episodes", action="store_true",
+        help="Before splitting, scan positive pair labels and drop any "
+             "episode where a positive source planet is not learner-owned "
+             "in the current planet features. This guards against "
+             "seat-relativity mismatches in mixed-player caches.",
+    )
+    parser.add_argument(
         "--pair-pos-weight", type=float, default=600.0,
         help="pos_weight multiplier for the masked pair-BCE loss. "
              "Observed positive-cell fraction is ~0.16%% (29,820 / "
@@ -2266,6 +2645,20 @@ def main() -> None:
         help="Fraction of episodes held out for test.",
     )
     args = parser.parse_args()
+    pair_history_offsets = None
+    if args.pair_history_offsets:
+        try:
+            pair_history_offsets = tuple(
+                int(x.strip()) for x in args.pair_history_offsets.split(",")
+                if x.strip()
+            )
+        except ValueError as exc:
+            raise SystemExit(
+                f"--pair-history-offsets must be comma-separated ints; "
+                f"got {args.pair_history_offsets!r}"
+            ) from exc
+        if not pair_history_offsets:
+            raise SystemExit("--pair-history-offsets parsed to an empty list")
 
     out_dir = args.out_dir or (ENTITY_RUNS_DIR / time.strftime("%Y%m%d-%H%M%S"))
     train(
@@ -2281,7 +2674,10 @@ def main() -> None:
         dual_n_heads=args.dual_n_heads,
         conditioner_n_layers=args.conditioner_n_layers,
         head_n_layers=args.head_n_layers,
+        skip_l34=args.skip_l34,
+        with_consolidator=not args.no_consolidator,
         freeze_perception=args.freeze_perception,
+        freeze_l1_only=args.freeze_l1_only,
         init_from_entity_ckpt=args.init_from_entity_ckpt,
         batch_size=args.batch_size,
         epochs=args.epochs,
@@ -2294,6 +2690,8 @@ def main() -> None:
         device=args.device,
         seed=args.seed,
         pair_cache_path=args.pair_cache_path,
+        pair_history_offsets=pair_history_offsets,
+        drop_invalid_source_episodes=args.drop_invalid_source_episodes,
         pair_pos_weight=args.pair_pos_weight,
         source_act_pos_weight=args.source_act_pos_weight,
         target_aim_pos_weight=args.target_aim_pos_weight,

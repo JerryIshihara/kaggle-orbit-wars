@@ -22,6 +22,7 @@
 #   bash scripts/chunk_and_upload_pair_cache.sh                # default
 #   CHUNKS=16 UPLOAD=0 bash scripts/chunk_and_upload_pair_cache.sh
 #   SOURCE=.../bowEbi.pt PREFIX=pair_cache_top4 UPLOAD=1 bash ...
+#   SOURCE=.../pair_cache_t10.pt PREFIX=pair_cache_t10 CHUNKS=8 UPLOAD=1 bash ...
 
 set -euo pipefail
 

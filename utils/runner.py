@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import random
 from typing import Any
 
 import agents as _agents
@@ -65,6 +66,11 @@ def run_match(
     from kaggle_environments import make
 
     players = _validate_and_load(agent_ids)
+    # orbit_wars 1.28.x builds maps with Python's module-level random,
+    # not env.configuration.seed. Seed it here so eval panels are actually
+    # reproducible across runs and machines.
+    if seed is not None:
+        random.seed(seed)
     config: dict = {"seed": seed} if seed is not None else {}
     env = make("orbit_wars", configuration=config, debug=debug)
     env.run([p.fn for p in players])

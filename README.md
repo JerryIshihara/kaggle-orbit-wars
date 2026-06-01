@@ -20,6 +20,29 @@ python run.py --mode submit --agents sniper        # pack and submit to Kaggle
 
 ---
 
+## Milestones
+
+Rough sequencing for the next round of model work, in order. Strike when complete; refine as scope changes.
+
+| # | Name | Description | Status |
+|---|------|-------------|--------|
+| 1 | **L2 perceptor refinement** | Pretrain `CrossEntityAttention` on the cross_entity dataset with `T=10` history (`HISTORY_OFFSETS = (45, 40, …, 0)`, ~50-turn lookback) and the ~25-head Tier-1/2/3/4 supervision menu (frontier / spatial / leader_k / score_advantage_k / tactical-horizon). Wired through `notebooks/L2_crossheads_crossT10_d256_colab.ipynb`. | in progress |
+| 2 | **L3 / L4 ablation** | Train the pair-action stack with `--skip-l34 --no-consolidator --freeze-perception` and compare against the May-21 baseline (full L1-L4 + shallow PairHead) on the same cache. Question: is the role-specialized stack load-bearing, or does `ctx_now → PairHead` suffice with deeper FiLM. Notebook: `Lall_noL34_PairHead_pairT10_d256_colab.ipynb`. Chunked pair-cache staging supported via `pair_cache_t10.manifest.json` + `.part_*`. | B-side at epoch 7 |
+| 3 | **Finalize actor + critic block design** | Lock in: actor branch level (`ctx_now` post-L2 vs `source_joint/target_joint` post-L4), FiLM conditioner + head depth, source/target/frac contract; critic input (`glob` CLS, `player_state[:, 0]` from PlayerConsolidator, or a new dedicated head), value MLP shape; wire both into `PPOActorCritic.forward` / `freeze_for_phase`. | pending |
+| 4 | **Actor + critic supervised pretrain** | With the finalized block design, pretrain heads against expert pair labels (actor: `pair_logits` BCE + `pair_frac` MSE) and per-player current/future/outcome targets (critic: Stage A `CurrentStateHead`, then v1 Future/Outcome/Matchup after cache rebuild). Goal: a warm-started `entity_encoder_best.pt` PPO loads with zero re-init. Notebooks: `Cons_StageA_currentstate_pairT6_d256_colab.ipynb` (critic) + `Lall_PairHead_pairT6_d256_colab.ipynb` (actor). | pending |
+| 5 | **Action-effect / player-state transition pretrain** | Teach the model how actions interact with the environment and change strategic state before PPO asks it to improve actions. Add action-conditioned transition heads over `player_state` / `slot_state`: given current world state plus sampled/expert launches, predict short-horizon deltas in ships, planet ownership, production, survival/rank, and pairwise player advantage. Include negative/no-op and invalid-action contrast so the model distinguishes "action looked plausible" from "action actually improved the future state." Success: action-conditioned predictions beat no-action baselines across K={5,10,20,50}, and learned deltas correlate with realized player-state/value changes. | pending |
+| 6 | **PPO rollout training** | Phase 0 self-play (frozen snapshot opponent per iter) + BC anchor on expert pair cache + soft cap on Bernoulli target count. Two-CPU protocol from `docs/PPO_TWO_CPU_PROTOCOL.md` with file-mediated gradient averaging A↔B. Success: winrate > 0.6 over 30 self-play iters, KL < 0.02, invalid-launch rate trending down. | pending |
+
+**Milestone 1 L2 data staging:** `notebooks/L2_crossheads_crossT10_d256_colab.ipynb` defaults to sharded CSV staging for faster Colab prep (`DATASET_SHARDS = 8`, batch 256). Build/upload the shard set from an extracted local `data/datasets/{cross_entity,entity,fleet,planet}/` tree with:
+
+```bash
+SHARDS=8 UPLOAD=1 bash scripts/chunk_cross_entity_dataset.sh
+```
+
+This uploads `cross_entity_dataset_shard_00.tgz` through `cross_entity_dataset_shard_07.tgz` plus `cross_entity_dataset_shard.manifest.json` to `gs://orbit-wars-shipping/cross_entity/`. Set `DATASET_SHARDS = 0` in the notebook only when falling back to streaming the legacy single object `cross_entity_dataset.tgz`.
+
+---
+
 ## Known issues / problem list
 
 Live punch list of observed failures and gaps. Add new items as they're found; strike (`~~done~~`) or remove once fixed. Cite a replay / seed when possible so we can re-check after a change.
@@ -30,6 +53,8 @@ Live punch list of observed failures and gaps. Add new items as they're found; s
 4. **Model can't recognize blocking planets on the launch path** — the agent picks a (source, target) pair whose straight-line trajectory passes through an intervening planet (own, neutral, or enemy). The intercepting body absorbs the fleet, so the intended target is never reached and the source's ships are spent on the wrong planet. Today the runner relies on `plan_launch` *after* the model picks the pair, but the LEARNED scorer has no feature describing "is there a planet sitting on the ray from src to tgt?". The relation tokens at L1 are `[fleet_tok ‖ src_planet ‖ tgt_planet]` — they don't include third-party planets that geometrically sit between the pair. Fix candidates: (a) add a per-(s, t) geometric feature (count / nearest-distance / soonest-blocker-arrival) and feed it into PairHead via `pair_scalars`; (b) at training time, mask out or down-weight cells where `plan_launch.reason == "wrong_planet_*"` so the model learns to score them low rather than just being rejected at inference.
 5. ~~**Miss-rate calculation diverges from env's actual outcomes**~~ — fixed in `utils/logger.py:trace_launch_motion` (2026-05-20). The aggregator now consumes `trace_fleets` outcomes directly (the env's ground-truth fleet lifecycle) instead of re-simulating physics. Mapping: `captured`/`reinforced`/`annihilated` → `ok`; `destroyed_sun` → `sun`; `out_of_map` → `boundary`; `unknown` → `unknown`. Multi-target moves the env rejected (running ship pool exhausted) produce no record now (FIFO match against fleets via `(owner, launch_step, from_id)`). Verified on seed=1729 transformer_v2 vs physical_v4: analyzer reports `boundary=44, sun=11` matching env's `out_of_map=44, destroyed_sun=11` exactly. `_first_collision_for_launch` is no longer called — kept as an optional diagnostic helper. (The original symptom was 0% reported miss rate vs ~15% real — caused by cumulative orbital-rotation drift between the local simulator and the env's absolute-angle planet positions.)
 6. **Performance degrades on large maps** — agent plays competently on seeds with fewer planets (~16-24 real planets, common static-heavy generations) but stops scaling on maps with the maximum number of planet groups (~40 planets, multiple orbital rings + comet spawns). Hypotheses: (a) **training distribution skew** — bow+Ebi's 555 replays may under-represent maximal-planet seeds, so the model never learned how to spread surplus across many fronts; (b) **per-cell pair_logits calibration shifts with P** — with `pos_weight=600` BCE trained against an average of ~30 valid cells per source, the absolute logit magnitude depends on local pair density, so the `> 2.0` inference threshold may be miscalibrated when the planet count doubles (more competing targets dilute confidence); (c) **L2/L4 attention saturation** — the planet↔planet self-attention sees 40+ tokens (vs ~16-20 typical) and may not have learned to allocate attention budget across that many entities cleanly; the model was trained with `max_planets=64` padding but the *actual* P distribution in training data is skewed low; (d) **action-budget mismatch** — the multi-target threshold rule scales linearly with active source count, so a 40-planet map can issue 10+ launches/turn while bow+Ebi typically issued 2-3; the model never saw rollouts with that launch density. Investigation candidates: bucket the eval-seed panel by P and report win rate per bucket; histogram pair_logits by snapshot P at val time to confirm the calibration shift; check whether physical_v4 also degrades on large maps (if yes, it's an env-difficulty axis; if no, it's a learning gap).
+7. ~~**Eval seed panel was not actually deterministic**~~ — fixed in `utils/runner.py:run_match` (2026-06-02). The Kaggle config seed was passed through, but `orbit_wars.py` also uses module-level Python `random`, so two machines could report the same seed list while generating different maps. `run_match()` now calls `random.seed(seed)` before `make("orbit_wars", configuration={"seed": seed})`; Machine B was also pinned back to `kaggle-environments==1.28.1` to match Machine A. Re-check: the 5-game latest L3/L4 PairHead eval vs `physical_v4` now matches exactly on A and B for seeds `[5199, 2083, 3493, 1649, 3233]`, including map hashes and outcomes: 3 wins / 0 draws / 2 losses.
+8. **PairHead actor over-reinforces same-owner corridors and loses mid-game production control** — in the seed-fixed latest model eval (`Lall_L3L4_novalue_top4T10_dropbad`, replays under `data/runs/play_Lall_L3L4_vs_physical_v4_seedfixed_A_20260602/replays`), the agent's opening is not the main failure. It expands, then falls into high-volume self-shipping loops while `physical_v4` takes contested production. Loss seed 1649: at t75 the agent is still even/ahead (`15 planets / 45 prod` vs `15 / 35`), but by t150 it is behind (`10 / 28` vs `22 / 64`) and finishes at `2 / 6` vs `30 / 86`; of 157,899 launched ships, 149,070 went to same-owner targets and only 4,337 to enemy targets. Loss seed 3233 is similar: t150 `7 / 24` vs `17 / 64`, final wipe; of 143,259 launched ships, 139,678 went same-owner and only 1,722 to enemy targets. Top loop corridors are symmetric shuttles such as `6->22->6`, `22->2->22`, `21->9->21`, and `9->5->9`. Fix candidates: ownership-conditioned same-owner target gating unless a defense need is detected, per-corridor cooldown / top-k cap, an explicit action-type head (`expand` / `attack` / `reinforce` / `defend` / `no-op`), and a value or map-control signal so the policy learns when to switch from reinforcement to denying enemy production.
 
 
 
@@ -309,12 +334,16 @@ protocol lives in [`docs/PPO_TWO_CPU_PROTOCOL.md`](docs/PPO_TWO_CPU_PROTOCOL.md)
 the algorithm-level sketch lives in [`PPO_PSEUDOCODE.md`](PPO_PSEUDOCODE.md).
 This section is the design overview.
 
+> **Current PPO critic design:** the critic branches from **L1**, not actor L2.
+> The old 3-Linear `value_head(glob)` path is debug-only. Production PPO uses
+> `actor L1 tokens -> separate critic L2 -> PlayerConsolidator -> ValueDecoder`.
+
 ### What PPO adds
 
 **Actor = the existing `pair_logits` and `pair_frac` outputs from `PairHead`.
-No new actor heads.** Critic is a new 3-Linear MLP `value_head` reading L2's
-`glob`. PPO's only new parameters are `value_head` (~132 k); everything else
-PPO trains is an existing supervised parameter.
+No new actor heads.** Critic is a separate `CrossEntityCriticModel` attached
+to actor L1. It runs critic L2 + `PlayerConsolidator` and trains the
+`ValueDecoder`; actor L2/L3/L4 are not the critic attachment point.
 
 **Preconditions on the supervised PairHead ckpt that PPO bootstraps from:**
 
@@ -397,9 +426,13 @@ starting PPO. Details in "PairHead minimum depths" below.
    ═════════════════ │ ════════════════════════════════════════════════
    GRADIENT FLOW    (during ppo_update)
                      │
-   value_loss   ───► value_head ──► glob ──► [L2 frozen P0/1; unfrozen P2]
+   value_loss   ───► critic ValueDecoder
+                       ↑
+                    critic L2 + PlayerConsolidator
+                       ↑
+                    actor L1 tokens
 
-   policy_loss  ───► (NOT into value_head)
+   policy_loss  ───► (NOT into critic ValueDecoder)
    entropy      ───► pair_logits, pair_frac (output Linears) ─► PairHead trunk
    bc_loss      ───►                                              (Phase 1+)
                                                                    │
@@ -409,24 +442,21 @@ starting PPO. Details in "PairHead minimum depths" below.
                                                                    │  Phase 1+
                                                             ─► L2  Phase 2 only
 
-   Critic and actor share L2 (read-only until Phase 2). No other coupling.
+   Critic branches from actor L1 and owns critic L2 + PlayerConsolidator.
+   Actor L2/L3/L4 are not the value scaffold.
    BC anchor (pair_cache → bce(pair_logits, expert)) lives ONLY on A's
    gradient in distributed Phase 1+; bc_coef doubles 0.05 → 0.10 to keep
    effective weight after averaging.
 ```
 
 **Why this split:**
-- **Decoupled gradients.** Value-loss never enters L3/L4/PairHead. Actor-loss
-  never enters `value_head`. Each head optimizes its own objective without
-  the other's noise.
-- **glob is the right signal for V(s).** L2's CLS already summarizes the board
-  (frontiers, balance, threats). Pulling role-aware or pair-aware tokens into
-  the value head would add variance without changing what's predictable.
-- **3-Linear value MLP.** `glob` is a 256-d summary; a single Linear is too
-  shallow to model V(s) as a non-linear function of board state. Two GELU
-  non-linearities + 3 weight matrices give the critic enough capacity to
-  learn "this board geometry / ship balance is winning" without leaking into
-  the actor.
+- **Decoupled gradients.** Value-loss enters the critic `ValueDecoder`, not
+  L3/L4/PairHead. Actor-loss never enters the critic.
+- **L1 is the critic branch point.** It preserves entity/fleet perception
+  without forcing value learning through actor-side L2/L3/L4 source-target
+  specialization.
+- **Critic ValueDecoder.** The critic's own L2 + PlayerConsolidator build the
+  player-level state; PPO fine-tunes only the ValueDecoder in Phase 0.
 - **Cleaner Phase-2 transition.** When L2 eventually unfreezes, value-loss
   on L2 is a single well-conditioned scalar-regression signal — much
   friendlier than the multi-head action zoo PairHead would dump on L2.

@@ -195,6 +195,12 @@ class PairHead(nn.Module):
         self.register_load_state_dict_post_hook(
             self._upgrade_dead_film_alpha_after_load,
         )
+        # Runtime toggle (NOT a constructor arg, so it never touches the
+        # state_dict): when True, ``forward`` skips the FiLM modulation
+        # entirely and feeds the bare trunk output ``h`` to the heads
+        # (h_film = h). Used to A/B the FiLM contribution at inference on
+        # an already-trained ckpt — set ``pair_head.disable_film = True``.
+        self.disable_film = False
 
         # ---- Two heads --------------------------------------------------------
         # ``head_n_layers`` controls depth of each per-head decoder MLP:
@@ -262,6 +268,15 @@ class PairHead(nn.Module):
             feats.append(pair_scalars)
         feat = torch.cat(feats, dim=-1)            # (B, P, P, 6·d_pair + c_sc)
         h = self.trunk(feat)                       # (B, P, P, trunk_hidden)
+
+        # ---- FiLM bypass ----
+        # Inference-time ablation: skip the conditioner + modulation and
+        # score directly off the trunk output. Lets us A/B "with FiLM" vs
+        # "without FiLM" on the SAME trained weights.
+        if self.disable_film:
+            pair_logits = self.pair_head(h).squeeze(-1)
+            pair_frac = self.pair_frac_head(h).squeeze(-1)
+            return {"pair_logits": pair_logits, "pair_frac": pair_frac}
 
         # ---- FiLM conditioner ----
         # Broadcast L1 tokens + 27-way pair-type embedding across (P, P).

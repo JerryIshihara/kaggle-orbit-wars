@@ -1,9 +1,9 @@
 """Parallel source/target role-conditioned cross-attention.
 
-Sits one level above ``CrossEntityAttention``. The cross-entity layer
-gives every planet a token contextualized over the global game state
-(``ctx_now``). This layer adds two **parallel** role-aware views on
-top:
+Sits one level above ``CrossEntityAttention``. The cross-entity layer is the
+end of world perception: every planet already has a token contextualized over
+the global game state (``ctx_now``). This module is part of the current compact
+post-perception ActionLearner. It adds two **parallel** role-aware views:
 
   * **source-to-target** — each planet in its *source* role attends to
     every other planet in its *target* role, learning "if I launch from

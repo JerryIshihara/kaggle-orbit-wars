@@ -27,6 +27,7 @@ For the factorized BC:
 from __future__ import annotations
 
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -56,19 +57,25 @@ class BCCacheSampler:
         if not self.cache_path.exists():
             raise FileNotFoundError(f"pair cache not found: {self.cache_path}")
         self.device = device
+        t0 = time.time()
         print(f"[bc] loading pair cache from {self.cache_path} ...", flush=True)
         self.dataset = CachedPairDataset(self.cache_path)
+        load_sec = time.time() - t0
         # Filter to acted snapshots (any expert positive) by default —
         # the BC source-categorical needs both NOOP and acted samples,
         # but a cache without ACTING snapshots starves the target loss.
         self.indices: list[int] = list(range(len(self.dataset)))
         if acted_only:
-            self.indices = [
-                i for i in self.indices
-                if bool(self.dataset.snapshots[i]["pair_labels"].any())
-            ]
+            acted = getattr(self.dataset, "acted_indices", None)
+            if acted is not None:
+                self.indices = list(acted)
+            else:
+                self.indices = [
+                    i for i in self.indices
+                    if bool(self.dataset.snapshots[i]["pair_labels"].any())
+                ]
         print(f"[bc] available: {len(self.indices)} snapshots "
-              f"(acted_only={acted_only})", flush=True)
+              f"(acted_only={acted_only}, load_sec={load_sec:.1f})", flush=True)
 
     def __len__(self) -> int:
         return len(self.indices)

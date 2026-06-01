@@ -5,7 +5,10 @@ Phase 0 minimal-actor implementation matching the design captured in
 
   * actor = the existing ``pair_logits`` and ``pair_frac`` outputs of the
     supervised ``PairHead`` (no new actor heads)
-  * critic = a single new 3-Linear MLP ``value_head`` reading L2's ``glob``
+  * critic = mean pairwise ``PairCompareHead`` probability from learner slot
+    0 to valid opponent slots, using post-L2 ``PlayerConsolidator`` state plus
+    L2 ``glob``. If the actor ckpt has no consolidator, the old L2 ``glob``
+    value_head is an explicit debug fallback.
   * action contract = ``source_multi_target_v1`` (NOOP-or-source categorical
     then per-source Bernoulli target bits + logit-normal frac with fixed sigma)
   * BC anchor = factorized to match the action contract
