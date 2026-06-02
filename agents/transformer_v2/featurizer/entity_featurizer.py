@@ -386,15 +386,25 @@ def _cross_entity_label_columns() -> list[str]:
         cols.append(f"final_rank_{s}")
     for s in range(NUM_OWNER_SLOTS):
         cols.append(f"player_valid_{s}")
+    for s in range(NUM_OWNER_SLOTS):
+        cols.append(f"final_score_adv_{s}")
     # Tier-3d per-turn temporal momentum (anti-shortcut anchors for the
     # prior/posterior critic). Vary with t (NOT broadcast).
     for s in range(NUM_OWNER_SLOTS):
         cols.append(f"dships_back_{s}")
+    for s in range(NUM_OWNER_SLOTS):
+        cols.append(f"dplanets_back_{s}")
+    for s in range(NUM_OWNER_SLOTS):
+        cols.append(f"trend_back_{s}")
     cols.append("score_adv_slope_back")
+    cols.append("valid_back")
     for s in range(NUM_OWNER_SLOTS):
         cols.append(f"dships_fwd_{s}")
     for s in range(NUM_OWNER_SLOTS):
         cols.append(f"survives_fwd_{s}")
+    for s in range(NUM_OWNER_SLOTS):
+        cols.append(f"future_score_adv_{s}")
+    cols.append("score_adv_slope_fwd")
     cols.append("valid_fwd")
     # Tier-3b neutral game-level (player-perspective-independent)
     cols.append("total_ships_in_play_log")
@@ -456,6 +466,18 @@ def _snapshot_totals(obs: dict[str, Any] | None, *, num_players: int) -> list[in
         if 0 <= owner < num_players:
             totals[owner] += int(f[F_SHIPS])
     return totals
+
+
+def _snapshot_planet_counts(obs: dict[str, Any] | None, *, num_players: int) -> list[int]:
+    """Owned real-planet counts per player from one observation."""
+    counts = [0] * num_players
+    if not obs:
+        return counts
+    for p in obs.get("planets") or []:
+        owner = int(p[P_OWNER])
+        if 0 <= owner < num_players:
+            counts[owner] += 1
+    return counts
 
 
 # ---------- Player-perspective-independent (neutral) global labels ----------
@@ -568,6 +590,33 @@ def _score_advantage_from_totals(
     return signed_log1p(learner_total - others_max) / SHIPS_LOG_MAX
 
 
+def _score_adv_norm_from_totals(
+    totals: list[int],
+    *,
+    seat: int,
+    num_players: int,
+) -> float:
+    own = totals[seat] if 0 <= seat < num_players else 0
+    others_max = max((totals[i] for i in range(num_players) if i != seat), default=0)
+    denom = max(1, sum(totals[:num_players]))
+    return float((own - others_max) / denom)
+
+
+def _per_player_score_adv_norm_from_totals(
+    totals: list[int],
+    *,
+    learner_slot: int,
+    num_players: int,
+) -> list[float]:
+    out = [0.0] * NUM_OWNER_SLOTS
+    for seat in range(num_players):
+        rel = (seat - learner_slot) % num_players
+        out[rel] = _score_adv_norm_from_totals(
+            totals, seat=seat, num_players=num_players,
+        )
+    return out
+
+
 def _final_rank_from_steps(
     steps: list,
     *,
@@ -637,6 +686,7 @@ def _temporal_deltas_from_steps(
     *,
     learner_slot: int,
     num_players: int,
+    max_planets: int | None = None,
 ) -> dict[str, float]:
     """Per-turn momentum labels that are UNcomputable from S_t alone.
 
@@ -655,40 +705,108 @@ def _temporal_deltas_from_steps(
     """
     obs_t = _step_obs(steps, t, learner_slot=learner_slot)
     totals_t = _snapshot_totals(obs_t, num_players=num_players)
-    tb = max(0, t - DELTA_K_BACK)
-    totals_b = _snapshot_totals(
-        _step_obs(steps, tb, learner_slot=learner_slot), num_players=num_players,
-    )
+    planets_t = _snapshot_planet_counts(obs_t, num_players=num_players)
+
+    tb_raw = t - DELTA_K_BACK
+    valid_back = 1.0 if tb_raw >= 0 else 0.0
+    tb = max(0, tb_raw)
+    obs_b = _step_obs(steps, tb, learner_slot=learner_slot)
+    totals_b = _snapshot_totals(obs_b, num_players=num_players)
+    planets_b = _snapshot_planet_counts(obs_b, num_players=num_players)
+
     obs_f = _step_obs(steps, t + DELTA_K_FWD, learner_slot=learner_slot)
     valid_fwd = 1.0 if obs_f else 0.0
     totals_f = (
         _snapshot_totals(obs_f, num_players=num_players) if obs_f else list(totals_t)
     )
+    planet_den = max(1, int(max_planets or 0))
+    for obs in (obs_t, obs_b, obs_f):
+        if obs:
+            planet_den = max(planet_den, len(obs.get("planets") or []))
 
-    def _score_adv(totals: list[int]) -> float:
+    def _ols_slope(vals: list[float]) -> float:
+        n = len(vals)
+        if n < 2:
+            return 0.0
+        mean_x = (n - 1) / 2.0
+        mean_y = sum(vals) / n
+        den = sum((i - mean_x) ** 2 for i in range(n))
+        if den <= 0.0:
+            return 0.0
+        num = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(vals))
+        return float(num / den)
+
+    def _totals_at(tt: int) -> list[int]:
+        return _snapshot_totals(
+            _step_obs(steps, tt, learner_slot=learner_slot),
+            num_players=num_players,
+        )
+
+    def _ship_share_series(seat: int, start: int, end: int) -> list[float]:
+        vals: list[float] = []
+        for tt in range(start, end + 1):
+            totals = _totals_at(tt)
+            denom = max(1, sum(totals[:num_players]))
+            vals.append(float(totals[seat] / denom))
+        return vals
+
+    def _score_adv_series(start: int, end: int) -> list[float]:
+        vals: list[float] = []
+        for tt in range(start, end + 1):
+            totals = _totals_at(tt)
+            vals.append(
+                _score_adv_norm_from_totals(
+                    totals, seat=learner_slot, num_players=num_players,
+                )
+            )
+        return vals
+
+    def _score_adv_signed_log(totals: list[int]) -> float:
         lt = totals[learner_slot] if 0 <= learner_slot < num_players else 0
         om = max((totals[i] for i in range(num_players) if i != learner_slot), default=0)
         return signed_log1p(lt - om) / SHIPS_LOG_MAX
 
+    back_start = t - DELTA_K_BACK
+    if back_start < 0:
+        back_start = t
+    fwd_end = t + DELTA_K_FWD if valid_fwd > 0.0 else t
+
     out: dict[str, float] = {
         "score_adv_slope_back": float(
-            (_score_adv(totals_t) - _score_adv(totals_b)) / max(1, t - tb)
+            (_score_adv_signed_log(totals_t) - _score_adv_signed_log(totals_b))
+            / max(1, t - tb)
         ),
+        "score_adv_slope_fwd": float(_ols_slope(_score_adv_series(t, fwd_end))),
+        "valid_back": float(valid_back),
         "valid_fwd": float(valid_fwd),
     }
     for s in range(NUM_OWNER_SLOTS):
         out[f"dships_back_{s}"] = 0.0
+        out[f"dplanets_back_{s}"] = 0.0
+        out[f"trend_back_{s}"] = 1.0
         out[f"dships_fwd_{s}"] = 0.0
         out[f"survives_fwd_{s}"] = 0.0
+        out[f"future_score_adv_{s}"] = 0.0
     for seat in range(num_players):
         rel = (seat - learner_slot) % num_players
         out[f"dships_back_{rel}"] = float(
             signed_log1p(totals_t[seat] - totals_b[seat]) / SHIPS_LOG_MAX
         )
+        out[f"dplanets_back_{rel}"] = float(
+            (planets_t[seat] - planets_b[seat]) / planet_den
+        )
+        slope = _ols_slope(_ship_share_series(seat, back_start, t))
+        out[f"trend_back_{rel}"] = 0.0 if slope < -1e-3 else (2.0 if slope > 1e-3 else 1.0)
         out[f"dships_fwd_{rel}"] = float(
             signed_log1p(totals_f[seat] - totals_t[seat]) / SHIPS_LOG_MAX
         )
         out[f"survives_fwd_{rel}"] = float(valid_fwd > 0.0 and totals_f[seat] > 0)
+        out[f"future_score_adv_{rel}"] = float(
+            _score_adv_norm_from_totals(
+                totals_f, seat=seat, num_players=num_players,
+            )
+            if valid_fwd > 0.0 else 0.0
+        )
     return out
 
 
@@ -902,6 +1020,7 @@ def _compute_episode_summary(
     )
     rank_cols = {f"final_rank_{s}": int(final_rank[s]) for s in range(NUM_OWNER_SLOTS)}
     valid_cols = {f"player_valid_{s}": int(player_valid[s]) for s in range(NUM_OWNER_SLOTS)}
+    final_score_cols = {f"final_score_adv_{s}": 0.0 for s in range(NUM_OWNER_SLOTS)}
 
     last = len(steps) - 1
     while last >= 0 and not steps[last]:
@@ -910,14 +1029,14 @@ def _compute_episode_summary(
         return {
             "winner_seat": NUM_OWNER_SLOTS,
             "score_advantage_at_end_log": 0.0,
-            **rank_cols, **valid_cols,
+            **rank_cols, **valid_cols, **final_score_cols,
         }
     obs = _step_obs(steps, last, learner_slot=learner_slot)
     if not obs:
         return {
             "winner_seat": NUM_OWNER_SLOTS,
             "score_advantage_at_end_log": 0.0,
-            **rank_cols, **valid_cols,
+            **rank_cols, **valid_cols, **final_score_cols,
         }
     totals = _snapshot_totals(obs, num_players=num_players)
     winner_class = _winner_class_from_totals(
@@ -930,11 +1049,20 @@ def _compute_episode_summary(
         learner_slot=learner_slot,
         num_players=num_players,
     )
+    final_score_adv = _per_player_score_adv_norm_from_totals(
+        totals,
+        learner_slot=learner_slot,
+        num_players=num_players,
+    )
+    final_score_cols = {
+        f"final_score_adv_{s}": float(final_score_adv[s])
+        for s in range(NUM_OWNER_SLOTS)
+    }
 
     return {
         "winner_seat": int(winner_class),
         "score_advantage_at_end_log": float(advantage),
-        **rank_cols, **valid_cols,
+        **rank_cols, **valid_cols, **final_score_cols,
     }
 
 
@@ -1243,7 +1371,11 @@ def save_episode_cross_entity_csv(
                 num_players=num_players,
             )
             temporal_deltas = _temporal_deltas_from_steps(
-                steps, t, learner_slot=learner_slot, num_players=num_players,
+                steps,
+                t,
+                learner_slot=learner_slot,
+                num_players=num_players,
+                max_planets=max_entities,
             )
             neutral_global = _compute_neutral_global_labels(
                 obs, num_players=num_players, turn=t,
@@ -1282,10 +1414,16 @@ def save_episode_cross_entity_csv(
                     ],
                     *[episode_summary[f"final_rank_{s}"] for s in range(NUM_OWNER_SLOTS)],
                     *[episode_summary[f"player_valid_{s}"] for s in range(NUM_OWNER_SLOTS)],
+                    *[episode_summary[f"final_score_adv_{s}"] for s in range(NUM_OWNER_SLOTS)],
                     *[temporal_deltas[f"dships_back_{s}"] for s in range(NUM_OWNER_SLOTS)],
+                    *[temporal_deltas[f"dplanets_back_{s}"] for s in range(NUM_OWNER_SLOTS)],
+                    *[temporal_deltas[f"trend_back_{s}"] for s in range(NUM_OWNER_SLOTS)],
                     temporal_deltas["score_adv_slope_back"],
+                    temporal_deltas["valid_back"],
                     *[temporal_deltas[f"dships_fwd_{s}"] for s in range(NUM_OWNER_SLOTS)],
                     *[temporal_deltas[f"survives_fwd_{s}"] for s in range(NUM_OWNER_SLOTS)],
+                    *[temporal_deltas[f"future_score_adv_{s}"] for s in range(NUM_OWNER_SLOTS)],
+                    temporal_deltas["score_adv_slope_fwd"],
                     temporal_deltas["valid_fwd"],
                     neutral_global["total_ships_in_play_log"],
                     neutral_global["ship_distribution_entropy"],

@@ -758,6 +758,9 @@ class EntityPretrainModel(nn.Module):
         head_n_layers: int = 1,
         skip_l34: bool = False,
         with_consolidator: bool = True,
+        with_value_heads: bool = False,
+        value_trunk_n_layers: int = 2,
+        value_head_n_layers: int = 2,
     ):
         super().__init__()
         self.d_model = d_model
@@ -880,6 +883,28 @@ class EntityPretrainModel(nn.Module):
             dropout=dropout,
         )
 
+        # Explicit value-pretrain heads (the /tmp value_pretrain_design.md set,
+        # factored into value_heads.ValuePretrainHeads). They branch off the
+        # SAME L2 backbone via the PlayerConsolidator's player_state, so the
+        # action head (PairHead, off L3/L4) and the value heads train jointly
+        # over one shared L2. Requires the consolidator.
+        self.with_value_heads = bool(with_value_heads)
+        if self.with_value_heads:
+            if not self.with_consolidator:
+                raise ValueError(
+                    "with_value_heads=True requires with_consolidator=True "
+                    "(the value branch reads player_state off L2)."
+                )
+            from .value_heads import ValuePretrainHeads
+            self.value_heads = ValuePretrainHeads(
+                d_model,
+                trunk_n_layers=value_trunk_n_layers,
+                head_n_layers=value_head_n_layers,
+                dropout=dropout,
+            )
+        else:
+            self.value_heads = None
+
     # ------------------------------------------------------------------ #
     # Freeze / unfreeze helpers                                          #
     # ------------------------------------------------------------------ #
@@ -950,6 +975,32 @@ class EntityPretrainModel(nn.Module):
                 p.requires_grad_(True)
             frozen[f"{name} (trainable)"] = sum(p.numel() for p in module.parameters())
         return frozen
+
+    def freeze_below_l2(self) -> dict[str, int]:
+        """Joint-training freeze ("L2~ unfreeze"): L0 (external) + L1 frozen;
+        L2 and everything above trainable.
+
+        Trainable: L2 (cross), L3 (dual_role), L4 (joint_role), PairHead,
+        PlayerConsolidator, and the value heads — so the action branch
+        (PairHead off L3/L4) and the value branch (value heads off the
+        consolidator) co-adapt the ONE shared L2. L0 specialists stay frozen
+        externally (``_load_encoders``). Returns ``{group: param_count}``.
+        """
+        report = self.freeze_l1_only()       # L1 frozen; L2/L3/L4 trainable
+        for name, module in (
+            ("pair_head", self.pair_head),
+            ("consolidator", self.consolidator),
+            ("value_heads", self.value_heads),
+        ):
+            if module is None:
+                report[f"{name} (trainable)"] = 0
+                continue
+            for p in module.parameters():
+                p.requires_grad_(True)
+            report[f"{name} (trainable)"] = sum(
+                p.numel() for p in module.parameters()
+            )
+        return report
 
     def forward(
         self,
@@ -1200,7 +1251,7 @@ class EntityPretrainModel(nn.Module):
             pair_type_ids=pair_type_now,
             pair_valid=pair_valid,
         )
-        return {
+        out = {
             "pair_logits": heads["pair_logits"],
             "pair_frac": heads["pair_frac"],
             "glob": glob,
@@ -1210,6 +1261,12 @@ class EntityPretrainModel(nn.Module):
             "target_joint": target_joint,
             "l1_now": l1_now,
         }
+        # Value branch off the SAME L2 (via player_state). Keys merge in
+        # alongside the action heads so one forward yields both action and
+        # value predictions for joint training.
+        if self.value_heads is not None and player_state is not None:
+            out.update(self.value_heads(glob, player_state))
+        return out
 
 
 # ---------- Loss ----------
@@ -1455,6 +1512,154 @@ def _ppo_frac_logit_loss(
     return sq_err[pos_mask].mean()
 
 
+def _owned_source_rows(
+    batch: dict[str, torch.Tensor],
+    pair_valid: torch.Tensor,
+) -> torch.Tensor:
+    """Learner-owned, present planets — the per-source target rows.
+
+    Every owned planet decides hold (NOOP=diagonal) or launch (one target),
+    so — unlike :func:`_ppo_source_mask_from_batch` — holders with no valid
+    off-diagonal target are KEPT (they supervise the NOOP/diagonal slot).
+    Falls back to ``pair_valid.any(dim=2)`` when planet features/mask are
+    missing (older / unit-test batches).
+    """
+    planet_features = batch.get("planet_features")
+    planet_mask = batch.get("planet_mask")
+    if planet_features is None or planet_mask is None:
+        return pair_valid.any(dim=2)
+    pf = _current_planet_features(planet_features)
+    pm = planet_mask[:, -1] if planet_mask.dim() == 3 else planet_mask
+    own_source = pf[..., _PLANET_OWNER_START_IDX] > 0.5
+    return own_source & pm.bool()
+
+
+def _pair_single_target_ce(
+    pair_logits: torch.Tensor,         # (B, P, P)
+    batch: dict[str, torch.Tensor],
+    pair_labels: torch.Tensor,         # (B, P, P) bool — off-diagonal launches
+    pair_valid: torch.Tensor,          # (B, P, P) bool — off-diagonal legal pairs
+    *,
+    launch_weight: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Per-source single-target categorical with the diagonal as NOOP/hold.
+
+    Each learner-owned source row ``s`` is one Categorical over the P target
+    columns INCLUDING the diagonal ``[s, s]``:
+
+      * diagonal wins      -> planet ``s`` holds (NOOP),
+      * column ``t != s``  -> launch ``s -> t``.
+
+    Expert label per owned row:
+      * acted (>=1 off-diagonal positive) -> the dominant target
+        (largest ``pair_ships``; ties -> lowest index),
+      * held (no positive)                -> the diagonal ``s`` (NOOP).
+
+    Rows flagged acting by ``is_source_this_turn`` whose target fell outside
+    the P-planet window (no in-grid positive) are DROPPED, not mislabeled
+    NOOP. Returns ``(ce_mean, chosen_cell_mask, diag)`` where
+    ``chosen_cell_mask (B,P,P) bool`` marks the single chosen off-diagonal
+    target per acted row (consumed by the frac loss; the diagonal is never
+    in it, so no frac is trained on a hold). ``diag`` carries scalar means
+    (train logging) plus raw counts (eval aggregation).
+    """
+    B, P, _ = pair_logits.shape
+    device = pair_logits.device
+    eye = torch.eye(P, dtype=torch.bool, device=device).unsqueeze(0)   # (1,P,P)
+
+    pos = pair_labels & pair_valid                        # off-diagonal positives
+    row_has_pos = pos.any(dim=2)                           # (B,P)
+
+    if "pair_ships" in batch:
+        score = batch["pair_ships"].float()
+    else:
+        score = pair_labels.float()
+    score = score.masked_fill(~pos, -1.0)
+    dom_t = score.argmax(dim=2)                            # (B,P) valid iff row_has_pos
+    diag_idx = torch.arange(P, device=device).expand(B, P)
+    label = torch.where(row_has_pos, dom_t, diag_idx)     # (B,P)
+
+    owned = _owned_source_rows(batch, pair_valid)         # (B,P)
+    diag_valid = eye & owned.unsqueeze(2)                 # diagonal on owned rows
+    col_valid = pair_valid | diag_valid                   # (B,P,P)
+    row_logits = pair_logits.masked_fill(~col_valid, float("-inf"))
+
+    active = owned.clone()
+    if "is_source_this_turn" in batch:
+        acted_flag = batch["is_source_this_turn"] > 0.5
+        active = active & ~(acted_flag & ~row_has_pos)    # drop out-of-window acts
+
+    empty = {
+        "pair_ce": 0.0, "pair_acc": float("nan"),
+        "noop_acc": float("nan"), "launch_acc": float("nan"),
+        "n_rows": 0, "n_correct": 0, "n_noop": 0, "n_noop_correct": 0,
+        "n_launch": 0, "n_launch_correct": 0,
+        "rk1": 0, "rk5": 0, "rk10": 0, "ce_sum": 0.0,
+    }
+    if not bool(active.any()):
+        return pair_logits.new_zeros(()), torch.zeros_like(pair_labels), empty
+
+    rl = row_logits[active]                                # (N,P) -inf on invalid cols
+    lab = label[active]                                    # (N,)
+    active_bs = torch.nonzero(active, as_tuple=False)      # (N,2) [b,s] row-major
+    src_of_row = active_bs[:, 1]                           # (N,)
+    launch_sel = lab != src_of_row                         # (N,) launch vs NOOP(diagonal)
+    noop_sel = ~launch_sel
+
+    # Row-softmax CE. Optionally up-weight launch rows so the (usually
+    # dominant) NOOP/hold rows don't drown the launch signal — the
+    # single-target analogue of the old per-cell BCE pos_weight.
+    # launch_weight=1.0 is the plain mean.
+    if launch_weight != 1.0:
+        per_row = F.cross_entropy(rl, lab, reduction="none")     # (N,)
+        w = torch.where(
+            launch_sel,
+            torch.full_like(per_row, float(launch_weight)),
+            torch.ones_like(per_row),
+        )
+        ce = (per_row * w).sum() / w.sum().clamp(min=1.0)
+    else:
+        ce = F.cross_entropy(rl, lab)
+
+    # Single chosen off-diagonal cell per launch row (frac supervision only).
+    launch_rows = active & row_has_pos                    # (B,P)
+    chosen = torch.zeros_like(pair_labels)
+    if bool(launch_rows.any()):
+        bi, si = torch.nonzero(launch_rows, as_tuple=True)
+        chosen[bi, si, dom_t[bi, si]] = True
+
+    with torch.no_grad():
+        pred = rl.argmax(dim=1)                            # (N,)
+        n_rows = int(lab.numel())
+        n_correct = int((pred == lab).sum())
+        n_noop = int(noop_sel.sum())
+        n_noop_correct = int((pred[noop_sel] == lab[noop_sel]).sum()) if n_noop else 0
+        n_launch = int(launch_sel.sum())
+        n_launch_correct = (
+            int((pred[launch_sel] == lab[launch_sel]).sum()) if n_launch else 0
+        )
+        rk = {1: 0, 5: 0, 10: 0}
+        if n_launch:
+            lr = rl[launch_sel]                            # (Nl,P)
+            ld = lab[launch_sel]                           # (Nl,) dominant target
+            for k in rk:
+                topk = lr.topk(min(k, P), dim=1).indices
+                rk[k] = int((topk == ld[:, None]).any(dim=1).sum())
+
+    diag = {
+        "pair_ce": float(ce.detach()),
+        "pair_acc": n_correct / max(1, n_rows),
+        "noop_acc": (n_noop_correct / n_noop) if n_noop else float("nan"),
+        "launch_acc": (n_launch_correct / n_launch) if n_launch else float("nan"),
+        "n_rows": n_rows, "n_correct": n_correct,
+        "n_noop": n_noop, "n_noop_correct": n_noop_correct,
+        "n_launch": n_launch, "n_launch_correct": n_launch_correct,
+        "rk1": rk[1], "rk5": rk[5], "rk10": rk[10],
+        "ce_sum": float(ce.detach()) * n_rows,
+    }
+    return ce, chosen, diag
+
+
 def compute_multi_loss(
     preds: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
@@ -1463,6 +1668,8 @@ def compute_multi_loss(
     ppo_source_weight: float = 1.0,
     ppo_target_weight: float = 1.0,
     ppo_frac_logit_weight: float = 0.0,
+    single_target: bool = False,
+    single_target_launch_weight: float = 1.0,
     enabled_heads: tuple[str, ...] | None = None,
     # Accepted-but-ignored knobs from the legacy aux-head API. Kept so the
     # train CLI + Colab notebook can still pass them as no-ops while older
@@ -1506,6 +1713,34 @@ def compute_multi_loss(
     pair_logits = preds["pair_logits"]
     pair_labels = batch["pair_labels"].bool()
     pair_valid = batch["pair_valid"].bool()
+
+    # 0) Single-target-per-source contract (diagonal = NOOP). Replaces the
+    # per-cell Bernoulli BCE + factorized_bc with ONE row-softmax CE per
+    # owned source: pick the dominant target or hold (the diagonal). The
+    # frac is supervised ONLY on the single chosen off-diagonal target — a
+    # hold (diagonal) trains no frac.
+    if single_target:
+        ce, chosen, ce_diag = _pair_single_target_ce(
+            pair_logits, batch, pair_labels, pair_valid,
+            launch_weight=single_target_launch_weight,
+        )
+        if "pair_logits" in enabled_heads:
+            per_head["pair_logits"] = ce_diag["pair_ce"]
+            per_head["pair_acc"] = ce_diag["pair_acc"]
+            per_head["noop_acc"] = ce_diag["noop_acc"]
+            per_head["launch_acc"] = ce_diag["launch_acc"]
+            total = total + ce
+        if "pair_frac" in enabled_heads and "pair_ships" in batch:
+            ships = batch["pair_ships"].float()
+            target_frac = _pair_frac_targets_from_batch(batch, ships)
+            pos_mask = chosen.to(pair_logits.dtype)
+            sq_err = (torch.sigmoid(preds["pair_frac"]) - target_frac).pow(2)
+            loss_frac = (sq_err * pos_mask).sum() / pos_mask.sum().clamp(min=1.0)
+            per_head["pair_frac"] = float(loss_frac.detach())
+            total = total + loss_frac
+        elif "pair_frac" in enabled_heads:
+            per_head["pair_frac"] = float("nan")
+        return total, per_head
 
     # 1) pair_logits — masked BCE over (B, P, P).
     if "pair_logits" in enabled_heads:
@@ -1628,6 +1863,7 @@ def evaluate(
     ppo_source_weight: float = 1.0,
     ppo_target_weight: float = 1.0,
     ppo_frac_logit_weight: float = 0.0,
+    single_target: bool = False,
 ) -> dict[str, dict[str, float]]:
     """2-head metrics over the validation set.
 
@@ -1658,6 +1894,15 @@ def evaluate(
     row_rk_hits: dict[int, int] = {1: 0, 5: 0, 10: 0}
     pos_total = 0
 
+    # single-target-per-source accounting (diagonal = NOOP).
+    st_ce_sum = 0.0
+    st_rows = st_correct = 0
+    st_noop = st_noop_correct = 0
+    st_launch = st_launch_correct = 0
+    st_rk: dict[int, int] = {1: 0, 5: 0, 10: 0}
+    st_frac_se = 0.0
+    st_frac_n = 0
+
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
         planet_tok = planet_enc(batch["planet_features"])
@@ -1684,6 +1929,30 @@ def evaluate(
         pair_logits = preds["pair_logits"]               # (B, P, P)
         pair_labels = batch["pair_labels"].bool()        # (B, P, P)
         pair_valid = batch["pair_valid"].bool()          # (B, P, P)
+
+        # ---- single-target-per-source metrics (diagonal = NOOP) ----
+        if single_target:
+            _ce, chosen, st = _pair_single_target_ce(
+                pair_logits, batch, pair_labels, pair_valid,
+            )
+            st_ce_sum += st["ce_sum"]
+            st_rows += st["n_rows"]
+            st_correct += st["n_correct"]
+            st_noop += st["n_noop"]
+            st_noop_correct += st["n_noop_correct"]
+            st_launch += st["n_launch"]
+            st_launch_correct += st["n_launch_correct"]
+            st_rk[1] += st["rk1"]
+            st_rk[5] += st["rk5"]
+            st_rk[10] += st["rk10"]
+            if "pair_ships" in batch:
+                ships = batch["pair_ships"].float()
+                target_frac = _pair_frac_targets_from_batch(batch, ships)
+                pm_chosen = chosen.float()
+                sq = (torch.sigmoid(preds["pair_frac"]) - target_frac).pow(2)
+                st_frac_se += float((sq * pm_chosen).sum())
+                st_frac_n += int(pm_chosen.sum())
+            continue
 
         # ---- pair_logits ----
         bce = F.binary_cross_entropy_with_logits(
@@ -1757,6 +2026,28 @@ def evaluate(
                 preds, batch, pair_labels, pair_valid,
             )) * B
             ppo_frac_n += B
+
+    if single_target:
+        model.train()
+        pair_entry = {
+            "loss": st_ce_sum / max(1, st_rows),
+            "acc": st_correct / max(1, st_rows),
+            # rec_pos column = launch top-1 acc; rec_neg = NOOP top-1 acc.
+            "recall_true": (st_launch_correct / st_launch) if st_launch else float("nan"),
+            "recall_false": (st_noop_correct / st_noop) if st_noop else float("nan"),
+            "pos_frac": st_launch / max(1, st_rows),
+            # R@k = launch-target recall@k (dominant target in row top-k).
+            "recall_at_1": (st_rk[1] / st_launch) if st_launch else float("nan"),
+            "recall_at_5": (st_rk[5] / st_launch) if st_launch else float("nan"),
+            "recall_at_10": (st_rk[10] / st_launch) if st_launch else float("nan"),
+            "n_pos": float(st_launch),
+            "n_neg": float(st_noop),
+        }
+        frac_entry = (
+            {"loss": st_frac_se / max(1, st_frac_n), "n_pos": float(st_frac_n)}
+            if st_frac_n > 0 else {"loss": float("nan"), "n_pos": 0.0}
+        )
+        return {"pair_logits": pair_entry, "pair_frac": frac_entry}
 
     pos = bce_stats["tp"] + bce_stats["fn"]
     neg = bce_stats["tn"] + bce_stats["fp"]
@@ -2152,6 +2443,8 @@ def train(
     ppo_source_weight: float = 1.0,
     ppo_target_weight: float = 1.0,
     ppo_frac_logit_weight: float = 0.0,
+    single_target: bool = False,
+    single_target_launch_weight: float = 1.0,
     source_act_pos_weight: float = 1.0,
     target_aim_pos_weight: float = 1.0,
     glob_act_pos_weight: float = 1.0,
@@ -2499,6 +2792,12 @@ def train(
         "ppo_source_weight": ppo_source_weight,
         "ppo_target_weight": ppo_target_weight,
         "ppo_frac_logit_weight": ppo_frac_logit_weight,
+        "single_target": single_target,
+        "single_target_launch_weight": single_target_launch_weight,
+        "action_contract": (
+            "single_target_per_source_v1" if single_target
+            else "source_multi_target_v1"
+        ),
         "pair_type_num_classes": PAIR_TYPE_NUM_CLASSES,
         "history_offsets": list(history_offsets) if history_offsets is not None else None,
         "n_steps": n_steps,
@@ -2508,18 +2807,32 @@ def train(
             f"[entity-pretrain] history-stacked input: T={n_steps} "
             f"offsets={history_offsets} (oldest first; labels stay at t)"
         )
-    if pair_pos_weight != 1.0:
+    if single_target:
+        print(
+            "[entity-pretrain] action contract = single_target_per_source_v1: "
+            "per-source row-softmax CE over targets, the DIAGONAL [s,s] is the "
+            "NOOP/hold slot, one dominant target per acting source, frac trained "
+            "only on the chosen off-diagonal cell (pair_pos_weight / "
+            "ppo_*_weight are ignored in this mode)."
+        )
+        if single_target_launch_weight != 1.0:
+            print(
+                f"[entity-pretrain] single_target_launch_weight = "
+                f"{single_target_launch_weight} (launch rows up-weighted vs NOOP "
+                f"rows in the TRAIN CE; val/test CE stays unweighted)"
+            )
+    elif pair_pos_weight != 1.0:
         print(
             f"[entity-pretrain] pair-BCE pos_weight = {pair_pos_weight} "
             f"(applied to train loss; val/test loss stays unweighted)"
         )
-    if ppo_source_weight > 0.0 or ppo_target_weight > 0.0:
+    if not single_target and (ppo_source_weight > 0.0 or ppo_target_weight > 0.0):
         print(
             "[entity-pretrain] PPO-alignment loss enabled: "
             f"source_ce_weight={ppo_source_weight} "
             f"target_row_bce_weight={ppo_target_weight}"
         )
-    if ppo_frac_logit_weight > 0.0:
+    if not single_target and ppo_frac_logit_weight > 0.0:
         print(
             "[entity-pretrain] PPO frac row-share logit loss enabled: "
             f"weight={ppo_frac_logit_weight}"
@@ -2565,6 +2878,8 @@ def train(
                 ppo_source_weight=ppo_source_weight,
                 ppo_target_weight=ppo_target_weight,
                 ppo_frac_logit_weight=ppo_frac_logit_weight,
+                single_target=single_target,
+                single_target_launch_weight=single_target_launch_weight,
                 source_act_pos_weight=source_act_pos_weight,
                 target_aim_pos_weight=target_aim_pos_weight,
                 glob_act_pos_weight=glob_act_pos_weight,
@@ -2612,6 +2927,7 @@ def train(
                 ppo_source_weight=ppo_source_weight,
                 ppo_target_weight=ppo_target_weight,
                 ppo_frac_logit_weight=ppo_frac_logit_weight,
+                single_target=single_target,
             )
             # Average across heads whose loss is finite. ``pair_frac``
             # emits NaN on caches without ``pair_ships``; skip those so
@@ -2657,6 +2973,7 @@ def train(
         ppo_source_weight=ppo_source_weight,
         ppo_target_weight=ppo_target_weight,
         ppo_frac_logit_weight=ppo_frac_logit_weight,
+        single_target=single_target,
     )
     print(_format_summary(test))
     (out_dir / "test_summary.json").write_text(json.dumps(test, indent=2))
@@ -2849,6 +3166,28 @@ def main() -> None:
              "as the only frac objective.",
     )
     parser.add_argument(
+        "--single-target", action="store_true",
+        help="Single-target-per-source action contract. Trains pair_logits "
+             "as ONE row-softmax categorical per learner-owned source over "
+             "targets INCLUDING the diagonal [s,s], which is the NOOP/hold "
+             "slot: held planets -> diagonal, acting planets -> their single "
+             "dominant target (largest pair_ships). frac is supervised only "
+             "on that one chosen off-diagonal cell (a hold trains no frac). "
+             "Multi-source per turn falls out (each owned planet is its own "
+             "row). Replaces the per-cell Bernoulli BCE + PPO-alignment "
+             "factorized_bc; pair_pos_weight / ppo_*_weight are ignored.",
+    )
+    parser.add_argument(
+        "--single-target-launch-weight", type=float, default=1.0,
+        help="(single-target mode only) Up-weight launching source rows "
+             "relative to NOOP/hold rows in the TRAIN row-softmax CE. Most "
+             "owned planets hold each turn, so the plain mean (1.0) is "
+             "NOOP-dominated and can bias the actor toward passivity — this is "
+             "the single-target analogue of the old per-cell BCE pos_weight. "
+             "Try ~3-8 if launch recall is low. Val/test CE stays unweighted "
+             "for comparability. Default 1.0 = plain mean.",
+    )
+    parser.add_argument(
         "--source-act-pos-weight", type=float, default=1.0,
         help="Legacy no-op retained for old launch cells/scripts. "
              "The current 2-head model has no source_act head.",
@@ -2924,6 +3263,8 @@ def main() -> None:
         ppo_source_weight=args.ppo_source_weight,
         ppo_target_weight=args.ppo_target_weight,
         ppo_frac_logit_weight=args.ppo_frac_logit_weight,
+        single_target=args.single_target,
+        single_target_launch_weight=args.single_target_launch_weight,
         source_act_pos_weight=args.source_act_pos_weight,
         target_aim_pos_weight=args.target_aim_pos_weight,
         glob_act_pos_weight=args.glob_act_pos_weight,

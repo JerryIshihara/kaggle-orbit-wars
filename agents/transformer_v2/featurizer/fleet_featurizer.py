@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from ...physics_utils import (
@@ -45,10 +46,15 @@ from ...physics_utils import (
     F_SHIPS,
     F_X,
     F_Y,
+    MAX_SPEED,
     P_ID,
     P_OWNER,
     P_PRODUCTION,
+    P_RADIUS,
     P_SHIPS,
+    P_X,
+    P_Y,
+    SPEED_LOG_DENOM,
     _fleet_eta_to_planet,
     fleet_speed,
 )
@@ -501,6 +507,114 @@ class FleetTracker:
         self.last_seen_tick.clear()
 
 
+# ---------- Vectorized fleet→planet ETA (the hot path, batch-ready) ----------
+# `_fleet_eta_to_planet` was ~15.5M calls/game (cProfile). The geometry is pure
+# and identical per (fleet, planet) pair, so compute the whole (F, P) ETA matrix
+# once with numpy; `_resolve_target` becomes an argmin over a row and the arrival
+# timeline reads a column. The scalar fns above stay as-is (other callers + the
+# A/B parity test). Set False to force the scalar path (parity testing only).
+USE_VECTORIZED_ETA = True
+
+
+def _fleet_speed_vec(ships: np.ndarray) -> np.ndarray:
+    """Vectorized `fleet_speed` over an array of ship counts."""
+    s = np.log(np.maximum(ships, 1.0)) / SPEED_LOG_DENOM
+    speed = np.minimum(1.0 + (MAX_SPEED - 1.0) * s ** 1.5, MAX_SPEED)
+    return np.where(ships <= 1, 1.0, speed)
+
+
+def _eta_matrix(raw_fleets: list, raw_planets: list) -> np.ndarray:
+    """`(F, P)` closest-approach ETA per fleet→planet (`inf` = miss/moving away).
+    `[i, j] == _fleet_eta_to_planet(raw_fleets[i], raw_planets[j])` (None → inf).
+    Pure tensor geometry — add a leading axis to the inputs for the batched
+    `(B, F, P)` version (option B)."""
+    F, P = len(raw_fleets), len(raw_planets)
+    if F == 0 or P == 0:
+        return np.full((F, P), np.inf, dtype=np.float64)
+    fx = np.fromiter((f[F_X] for f in raw_fleets), np.float64, F)
+    fy = np.fromiter((f[F_Y] for f in raw_fleets), np.float64, F)
+    fang = np.fromiter((f[F_ANGLE] for f in raw_fleets), np.float64, F)
+    fsh = np.fromiter((f[F_SHIPS] for f in raw_fleets), np.float64, F)
+    px = np.fromiter((p[P_X] for p in raw_planets), np.float64, P)
+    py = np.fromiter((p[P_Y] for p in raw_planets), np.float64, P)
+    prad = np.fromiter((p[P_RADIUS] for p in raw_planets), np.float64, P)
+    sp = _fleet_speed_vec(fsh)[:, None]                 # (F, 1)
+    ch = np.cos(fang)[:, None]
+    sh = np.sin(fang)[:, None]
+    dx = px[None, :] - fx[:, None]                      # (F, P)
+    dy = py[None, :] - fy[:, None]
+    t = (dx * ch + dy * sh) / sp
+    cx = fx[:, None] + sp * t * ch
+    cy = fy[:, None] + sp * t * sh
+    d = np.hypot(cx - px[None, :], cy - py[None, :])
+    hit = (t >= 0.0) & (d <= prad[None, :])
+    return np.where(hit, t, np.inf)
+
+
+def _resolve_target_vec(eta_row: np.ndarray, raw_planets: list):
+    """Nearest-ETA planet for one fleet from its `_eta_matrix` row.
+    Returns `(pid, eta, planet, col)` or `(None, None, None, None)`."""
+    if eta_row.size == 0:
+        return None, None, None, None
+    col = int(np.argmin(eta_row))             # first min → matches scalar strict-<
+    eta = float(eta_row[col])
+    if not np.isfinite(eta):
+        return None, None, None, None
+    p = raw_planets[col]
+    return p[P_ID], eta, p, col
+
+
+def _target_state_before_arrival_vec(target, eta, eta_col, raw_fleets, exclude_fi):
+    """`_target_state_before_arrival` with per-fleet ETAs read from the precomputed
+    matrix column instead of recomputed. The accumulation mirrors the scalar fn
+    line-for-line so the A/B test exercises only the ETA source."""
+    cur_owner = target[P_OWNER]
+    pprod = target[P_PRODUCTION]
+    garrison = float(target[P_SHIPS])
+
+    arrivals: list[tuple[float, int, int]] = []
+    for k, f in enumerate(raw_fleets):
+        if k == exclude_fi:
+            continue
+        t = eta_col[k]
+        if not np.isfinite(t) or t >= eta:
+            continue
+        arrivals.append((float(t), f[F_OWNER], f[F_SHIPS]))
+    arrivals.sort(key=lambda x: x[0])
+
+    last_t = 0.0
+    i = 0
+    while i < len(arrivals):
+        t = arrivals[i][0]
+        if cur_owner >= 0:
+            garrison += pprod * max(0.0, t - last_t)
+        ships_per_owner: dict[int, int] = {}
+        while i < len(arrivals) and arrivals[i][0] - t < 0.5:
+            _, ow, sh = arrivals[i]
+            ships_per_owner[ow] = ships_per_owner.get(ow, 0) + sh
+            i += 1
+        if cur_owner in ships_per_owner:
+            garrison += ships_per_owner.pop(cur_owner)
+        if ships_per_owner:
+            sorted_atk = sorted(ships_per_owner.items(), key=lambda kv: -kv[1])
+            top_o, top_s = sorted_atk[0]
+            second_s = sorted_atk[1][1] if len(sorted_atk) > 1 else 0
+            if top_s == second_s:
+                pass
+            else:
+                survivor = top_s - second_s
+                if survivor > garrison:
+                    cur_owner = top_o
+                    garrison = float(survivor - garrison)
+                else:
+                    garrison = float(garrison - survivor)
+        last_t = t
+
+    if cur_owner >= 0 and cur_owner != -1:
+        garrison += pprod * max(0.0, eta - last_t)
+    return cur_owner, int(math.ceil(garrison))
+
+
 # ---------- Featurization ----------
 def _resolve_target(fleet, planets) -> tuple[int | None, float | None, Any]:
     """Find the planet this fleet's straight trajectory hits first.
@@ -649,9 +763,11 @@ def featurize_fleets(
     comet_ids = set(get("comet_planet_ids") or [])
     current_tick = int(get("step", 0) or 0)
 
-    # Resolve target + build records for every fleet.
+    # Resolve target + build records for every fleet. One vectorized (F, P) ETA
+    # matrix replaces the per-pair scalar calls that dominated the profile.
+    eta_mat = _eta_matrix(raw_fleets, raw_planets) if USE_VECTORIZED_ETA else None
     raw_records: list[FleetFeaturizer] = []
-    for f in raw_fleets:
+    for fi, f in enumerate(raw_fleets):
         fid = int(f[F_ID])
         owner = int(f[F_OWNER])
         x = float(f[F_X])
@@ -663,7 +779,12 @@ def featurize_fleets(
         vx = speed * math.cos(angle)
         vy = speed * math.sin(angle)
 
-        target_pid, eta, target_planet = _resolve_target(f, raw_planets)
+        if eta_mat is not None:
+            target_pid, eta, target_planet, target_col = _resolve_target_vec(
+                eta_mat[fi], raw_planets)
+        else:
+            target_pid, eta, target_planet = _resolve_target(f, raw_planets)
+            target_col = None
         is_target_comet = target_pid in comet_ids
         target_owner = target_planet[P_OWNER] if target_planet is not None else None
         target_ships = target_planet[P_SHIPS] if target_planet is not None else None
@@ -690,10 +811,15 @@ def featurize_fleets(
         will_flip = False
         capture_margin = 0
         if target_planet is not None and eta is not None:
-            other_fleets = [g for g in raw_fleets if int(g[F_ID]) != fid]
-            owner_before, garrison_before = _target_state_before_arrival(
-                target_planet, eta, other_fleets,
-            )
+            if eta_mat is not None:
+                owner_before, garrison_before = _target_state_before_arrival_vec(
+                    target_planet, eta, eta_mat[:, target_col], raw_fleets, fi,
+                )
+            else:
+                other_fleets = [g for g in raw_fleets if int(g[F_ID]) != fid]
+                owner_before, garrison_before = _target_state_before_arrival(
+                    target_planet, eta, other_fleets,
+                )
             if owner_before == owner:
                 # Reinforcement at touchdown — ownership cannot change,
                 # net contribution is +ships.
@@ -734,16 +860,29 @@ def featurize_fleets(
     # of our planets. Falls back to fleet ETA (target ETA) if we own
     # nothing.
     if len(raw_records) > max_fleets:
-        my_planets = [p for p in raw_planets if p[P_OWNER] == learner_slot]
-        def _relevance(rec_idx: int) -> float:
-            f = raw_fleets[rec_idx]
-            if my_planets:
-                e = min(
-                    (et for et in (_fleet_eta_to_planet(f, p) for p in my_planets) if et is not None),
-                    default=float("inf"),
-                )
-                return e
-            return raw_records[rec_idx].eta_to_target or float("inf")
+        if eta_mat is not None:
+            my_cols = [j for j, p in enumerate(raw_planets) if p[P_OWNER] == learner_slot]
+            if my_cols:
+                my_eta = eta_mat[:, my_cols].min(axis=1)
+            else:
+                my_eta = np.array(
+                    [r.eta_to_target if r.eta_to_target is not None else float("inf")
+                     for r in raw_records], dtype=np.float64)
+
+            def _relevance(rec_idx: int) -> float:
+                return float(my_eta[rec_idx])
+        else:
+            my_planets = [p for p in raw_planets if p[P_OWNER] == learner_slot]
+
+            def _relevance(rec_idx: int) -> float:
+                f = raw_fleets[rec_idx]
+                if my_planets:
+                    e = min(
+                        (et for et in (_fleet_eta_to_planet(f, p) for p in my_planets) if et is not None),
+                        default=float("inf"),
+                    )
+                    return e
+                return raw_records[rec_idx].eta_to_target or float("inf")
         order = sorted(range(len(raw_records)), key=_relevance)[:max_fleets]
         raw_records = [raw_records[i] for i in order]
 

@@ -56,6 +56,7 @@ from ..featurizer import (
     FLEET_RAW_DIM,
     PLANET_RAW_DIM,
 )
+from ..featurizer.fleet_featurizer import SHIPS_LOG_MAX
 from ..paths import (
     CROSS_ENTITY_DATASET_DIR,
     CROSS_ENTITY_RUNS_DIR,
@@ -308,8 +309,17 @@ class CrossEntitySnapshotDataset(EntitySnapshotDataset):
         dships_back = torch.zeros(ENTITY_NUM_OWNER_SLOTS, dtype=torch.float32)
         dships_fwd = torch.zeros(ENTITY_NUM_OWNER_SLOTS, dtype=torch.float32)
         survives_fwd = torch.zeros(ENTITY_NUM_OWNER_SLOTS, dtype=torch.float32)
+        final_score_adv = torch.zeros(ENTITY_NUM_OWNER_SLOTS, dtype=torch.float32)
+        final_score_adv_valid = torch.zeros(ENTITY_NUM_OWNER_SLOTS, dtype=torch.float32)
+        dplanets_back = torch.zeros(ENTITY_NUM_OWNER_SLOTS, dtype=torch.float32)
+        trend_back = torch.ones(ENTITY_NUM_OWNER_SLOTS, dtype=torch.long)
+        future_score_adv = torch.zeros(ENTITY_NUM_OWNER_SLOTS, dtype=torch.float32)
         score_adv_slope_back = torch.zeros((), dtype=torch.float32)
+        score_adv_slope_fwd = torch.zeros((), dtype=torch.float32)
+        valid_back = torch.zeros((), dtype=torch.float32)
+        valid_back_available = torch.zeros((), dtype=torch.float32)
         valid_fwd = torch.zeros((), dtype=torch.float32)
+        future_score_adv_available = torch.zeros((), dtype=torch.float32)
         if rows:
             head = rows[0]
             winner = int(head["winner_seat"])
@@ -348,6 +358,12 @@ class CrossEntitySnapshotDataset(EntitySnapshotDataset):
                     [float(head[f"player_valid_{s}"]) for s in range(ENTITY_NUM_OWNER_SLOTS)],
                     dtype=torch.float32,
                 )
+            if "final_score_adv_0" in head:
+                final_score_adv = torch.tensor(
+                    [float(head[f"final_score_adv_{s}"]) for s in range(ENTITY_NUM_OWNER_SLOTS)],
+                    dtype=torch.float32,
+                )
+                final_score_adv_valid = player_valid.clone()
             if "dships_back_0" in head:
                 dships_back = torch.tensor(
                     [float(head[f"dships_back_{s}"]) for s in range(ENTITY_NUM_OWNER_SLOTS)],
@@ -365,6 +381,26 @@ class CrossEntitySnapshotDataset(EntitySnapshotDataset):
                     float(head["score_adv_slope_back"]), dtype=torch.float32,
                 )
                 valid_fwd = torch.tensor(float(head["valid_fwd"]), dtype=torch.float32)
+            if "dplanets_back_0" in head:
+                dplanets_back = torch.tensor(
+                    [float(head[f"dplanets_back_{s}"]) for s in range(ENTITY_NUM_OWNER_SLOTS)],
+                    dtype=torch.float32,
+                )
+                trend_back = torch.tensor(
+                    [int(float(head[f"trend_back_{s}"])) for s in range(ENTITY_NUM_OWNER_SLOTS)],
+                    dtype=torch.long,
+                )
+                valid_back = torch.tensor(float(head["valid_back"]), dtype=torch.float32)
+                valid_back_available = torch.ones((), dtype=torch.float32)
+            if "future_score_adv_0" in head:
+                future_score_adv = torch.tensor(
+                    [float(head[f"future_score_adv_{s}"]) for s in range(ENTITY_NUM_OWNER_SLOTS)],
+                    dtype=torch.float32,
+                )
+                score_adv_slope_fwd = torch.tensor(
+                    float(head["score_adv_slope_fwd"]), dtype=torch.float32,
+                )
+                future_score_adv_available = torch.ones((), dtype=torch.float32)
 
         # Vectorize per-planet cross-entity label scatter (same trick as
         # EntitySnapshotDataset._build_snapshot — gather lists first,
@@ -425,11 +461,20 @@ class CrossEntitySnapshotDataset(EntitySnapshotDataset):
             "winner_seat": torch.tensor(winner, dtype=torch.long),
             "final_rank": final_rank,
             "player_valid": player_valid,
+            "final_score_adv": final_score_adv,
+            "final_score_adv_valid": final_score_adv_valid,
             "dships_back": dships_back,
+            "dplanets_back": dplanets_back,
+            "trend_back": trend_back,
             "dships_fwd": dships_fwd,
             "survives_fwd": survives_fwd,
+            "future_score_adv": future_score_adv,
             "score_adv_slope_back": score_adv_slope_back,
+            "score_adv_slope_fwd": score_adv_slope_fwd,
+            "valid_back": valid_back,
+            "valid_back_available": valid_back_available,
             "valid_fwd": valid_fwd,
+            "future_score_adv_available": future_score_adv_available,
             "score_advantage_at_end_log": torch.tensor(score_adv, dtype=torch.float32),
             "turns_until_episode_end": torch.tensor(turns_left, dtype=torch.float32),
             "expert_acted_this_turn": torch.tensor(
@@ -1480,6 +1525,21 @@ def compute_loss_v3(
 # valid opponents to the terminal-reward scale. A companion per-player
 # ``is_ahead`` head predicts the future leader class at each cached value
 # horizon, derived from existing ``leader_seat_t_plus_K`` labels.
+VALUE_CURRENT_STAT_CHANNELS: tuple[str, ...] = (
+    "ship_share",
+    "production_share",
+    "planet_share",
+    "fleet_ship_share",
+    "score_adv_norm",
+)
+VALUE_N_CURRENT_STATS: int = len(VALUE_CURRENT_STAT_CHANNELS)
+
+
+def _zero_last_linear(module: nn.Module) -> None:
+    last = module[-1] if isinstance(module, nn.Sequential) else None
+    if isinstance(last, nn.Linear):
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
 
 
 class ValueDecoder(nn.Module):
@@ -1559,7 +1619,7 @@ class PairCompareHead(nn.Module):
 
 
 class CrossEntityCriticModel(nn.Module):
-    """V2 backbone (L2 + PlayerConsolidator) + pairwise value & momentum heads.
+    """V2 backbone (L2 + PlayerConsolidator) + value/momentum heads.
 
     Backbone ctor args are IDENTICAL to ``CrossEntityPretrainModelV2`` so a V2
     ckpt's ``cross.*`` / ``consolidator.*`` keys load cleanly (strict=False).
@@ -1567,7 +1627,9 @@ class CrossEntityCriticModel(nn.Module):
     per-player ``is_ahead`` horizon head. Momentum heads
     (``dships_back``/``slope_back`` for the prior view;
     ``dships_fwd``/``survives_fwd`` for the posterior) are the anti-shortcut
-    temporal anchors.
+    temporal anchors. The standalone ``head_set=value`` objective also uses
+    explicit supervised heads: final win, final rank score, final score
+    advantage, and current-state shares from a shared value trunk.
     """
 
     def __init__(
@@ -1594,23 +1656,63 @@ class CrossEntityCriticModel(nn.Module):
             hidden=d_model,
             n_layers=max(1, value_trunk_n_layers + value_head_n_layers - 1),
         )
+        self.value_trunk = _build_mlp(
+            in_dim=feat_dim,
+            hidden=d_model,
+            out_dim=d_model,
+            n_layers=value_trunk_n_layers,
+        )
+        self.win_logit_head = _build_mlp(
+            in_dim=d_model,
+            hidden=d_model,
+            out_dim=1,
+            n_layers=value_head_n_layers,
+        )
+        self.rank_score_head = _build_mlp(
+            in_dim=d_model,
+            hidden=d_model,
+            out_dim=1,
+            n_layers=value_head_n_layers,
+        )
+        self.final_score_adv_head = _build_mlp(
+            in_dim=d_model,
+            hidden=d_model,
+            out_dim=1,
+            n_layers=value_head_n_layers,
+        )
+        self.current_stats_head = _build_mlp(
+            in_dim=d_model,
+            hidden=d_model,
+            out_dim=VALUE_N_CURRENT_STATS,
+            n_layers=value_head_n_layers,
+        )
+        for head in (
+            self.win_logit_head,
+            self.rank_score_head,
+            self.final_score_adv_head,
+            self.current_stats_head,
+        ):
+            _zero_last_linear(head)
         self.is_ahead_head = _build_mlp(
             in_dim=feat_dim,
             hidden=d_model,
             out_dim=len(CROSS_ENTITY_VALUE_HORIZONS),
             n_layers=value_head_n_layers,
         )
-        last = self.is_ahead_head[-1]
-        if isinstance(last, nn.Linear):
-            nn.init.zeros_(last.weight)
-            nn.init.zeros_(last.bias)
+        _zero_last_linear(self.is_ahead_head)
         # Temporal momentum heads (per-player) on the same feature.
         def _mlp() -> nn.Module:
             return _build_mlp(in_dim=feat_dim, hidden=d_model, out_dim=1, n_layers=2)
         self.head_dships_back = _mlp()
+        self.head_dplanets_back = _mlp()
         self.head_dships_fwd = _mlp()
+        self.head_future_score_adv = _mlp()
         self.head_survives_fwd = _mlp()
+        self.head_trend_back = _build_mlp(
+            in_dim=feat_dim, hidden=d_model, out_dim=3, n_layers=2,
+        )
         self.head_slope_back = _mlp()                         # read learner slot only
+        self.head_slope_fwd = _mlp()                          # read learner slot only
 
     def forward(
         self,
@@ -1627,13 +1729,22 @@ class CrossEntityCriticModel(nn.Module):
         player_state = self.consolidator(ctx_now, mask_now, owner_now)   # (B, 4, d)
         glob_b = glob.unsqueeze(1).expand(-1, player_state.size(1), -1)  # (B, 4, d)
         feat = torch.cat([glob_b, player_state], dim=-1)                 # (B, 4, 2d)
+        value_h = self.value_trunk(feat)                                 # (B, 4, d)
         return {
             "pair_logits": self.pair_compare(player_state, glob),     # (B, 4, 4)
+            "win_logit": self.win_logit_head(value_h).squeeze(-1),     # (B, 4)
+            "rank_score": self.rank_score_head(value_h).squeeze(-1),   # (B, 4)
+            "final_score_adv": self.final_score_adv_head(value_h).squeeze(-1),
+            "current_stats": self.current_stats_head(value_h),         # (B, 4, C)
             "is_ahead_logits": self.is_ahead_head(feat),              # (B, 4, H)
             "dships_back": self.head_dships_back(feat).squeeze(-1),    # (B, 4)
+            "dplanets_back": self.head_dplanets_back(feat).squeeze(-1), # (B, 4)
+            "trend_back": self.head_trend_back(feat),                  # (B, 4, 3)
             "dships_fwd": self.head_dships_fwd(feat).squeeze(-1),      # (B, 4)
+            "future_score_adv": self.head_future_score_adv(feat).squeeze(-1),
             "survives_fwd": self.head_survives_fwd(feat).squeeze(-1),  # (B, 4)
             "slope_back": self.head_slope_back(feat[:, 0]).squeeze(-1),  # (B,)
+            "slope_fwd": self.head_slope_fwd(feat[:, 0]).squeeze(-1),    # (B,)
             "player_state": player_state,
             "glob": glob,
         }
@@ -1891,6 +2002,366 @@ def compute_loss_critic(
         per_head.update(fwd_terms)
         per_head.update({f"post_{k}": v for k, v in post_terms.items()})
         per_head["consistency"] = float(cons.detach())
+    return total, per_head
+
+
+# Standalone value-pretrain loss weights. This path is intentionally separate
+# from PPO/GAE and from the deployed pair-comparison critic objective.
+VALUE_LAMBDA_WIN: float = 1.0
+VALUE_LAMBDA_RANK: float = 0.3
+VALUE_LAMBDA_SCORE: float = 1.0
+VALUE_LAMBDA_CURRENT: float = 0.5
+VALUE_LAMBDA_BACK: float = 0.5
+VALUE_LAMBDA_FWD: float = 0.5
+VALUE_LAMBDA_CONS: float = 0.05
+# Weight on the near-future-decayed multi-horizon "is_ahead" return term.
+VALUE_LAMBDA_AHEAD: float = 0.5
+# Per-turn discount for the future "explicit reward". The multi-horizon
+# is_ahead labels {10,20,50} are weighted by gamma**K (normalized), so a LARGE
+# decay (gamma well below 1) makes training focus on NEAR-future return: at
+# gamma=0.9 the K=10 horizon carries ~73% of the weight and K=50 only ~1%.
+VALUE_FWD_GAMMA: float = 0.9
+
+
+def _value_future_ahead_decay_loss(
+    preds: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    valid: torch.Tensor,
+    *,
+    gamma: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Near-future-weighted learner "is_ahead" over the value horizons.
+
+    The future "explicit reward" is the learner being ahead at t+K for
+    K in ``CROSS_ENTITY_VALUE_HORIZONS``. Each horizon's BCE is weighted by
+    ``gamma**K`` (normalized across horizons), so a large decay (small gamma)
+    concentrates the gradient on the nearest horizon — "focus on near-future
+    return". Reads the per-horizon learner slot of ``is_ahead_logits (B,O,H)``;
+    masked by ``valid_global_t_plus_K`` and the learner's ``player_valid``.
+    Skips silently if the head/labels are absent (older caches/models).
+    """
+    total = _zero_loss_from_preds(preds)
+    terms: dict[str, float] = {}
+    logits = preds.get("is_ahead_logits")
+    if logits is None or logits.dim() != 3:
+        return total, terms
+    horizons = CROSS_ENTITY_VALUE_HORIZONS
+    H = logits.shape[-1]
+    raw = [gamma ** float(k) for k in horizons[:H]]
+    denom = sum(raw) if sum(raw) > 0 else 1.0
+    weights = [r / denom for r in raw]
+    learner_valid = valid[:, 0]                                   # (B,)
+    any_term = False
+    for idx, k in enumerate(horizons[:H]):
+        label = batch.get(f"is_ahead_t_plus_{k}")
+        vK = batch.get(f"valid_global_t_plus_{k}")
+        if label is None or vK is None:
+            continue
+        mask = vK.float() * learner_valid
+        bce = F.binary_cross_entropy_with_logits(
+            logits[:, 0, idx], label.float(), reduction="none",
+        )
+        Lk = _masked_mean(bce, mask)
+        total = total + weights[idx] * Lk
+        terms[f"is_ahead_t_plus_{k}"] = float(Lk.detach())
+        any_term = True
+    if any_term:
+        terms["fwd_ahead_decay"] = float(total.detach())
+    return total, terms
+
+
+def _zero_loss_from_preds(preds: dict[str, torch.Tensor]) -> torch.Tensor:
+    for val in preds.values():
+        if torch.is_tensor(val) and val.dtype.is_floating_point:
+            return val.sum() * 0.0
+    raise ValueError("preds does not contain a floating tensor")
+
+
+def _masked_mean(term: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.to(dtype=term.dtype, device=term.device)
+    return (term * mask).sum() / mask.sum().clamp(min=1.0)
+
+
+def _mask_any(mask: torch.Tensor | None) -> bool:
+    return bool(mask is not None and (mask.float().sum().detach().cpu().item() > 0.0))
+
+
+def _value_current_stats_targets(
+    batch: dict[str, torch.Tensor],
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    labels = compute_current_state_labels(
+        batch["planet_features"],
+        batch["planet_mask"],
+        batch["fleet_features"],
+        batch["fleet_mask"],
+    )
+    total_ships = torch.expm1(labels.total_ships_log * SHIPS_LOG_MAX).clamp_min(0.0)
+    fleet_ships = torch.expm1(labels.fleet_ships_in_air_log * SHIPS_LOG_MAX).clamp_min(0.0)
+    production = labels.production_sum.clamp_min(0.0)
+    planet_count = labels.planet_count.clamp_min(0.0)
+
+    total_ships_all = total_ships.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    total_production = production.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    real_planets = _current_planet_mask(batch).float().sum(dim=-1, keepdim=True).clamp_min(1.0)
+
+    B, S = total_ships.shape
+    eye = torch.eye(S, dtype=torch.bool, device=total_ships.device).view(1, S, S)
+    other_valid = (valid > 0.5).unsqueeze(1).expand(B, S, S) & ~eye
+    other_ships = total_ships.unsqueeze(1).expand(B, S, S).masked_fill(~other_valid, -1.0)
+    max_other = other_ships.max(dim=-1).values.clamp_min(0.0)
+    score_adv_norm = (total_ships - max_other) / total_ships_all
+
+    return torch.stack(
+        [
+            total_ships / total_ships_all,
+            production / total_production,
+            planet_count / real_planets,
+            fleet_ships / total_ships_all,
+            score_adv_norm,
+        ],
+        dim=-1,
+    )
+
+
+def _value_final_outcome_loss(
+    preds: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    valid: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    total = _zero_loss_from_preds(preds)
+    terms: dict[str, float] = {}
+
+    final_rank = batch.get("final_rank")
+    if final_rank is not None:
+        win_target = ((final_rank.long() == 0) & (valid > 0.5)).float()
+        win_mask = valid
+    else:
+        win_target = _per_player_targets_from_class(batch["winner_seat"].long())
+        row_valid = (batch["winner_seat"] < ENTITY_NUM_OWNER_SLOTS).float().unsqueeze(-1)
+        win_mask = valid * row_valid
+
+    bce = F.binary_cross_entropy_with_logits(
+        preds["win_logit"], win_target, reduction="none",
+    )
+    L_win = _masked_mean(bce, win_mask)
+    total = total + VALUE_LAMBDA_WIN * L_win
+    terms["win_bce"] = float(L_win.detach())
+
+    if final_rank is not None:
+        L_rank = _listmle_loss(preds["rank_score"], final_rank.long(), valid)
+        total = total + VALUE_LAMBDA_RANK * L_rank
+        terms["rank_listmle"] = float(L_rank.detach())
+
+    score_label = batch.get("final_score_adv")
+    score_mask = batch.get("final_score_adv_valid")
+    if score_label is not None and score_mask is not None and _mask_any(score_mask):
+        score_mask = score_mask.float() * valid
+        L_score = _masked_mean(
+            F.smooth_l1_loss(preds["final_score_adv"], score_label, reduction="none"),
+            score_mask,
+        )
+    else:
+        # Older caches only have the learner-relative terminal advantage scalar.
+        self_mask = torch.zeros_like(valid)
+        self_mask[:, 0] = valid[:, 0]
+        L_score = _masked_mean(
+            F.smooth_l1_loss(
+                preds["final_score_adv"][:, 0],
+                batch["score_advantage_at_end_log"],
+                reduction="none",
+            ),
+            self_mask[:, 0],
+        )
+    total = total + VALUE_LAMBDA_SCORE * L_score
+    terms["final_score_adv"] = float(L_score.detach())
+
+    return total, terms
+
+
+def _value_current_state_loss(
+    preds: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    valid: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    target = _value_current_stats_targets(batch, valid)
+    mask = valid.unsqueeze(-1).expand_as(target)
+    err = F.smooth_l1_loss(preds["current_stats"], target, reduction="none")
+    loss = _masked_mean(err, mask)
+    terms = {"current_stats": float(loss.detach())}
+    for idx, name in enumerate(VALUE_CURRENT_STAT_CHANNELS):
+        Li = _masked_mean(err[..., idx], valid)
+        terms[f"current_{name}"] = float(Li.detach())
+    return loss, terms
+
+
+def _value_backward_momentum_loss(
+    preds: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    valid: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    total = _zero_loss_from_preds(preds)
+    terms: dict[str, float] = {}
+    if "dships_back" not in batch:
+        return total, terms
+
+    avail = batch.get("valid_back_available")
+    full_window = batch.get("valid_back")
+    has_full_window_labels = _mask_any(avail)
+    if has_full_window_labels and full_window is not None:
+        mask = valid * full_window.float().unsqueeze(-1)
+    else:
+        mask = valid
+
+    L_dships = _masked_mean(
+        F.smooth_l1_loss(preds["dships_back"], batch["dships_back"], reduction="none"),
+        mask,
+    )
+    total = total + L_dships
+    terms["dships_back"] = float(L_dships.detach())
+
+    if has_full_window_labels and "dplanets_back" in batch:
+        L_dplanets = _masked_mean(
+            F.smooth_l1_loss(
+                preds["dplanets_back"], batch["dplanets_back"], reduction="none",
+            ),
+            mask,
+        )
+        total = total + L_dplanets
+        terms["dplanets_back"] = float(L_dplanets.detach())
+
+    if has_full_window_labels and "trend_back" in batch:
+        ce = F.cross_entropy(
+            preds["trend_back"].reshape(-1, 3),
+            batch["trend_back"].long().reshape(-1).clamp(0, 2),
+            reduction="none",
+        ).view_as(valid)
+        L_trend = _masked_mean(ce, mask)
+        total = total + L_trend
+        terms["trend_back"] = float(L_trend.detach())
+
+    if "score_adv_slope_back" in batch:
+        slope_mask = (
+            full_window.float()
+            if has_full_window_labels and full_window is not None
+            else torch.ones_like(batch["score_adv_slope_back"])
+        )
+        L_slope = _masked_mean(
+            F.smooth_l1_loss(
+                preds["slope_back"], batch["score_adv_slope_back"], reduction="none",
+            ),
+            slope_mask,
+        )
+        total = total + L_slope
+        terms["score_adv_slope_back"] = float(L_slope.detach())
+
+    return total, terms
+
+
+def _value_forward_momentum_loss(
+    preds: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    valid: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    total = _zero_loss_from_preds(preds)
+    terms: dict[str, float] = {}
+    vf = batch.get("valid_fwd")
+    if "dships_fwd" not in batch or vf is None:
+        return total, terms
+
+    mask = valid * vf.float().unsqueeze(-1)
+    L_dships = _masked_mean(
+        F.smooth_l1_loss(preds["dships_fwd"], batch["dships_fwd"], reduction="none"),
+        mask,
+    )
+    total = total + L_dships
+    terms["dships_fwd"] = float(L_dships.detach())
+
+    if "survives_fwd" in batch:
+        L_survives = _masked_mean(
+            F.binary_cross_entropy_with_logits(
+                preds["survives_fwd"], batch["survives_fwd"], reduction="none",
+            ),
+            mask,
+        )
+        total = total + L_survives
+        terms["survives_fwd"] = float(L_survives.detach())
+
+    future_avail = batch.get("future_score_adv_available")
+    if _mask_any(future_avail) and "future_score_adv" in batch:
+        L_adv = _masked_mean(
+            F.smooth_l1_loss(
+                preds["future_score_adv"], batch["future_score_adv"], reduction="none",
+            ),
+            mask,
+        )
+        total = total + L_adv
+        terms["future_score_adv"] = float(L_adv.detach())
+        if "score_adv_slope_fwd" in batch:
+            L_slope = _masked_mean(
+                F.smooth_l1_loss(
+                    preds["slope_fwd"], batch["score_adv_slope_fwd"], reduction="none",
+                ),
+                vf.float(),
+            )
+            total = total + L_slope
+            terms["score_adv_slope_fwd"] = float(L_slope.detach())
+
+    return total, terms
+
+
+def compute_loss_value_pretrain(
+    preds: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    post_preds: dict[str, torch.Tensor] | None = None,
+    *,
+    fwd_gamma: float = VALUE_FWD_GAMMA,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Standalone supervised value-pretrain objective from /tmp design doc.
+
+    It trains explicit independent heads on final outcome, current-state
+    resource shares, backward momentum, a near-future-decayed multi-horizon
+    "is_ahead" return term, and optional posterior forward labels. This is a
+    representation/critic-warm-start loss, not PPO value loss.
+
+    ``fwd_gamma`` is the per-turn discount on the future is_ahead term: a large
+    decay (small gamma) focuses training on near-future return (see
+    :data:`VALUE_FWD_GAMMA`). Set ``fwd_gamma=0`` (or 1.0 with no horizons) to
+    disable the term.
+    """
+    valid = batch["player_valid"].float()
+    if float(valid.sum().detach().cpu().item()) == 0.0:
+        raise ValueError(
+            "player_valid is all-zero. Rebuild the cross_entity cache with "
+            "final_rank/player_valid columns before training head_set='value'."
+        )
+
+    total, per_head = _value_final_outcome_loss(preds, batch, valid)
+    L_cur, cur_terms = _value_current_state_loss(preds, batch, valid)
+    total = total + VALUE_LAMBDA_CURRENT * L_cur
+    per_head.update(cur_terms)
+
+    L_back, back_terms = _value_backward_momentum_loss(preds, batch, valid)
+    total = total + VALUE_LAMBDA_BACK * L_back
+    per_head.update(back_terms)
+
+    # Near-future-decayed future "explicit reward": learner is_ahead at the
+    # value horizons, weighted by gamma**K so the near horizon dominates.
+    if fwd_gamma and fwd_gamma > 0.0:
+        L_ahead, ahead_terms = _value_future_ahead_decay_loss(
+            preds, batch, valid, gamma=fwd_gamma,
+        )
+        total = total + VALUE_LAMBDA_AHEAD * L_ahead
+        per_head.update(ahead_terms)
+
+    if post_preds is not None:
+        L_fwd, fwd_terms = _value_forward_momentum_loss(post_preds, batch, valid)
+        total = total + VALUE_LAMBDA_FWD * L_fwd
+        per_head.update({f"post_{k}": v for k, v in fwd_terms.items()})
+        cons = F.mse_loss(preds["rank_score"], post_preds["rank_score"].detach())
+        total = total + VALUE_LAMBDA_CONS * cons
+        per_head["rank_consistency"] = float(cons.detach())
+
     return total, per_head
 
 
@@ -2618,6 +3089,111 @@ def evaluate_critic(
     return summary
 
 
+@torch.no_grad()
+def evaluate_value_pretrain(
+    model: "CrossEntityCriticModel",
+    fleet_enc: FleetEncoder,
+    planet_enc: PlanetEncoder,
+    entity_enc: PlanetEntityEncoder,
+    loader: DataLoader,
+    device: str,
+) -> dict[str, dict[str, float]]:
+    """Eval for the standalone explicit-head value-pretrain objective."""
+    model.eval()
+    agg = defaultdict(float)
+    cnt = defaultdict(float)
+
+    def add(name: str, value: torch.Tensor, mask: torch.Tensor) -> None:
+        m = mask.float()
+        agg[name] += float((value * m).sum().detach())
+        cnt[name] += float(m.sum().detach())
+
+    for batch in loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        et, em = _entity_tokens_per_step(batch, fleet_enc, planet_enc, entity_enc)
+        oo = _owner_oh_from_batch(batch)
+        preds = model(et, em, oo)
+        valid = batch["player_valid"].float()
+        if float(valid.sum().detach().cpu().item()) == 0.0:
+            continue
+
+        final_rank = batch["final_rank"].long()
+        win_t = ((final_rank == 0) & (valid > 0.5)).float()
+        win_bce = F.binary_cross_entropy_with_logits(
+            preds["win_logit"], win_t, reduction="none",
+        )
+        win_prob = torch.sigmoid(preds["win_logit"])
+        add("win_bce", win_bce, valid)
+        add("win_brier", (win_prob - win_t).pow(2), valid)
+        add("win_acc", ((preds["win_logit"] >= 0.0).float() == win_t).float(), valid)
+
+        masked_scores = preds["rank_score"].masked_fill(valid <= 0.5, -1e9)
+        pred_winner = masked_scores.argmax(dim=-1)
+        true_winner = final_rank.masked_fill(valid <= 0.5, ENTITY_NUM_OWNER_SLOTS).argmin(dim=-1)
+        row_valid = valid.sum(dim=-1) >= 2
+        if bool(row_valid.any()):
+            add(
+                "winner_top1",
+                (pred_winner == true_winner).float(),
+                row_valid.float(),
+            )
+
+        B, S = final_rank.shape
+        eye = torch.eye(S, dtype=torch.bool, device=device).view(1, S, S)
+        pair_mask = valid.unsqueeze(2) * valid.unsqueeze(1) * (~eye).float()
+        rank_i = final_rank.unsqueeze(2)
+        rank_j = final_rank.unsqueeze(1)
+        score_i = preds["rank_score"].unsqueeze(2)
+        score_j = preds["rank_score"].unsqueeze(1)
+        pair_t = (rank_i < rank_j).float()
+        pair_pred = (score_i > score_j).float()
+        add("ranking_pair_acc", (pair_pred == pair_t).float(), pair_mask)
+
+        score_label = batch.get("final_score_adv")
+        score_mask = batch.get("final_score_adv_valid")
+        if score_label is not None and score_mask is not None and _mask_any(score_mask):
+            sm = score_mask.float() * valid
+            add("final_score_mae", (preds["final_score_adv"] - score_label).abs(), sm)
+        else:
+            self_mask = valid[:, 0]
+            add(
+                "final_score_mae",
+                (preds["final_score_adv"][:, 0] - batch["score_advantage_at_end_log"]).abs(),
+                self_mask,
+            )
+
+        cur_t = _value_current_stats_targets(batch, valid)
+        cur_err = F.smooth_l1_loss(preds["current_stats"], cur_t, reduction="none")
+        add("current_stats", cur_err, valid.unsqueeze(-1).expand_as(cur_err))
+        for idx, name in enumerate(VALUE_CURRENT_STAT_CHANNELS):
+            add(f"current_{name}", cur_err[..., idx], valid)
+
+        if "dships_back" in batch:
+            add(
+                "dships_back_mae",
+                (preds["dships_back"] - batch["dships_back"]).abs(),
+                valid,
+            )
+        if "score_adv_slope_back" in batch:
+            add(
+                "score_adv_slope_back_mae",
+                (preds["slope_back"] - batch["score_adv_slope_back"]).abs(),
+                torch.ones_like(batch["score_adv_slope_back"]),
+            )
+
+    summary: dict[str, dict[str, float]] = {}
+    for name in agg:
+        n = cnt[name]
+        if n <= 0:
+            continue
+        entry = {"loss": agg[name] / n}
+        if name.endswith("_acc") or name == "winner_top1":
+            entry["acc"] = entry["loss"]
+        summary[name] = entry
+    model.train()
+    return summary
+
+
 # ---------- Helpers ----------
 def _load_frozen_encoders(
     fleet_run_dir: Path,
@@ -3125,6 +3701,7 @@ def train(
     unfreeze: str = "none",
     backbone_lr_mult: float = 0.1,
     aux_posterior: bool = False,
+    fwd_gamma: float = VALUE_FWD_GAMMA,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -3162,7 +3739,7 @@ def train(
             per_frame_label_keys=(
                 V3_PER_FRAME_LABEL_KEYS if head_set == "v3" else None
             ),
-            with_posterior=(head_set == "critic" and aux_posterior),
+            with_posterior=(head_set in ("critic", "value") and aux_posterior),
         )
         print(
             f"  cache size: {len(full):,} snapshots; "
@@ -3219,17 +3796,20 @@ def train(
         fleet_run_dir, planet_run_dir, entity_run_dir, device=device,
     )
 
-    if head_set not in ("v1", "v2", "v3", "critic"):
-        raise ValueError(f"unknown head_set={head_set!r}; expected 'v1', 'v2', 'v3', or 'critic'")
+    if head_set not in ("v1", "v2", "v3", "critic", "value"):
+        raise ValueError(
+            f"unknown head_set={head_set!r}; expected 'v1', 'v2', 'v3', "
+            "'critic', or 'value'"
+        )
     if head_set == "v3" and cross_cache_path is None:
         raise ValueError(
             "head_set='v3' requires --cross-cache-path: per-frame supervision "
             "stacks history-frame labels from the cache (the CSV path only "
             "carries current-frame labels)."
         )
-    if aux_posterior and (head_set != "critic" or cross_cache_path is None):
+    if aux_posterior and (head_set not in ("critic", "value") or cross_cache_path is None):
         raise ValueError(
-            "--aux-posterior requires head_set='critic' AND --cross-cache-path "
+            "--aux-posterior requires head_set='critic'/'value' AND --cross-cache-path "
             "(the future-window stacking is only built on the cached path)."
         )
     if head_set == "v3":
@@ -3238,9 +3818,12 @@ def train(
     elif head_set == "v2":
         model = CrossEntityPretrainModelV2(d_model=d_model).to(device)
         print(f"  V2 cross+consolidator+heads params: {sum(p.numel() for p in model.parameters()):,}")
-    elif head_set == "critic":
+    elif head_set in ("critic", "value"):
         model = CrossEntityCriticModel(d_model=d_model).to(device)
-        print(f"  critic backbone+pair_compare params: {sum(p.numel() for p in model.parameters()):,}")
+        print(
+            f"  {head_set} backbone+value heads params: "
+            f"{sum(p.numel() for p in model.parameters()):,}"
+        )
     else:
         model = CrossEntityPretrainModel(d_model=d_model).to(device)
         print(f"  V1 cross+heads params: {sum(p.numel() for p in model.parameters()):,}")
@@ -3261,16 +3844,16 @@ def train(
         bad = [k for k in miss if k.startswith("cross.") or k.startswith("consolidator.")]
         n_heads = len(miss) - len(bad)
         print(
-            f"[critic] warm-start from {init_from}: missing={len(miss)} "
+            f"[{head_set}] warm-start from {init_from}: missing={len(miss)} "
             f"(new heads: {n_heads}, backbone: {len(bad)}), "
             f"unexpected={len(res.unexpected_keys)}"
         )
-        if head_set == "critic" and bad:
+        if head_set in ("critic", "value") and bad:
             raise RuntimeError(
                 f"warm-start left BACKBONE keys uninitialized: {bad[:6]} "
                 "— backbone ctor args must match the source V2 ckpt."
             )
-    if head_set == "critic":
+    if head_set in ("critic", "value"):
         # ``unfreeze`` controls which backbone blocks fine-tune alongside the
         # (always-trainable) critic heads. ``--no-freeze-backbone`` maps to
         # "all" for back-compat. Unfrozen pretrained blocks get a SMALLER LR
@@ -3297,11 +3880,20 @@ def train(
                     n_frozen += p.numel()
         decoder_params = (
             list(model.pair_compare.parameters())
+            + list(model.value_trunk.parameters())
+            + list(model.win_logit_head.parameters())
+            + list(model.rank_score_head.parameters())
+            + list(model.final_score_adv_head.parameters())
+            + list(model.current_stats_head.parameters())
             + list(model.is_ahead_head.parameters())
             + list(model.head_dships_back.parameters())
+            + list(model.head_dplanets_back.parameters())
             + list(model.head_dships_fwd.parameters())
+            + list(model.head_future_score_adv.parameters())
             + list(model.head_survives_fwd.parameters())
+            + list(model.head_trend_back.parameters())
             + list(model.head_slope_back.parameters())
+            + list(model.head_slope_fwd.parameters())
         )
         backbone_params = [p for m in unfrozen_mods for p in m.parameters()]
         groups = [{"params": decoder_params, "lr": lr}]
@@ -3311,8 +3903,8 @@ def train(
         n_dec = sum(p.numel() for p in decoder_params)
         n_bb = sum(p.numel() for p in backbone_params)
         print(
-            f"[critic] unfreeze={unfreeze_eff}  frozen={n_frozen:,}  "
-            f"critic_heads={n_dec:,}@lr={lr:g}  backbone={n_bb:,}@lr={bb_lr:g}"
+            f"[{head_set}] unfreeze={unfreeze_eff}  frozen={n_frozen:,}  "
+            f"value_heads={n_dec:,}@lr={lr:g}  backbone={n_bb:,}@lr={bb_lr:g}"
         )
         opt = torch.optim.AdamW(groups, lr=lr, weight_decay=weight_decay)
     else:
@@ -3334,6 +3926,15 @@ def train(
         "critic_lambda_is_ahead": CRITIC_LAMBDA_IS_AHEAD,
         "critic_lambda_post": CRITIC_LAMBDA_POST,
         "critic_lambda_cons": CRITIC_LAMBDA_CONS,
+        "critic_lambda_delta": CRITIC_LAMBDA_DELTA,
+        "value_current_stat_channels": list(VALUE_CURRENT_STAT_CHANNELS),
+        "value_lambda_win": VALUE_LAMBDA_WIN,
+        "value_lambda_rank": VALUE_LAMBDA_RANK,
+        "value_lambda_score": VALUE_LAMBDA_SCORE,
+        "value_lambda_current": VALUE_LAMBDA_CURRENT,
+        "value_lambda_back": VALUE_LAMBDA_BACK,
+        "value_lambda_fwd": VALUE_LAMBDA_FWD,
+        "value_lambda_cons": VALUE_LAMBDA_CONS,
     }
 
     log: list[dict[str, Any]] = []
@@ -3357,7 +3958,7 @@ def train(
                 owner_oh = _owner_oh_from_batch(batch)
                 preds = model(entity_tokens, entity_mask, owner_oh)
                 total_loss, per_head = compute_loss_v3(preds, batch)
-            elif head_set == "critic":
+            elif head_set in ("critic", "value"):
                 owner_oh = _owner_oh_from_batch(batch)
                 preds = model(entity_tokens, entity_mask, owner_oh)
                 post_preds = None
@@ -3373,7 +3974,15 @@ def train(
                         )
                     post_owner = _owner_oh_from_batch(post_batch)
                     post_preds = model(post_et, post_em, post_owner)
-                total_loss, per_head = compute_loss_critic(preds, batch, post_preds=post_preds)
+                if head_set == "value":
+                    total_loss, per_head = compute_loss_value_pretrain(
+                        preds, batch, post_preds=post_preds,
+                        fwd_gamma=fwd_gamma,
+                    )
+                else:
+                    total_loss, per_head = compute_loss_critic(
+                        preds, batch, post_preds=post_preds,
+                    )
             elif head_set == "v2":
                 owner_oh = _owner_oh_from_batch(batch)
                 preds = model(entity_tokens, entity_mask, owner_oh)
@@ -3405,7 +4014,12 @@ def train(
             "train_per_head": train_per_head, "elapsed_s": elapsed,
         }
 
-        _eval_fn = {"v3": evaluate_v3, "v2": evaluate_v2, "critic": evaluate_critic}.get(head_set, evaluate)
+        _eval_fn = {
+            "v3": evaluate_v3,
+            "v2": evaluate_v2,
+            "critic": evaluate_critic,
+            "value": evaluate_value_pretrain,
+        }.get(head_set, evaluate)
         if epoch % eval_every == 0 or epoch == epochs:
             val = _eval_fn(model, fenc, penc, eenc, val_loader, device)
             mean = sum(m["loss"] for m in val.values()) / max(1, len(val))
@@ -3730,7 +4344,7 @@ def main() -> None:
              "cache via the manifest's per-split stem lists.",
     )
     parser.add_argument(
-        "--head-set", choices=("v1", "v2", "v3", "critic"), default="v1",
+        "--head-set", choices=("v1", "v2", "v3", "critic", "value"), default="v1",
         help="v1 (default): legacy 25-head Tier-1/2/3/4 menu. "
              "v2: PlayerConsolidator + slimmed advantage/future heads "
              "(per-player winner/leader_k via BCE, learner is_ahead_k / "
@@ -3740,26 +4354,29 @@ def main() -> None:
              "critic: PairCompareHead on V2 player_state plus per-player "
              "is_ahead BCE derived from leader_seat_t_plus_K; pair with "
              "--init-from a V2 ckpt, then choose --unfreeze none/l2/all. "
+             "value: standalone explicit value-pretrain heads from "
+             "glob||player_state (win/rank/score/current/momentum), kept "
+             "separate from PPO value loss. "
              "The ckpts are NOT cross-compatible.",
     )
     parser.add_argument(
         "--init-from", type=Path, default=None,
         help="Warm-start the backbone (cross.* / consolidator.*) from a prior "
-             "ckpt (strict=False). For head_set=critic, load a V2 playerpair "
-             "ckpt; pair_compare.* and is_ahead_head.* start fresh.",
+             "ckpt (strict=False). For head_set=critic/value, load a V2 "
+             "playerpair ckpt; new value heads start fresh.",
     )
     parser.add_argument(
         "--freeze-backbone", action="store_true", default=True,
-        help="(critic) freeze L2 + PlayerConsolidator; train only critic "
+        help="(critic/value) freeze L2 + PlayerConsolidator; train only value "
              "heads. On by default; override granularly with --unfreeze.",
     )
     parser.add_argument(
         "--no-freeze-backbone", dest="freeze_backbone", action="store_false",
-        help="(critic) fine-tune the whole stack (equivalent to --unfreeze all).",
+        help="(critic/value) fine-tune the whole stack (equivalent to --unfreeze all).",
     )
     parser.add_argument(
         "--unfreeze", choices=("none", "l2", "consolidator", "all"), default="none",
-        help="(critic) which backbone blocks fine-tune with the critic heads: "
+        help="(critic/value) which backbone blocks fine-tune with the value heads: "
              "none (freeze L2 + consolidator), l2 (unfreeze L2/CrossEntityAttention, "
              "keep consolidator frozen), consolidator (train PlayerConsolidator "
              "while preserving the actor's L2), all (L2 + consolidator). "
@@ -3768,13 +4385,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--backbone-lr-mult", type=float, default=0.1,
-        help="(critic) LR multiplier for unfrozen backbone blocks relative to "
-             "--lr (the fresh critic heads always train at full --lr). "
+        help="(critic/value) LR multiplier for unfrozen backbone blocks relative to "
+             "--lr (the fresh value heads always train at full --lr). "
              "Default 0.1 (10x smaller) for gentle pretrained-layer fine-tuning.",
     )
     parser.add_argument(
         "--aux-posterior", action="store_true",
-        help="(critic) prior/posterior consistency aux: a future mirror of "
+        help="(critic/value) prior/posterior consistency aux: a future mirror of "
              "HISTORY_OFFSETS (for T=10, frames t+45,t+40,...,t) is fit to "
              "the same outcome and the deployable prior (t-45,...,t) logits "
              "are pulled toward the stop-grad posterior logits. Trains a "
@@ -3782,8 +4399,16 @@ def main() -> None:
              "only the prior view. Requires --cross-cache-path.",
     )
     parser.add_argument(
+        "--fwd-gamma", type=float, default=VALUE_FWD_GAMMA,
+        help="(value) per-turn discount on the future 'explicit reward'. The "
+             "multi-horizon is_ahead labels {10,20,50} are weighted by "
+             "gamma**K (normalized), so a LARGE decay (small gamma) focuses "
+             f"training on near-future return. Default {VALUE_FWD_GAMMA} "
+             "(K=10 ~73%% of the weight, K=50 ~1%%). Set 0 to disable.",
+    )
+    parser.add_argument(
         "--lambda-cons", type=float, default=None,
-        help="(critic, aux) weight on the prior->posterior consistency MSE "
+        help="(critic/value, aux) weight on the prior->posterior consistency MSE "
              "(default 0.2).",
     )
     parser.add_argument(
@@ -3802,6 +4427,7 @@ def main() -> None:
     # compute_loss_critic).
     if args.lambda_cons is not None:
         globals()["CRITIC_LAMBDA_CONS"] = float(args.lambda_cons)
+        globals()["VALUE_LAMBDA_CONS"] = float(args.lambda_cons)
     if args.lambda_post is not None:
         globals()["CRITIC_LAMBDA_POST"] = float(args.lambda_post)
     if args.train_mode == "frozen":
@@ -3829,6 +4455,7 @@ def main() -> None:
             unfreeze=args.unfreeze,
             backbone_lr_mult=args.backbone_lr_mult,
             aux_posterior=args.aux_posterior,
+            fwd_gamma=args.fwd_gamma,
         )
         return
 
