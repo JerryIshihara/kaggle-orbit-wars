@@ -1,7 +1,7 @@
 """Joint action + value pretraining over ONE shared L2 backbone.
 
 The action head (PairHead, single-target contract) and the explicit value heads
-(win / rank / score / current-state / momentum / near-future is_ahead) branch
+(win + 5 relative P1 signals at future horizons + anti-shortcut aux) branch
 from the SAME ``EntityPretrainModel`` L2 — the action branch via L3/L4, the
 value branch via the PlayerConsolidator — so a combined loss co-adapts the one
 L2 (and L3/L4/consolidator/heads) while L0+L1 stay frozen ("L2~ unfreeze").
@@ -9,8 +9,9 @@ L2 (and L3/L4/consolidator/heads) while L0+L1 stay frozen ("L2~ unfreeze").
 Two caches feed the two losses (the action labels live in the pair cache, the
 value labels in the cross-entity cache); each batch is L0-encoded the same way
 and run through ``forward_with_context``, which emits both head groups. The
-value loss uses a large near-future decay so the value/critic representation
-focuses on near-future return (see ``cross_entity.VALUE_FWD_GAMMA``).
+value heads predict the ACTUAL FUTURE LEVEL sᵢ(t+K) of each P1 signal at
+horizons {5,10,15,20,50} (see ``value_signals`` / ``value_heads``); the diffs
+that drive PBRS shaping are derived from those levels at PPO time.
 
 Data note: the pair cache is T=6 and the cross-entity cache is T=10. A shared L2
 built with ``n_steps=10`` consumes both via ``step_embed[-T:]``, but for clean
@@ -22,7 +23,6 @@ cache-agnostic.
 
 from __future__ import annotations
 
-import itertools
 import json
 import math
 import time
@@ -89,20 +89,19 @@ def joint_train_step(
     value_batch: dict[str, torch.Tensor] | None,
     *,
     launch_weight: float = 1.0,
-    fwd_gamma: float = 0.9,
     value_coef: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Combined action + value loss over the shared L2.
 
     ``total = action_loss + value_coef * value_loss`` where the action loss is
     the single-target PairHead objective (``compute_multi_loss(single_target=
-    True)``) on the pair-cache batch, and the value loss is
-    ``compute_loss_value_pretrain`` (with near-future decay ``fwd_gamma``) on the
-    cross-entity batch. Either batch may be ``None`` (e.g. when one loader is
-    exhausted), in which case only the present side contributes. Per-head losses
-    are returned namespaced ``act/<head>`` and ``val/<head>``.
+    True)``) on the pair-cache batch, and the value loss is the action-impact
+    ``compute_value_pretrain_loss`` (win tier-1 + 5 future-level signal heads
+    tier-2 + aux tier-3) on the cross-entity batch. Either batch may be ``None``
+    (loader exhaustion) — only the present side contributes. Per-head losses are
+    returned namespaced ``act/<head>`` and ``val/<head>``.
     """
-    from .cross_entity import compute_loss_value_pretrain  # local: avoid import cycle
+    from .value_heads import compute_value_pretrain_loss
 
     fleet_enc, planet_enc, comet_enc = encoders
     total: torch.Tensor | None = None
@@ -125,9 +124,7 @@ def joint_train_step(
         val_out = _forward_context_from_batch(
             model, fleet_enc, planet_enc, comet_enc, value_batch,
         )
-        val_loss, val_terms = compute_loss_value_pretrain(
-            val_out, value_batch, fwd_gamma=fwd_gamma,
-        )
+        val_loss, val_terms = compute_value_pretrain_loss(val_out, value_batch)
         scaled = value_coef * val_loss
         total = scaled if total is None else total + scaled
         for k, v in val_terms.items():
@@ -165,16 +162,96 @@ def format_joint_per_head(
 
 
 def _cycle_zip(action_loader, value_loader):
-    """Yield (action_batch, value_batch) for max(len) steps, cycling the shorter
-    loader so every step trains both branches (the longer loader sets the epoch
-    length; the shorter repeats)."""
-    la = len(action_loader)
-    lv = len(value_loader)
-    n = max(la, lv)
-    a_it = iter(action_loader) if la == n else itertools.cycle(action_loader)
-    v_it = iter(value_loader) if lv == n else itertools.cycle(value_loader)
+    """Yield (action_batch, value_batch) for max(len) steps, restarting the
+    shorter loader's iterator when it is exhausted so every step trains both
+    branches (the longer loader sets the epoch length; the shorter repeats).
+
+    Uses explicit ``iter()`` reset on ``StopIteration`` rather than
+    ``itertools.cycle``: ``cycle`` caches every batch it has yielded, which (a)
+    pins a full epoch of collated tensors in RAM for the whole run and (b)
+    replays them in the IDENTICAL order every cycle (no re-shuffle). Re-iterating
+    a shuffled ``DataLoader`` reshuffles each pass and holds only the current
+    batch."""
+    n = max(len(action_loader), len(value_loader))
+    a_it = iter(action_loader)
+    v_it = iter(value_loader)
     for _ in range(n):
-        yield next(a_it), next(v_it)
+        try:
+            a = next(a_it)
+        except StopIteration:
+            a_it = iter(action_loader)
+            a = next(a_it)
+        try:
+            v = next(v_it)
+        except StopIteration:
+            v_it = iter(value_loader)
+            v = next(v_it)
+        yield a, v
+
+
+def _split_value_by_game(value_ds):
+    """Split the cross-entity value dataset into (train, val) Subsets BY GAME,
+    using the cache's stored ``split_stems`` (train/val/test stem lists) +
+    ``episode_to_stem``. Snapshots whose game-stem is in the val split go to the
+    held-out set; everything not-in-val (train + test stems, or all games if no
+    split metadata) is used for training. Returns ``(train_subset, val_subset)``;
+    ``val_subset`` is ``None`` when the cache carries no split metadata."""
+    from torch.utils.data import Subset
+
+    cfg = getattr(value_ds, "config", {}) or {}
+    split = cfg.get("split_stems")
+    e2s = cfg.get("episode_to_stem")
+    keys = value_ds.keys
+    if not split or not e2s:
+        print("[joint] WARNING: cross cache has no split_stems/episode_to_stem — "
+              "training value heads on ALL games with NO held-out eval (win_acc "
+              "cannot be trusted; rebuild the cache to enable the holdout).",
+              flush=True)
+        return value_ds, None
+
+    val_stems = set(split.get("val", []))
+    val_idx, train_idx = [], []
+    for i, (ep, _t) in enumerate(keys):
+        (val_idx if e2s.get(ep) in val_stems else train_idx).append(i)
+    n_train_games = len({e2s.get(keys[i][0]) for i in train_idx})
+    n_val_games = len({e2s.get(keys[i][0]) for i in val_idx})
+    print(f"[joint] value split BY GAME: train={len(train_idx)} snaps / "
+          f"{n_train_games} games | holdout(val)={len(val_idx)} snaps / "
+          f"{n_val_games} games", flush=True)
+    return Subset(value_ds, train_idx), Subset(value_ds, val_idx)
+
+
+@torch.no_grad()
+def _value_holdout_eval(model, encoders, val_loader, device,
+                        max_batches: int = 64) -> dict[str, float]:
+    """Held-out value-head eval over whole games the model never trained on.
+    Returns mean per-head metrics namespaced ``holdout/<head>`` (e.g.
+    ``holdout/win``, ``holdout/win_acc``, ``holdout/fwd``) — distinct from the
+    training-time ``val/<head>`` keys, where 'val' means VALUE-branch, not
+    validation. Caps at ``max_batches`` (the loader is shuffled, so this is a
+    representative sample across all holdout games — win is per-game-constant,
+    so cross-game coverage is what matters) to keep per-epoch eval cheap even
+    when the holdout set is large. Dropout off via ``model.eval()``; caller
+    restores ``train()``."""
+    from .value_heads import compute_value_pretrain_loss
+
+    fleet_enc, planet_enc, comet_enc = encoders
+    model.eval()
+    agg: dict[str, float] = {}
+    cnt: dict[str, int] = {}
+    for bi, batch in enumerate(val_loader):
+        if bi >= max_batches:
+            break
+        batch = {k: v.to(device) for k, v in batch.items()}
+        out = _forward_context_from_batch(
+            model, fleet_enc, planet_enc, comet_enc, batch)
+        _loss, per = compute_value_pretrain_loss(out, batch)
+        for k, v in per.items():
+            if isinstance(v, float) and math.isnan(v):
+                continue
+            agg[k] = agg.get(k, 0.0) + v
+            cnt[k] = cnt.get(k, 0) + 1
+    return {f"holdout/{k}": agg[k] / max(1, cnt[k]) for k in agg}
 
 
 def train_joint(
@@ -192,8 +269,9 @@ def train_joint(
     lr: float = 1e-4,
     weight_decay: float = 1e-4,
     launch_weight: float = 1.0,
-    fwd_gamma: float = 0.9,
     value_coef: float = 1.0,
+    value_dropout: float = 0.1,
+    warm_start: Path | None = None,
     num_workers: int = 0,
     device: str | None = None,
     seed: int = 0,
@@ -226,27 +304,77 @@ def train_joint(
     model = EntityPretrainModel(
         d_model=d_model, n_steps=n_steps,
         with_consolidator=True, with_value_heads=True,
+        value_dropout=value_dropout,
     ).to(device)
+    if warm_start is not None:
+        ck = torch.load(warm_start, map_location=device, weights_only=False)
+        sd = ck.get("model", ck)
+        # Warm-start the shared backbone + action head (PairHead/L2/L3/L4/
+        # consolidator) from the previous run; the NEW value heads stay fresh.
+        # DROP any old ``value_heads.*`` keys first: the previous design's value
+        # heads share names with the new ones at DIFFERENT shapes, and
+        # ``load_state_dict(strict=False)`` still hard-errors on a shape mismatch
+        # for a shared key (it only tolerates missing/unexpected). Filtering them
+        # out guarantees the new value heads initialize fresh.
+        n_drop = sum(1 for k in sd if k.startswith("value_heads."))
+        sd = {k: v for k, v in sd.items() if not k.startswith("value_heads.")}
+        res = model.load_state_dict(sd, strict=False)
+        non_value_missing = [k for k in res.missing_keys
+                             if not k.startswith("value_heads.")]
+        print(f"[joint] warm-started from {warm_start}: loaded {len(sd)} backbone/"
+              f"action tensors; dropped {n_drop} old value_heads.* (re-init fresh); "
+              f"missing={len(res.missing_keys)} (non-value={len(non_value_missing)}) "
+              f"unexpected={len(res.unexpected_keys)}", flush=True)
+        if non_value_missing:
+            print(f"[joint]   WARNING non-value missing keys (backbone skew?): "
+                  f"{non_value_missing[:6]}", flush=True)
     report = model.freeze_below_l2()
     print("[joint] freeze_below_l2 (L0+L1 frozen, L2+ trainable):", flush=True)
     for k, v in report.items():
         print(f"    {k:<28s} {v:,}", flush=True)
 
     print(f"[joint] action cache: {pair_cache_path}", flush=True)
-    action_ds = CachedPairDataset(pair_cache_path)
+    action_full = CachedPairDataset(pair_cache_path)
+    # Train the action head ONLY on acted (launch) turns — non-acted snapshots
+    # are kept in the cache solely as T-history context. Iterating the whole
+    # cache (all snapshots) floods the single-target CE with pure-NOOP turns
+    # and drives the actor to over-hold; restricting to acted_indices keeps the
+    # launch:hold balance close to the experts'. (entity_encoder.train does the
+    # same via train_row_indices=acted_indices.)
+    acted = list(getattr(action_full, "acted_indices", []) or [])
+    action_ds = torch.utils.data.Subset(action_full, acted) if acted else action_full
+    print(
+        f"[joint]   {len(action_full)} snapshots; training on "
+        f"{len(action_ds)} ACTED/launch turns "
+        f"({100 * len(action_ds) / max(1, len(action_full)):.0f}% acted)",
+        flush=True,
+    )
     print(f"[joint] value  cache: {cross_cache_path}", flush=True)
     value_ds = CachedCrossEntitySnapshotDataset(cross_cache_path)
+    # --- game-level train/val split for the value branch ---
+    # The win head's label is a per-game CONSTANT, so a snapshot-level split
+    # leaks (sibling snapshots of the same game land in both sides) and the head
+    # memorizes game identity. Split by GAME using the cache's `split_stems`, and
+    # hold the val games out entirely so `val/win_acc` measures real generalization.
+    from torch.utils.data import Subset
+    value_train_ds, value_val_ds = _split_value_by_game(value_ds)
     action_loader = DataLoader(
         action_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, drop_last=True,
     )
     value_loader = DataLoader(
-        value_ds, batch_size=batch_size, shuffle=True,
+        value_train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, drop_last=True,
+    )
+    value_val_loader = (
+        DataLoader(value_val_ds, batch_size=batch_size, shuffle=True,
+                   num_workers=num_workers, drop_last=False)
+        if value_val_ds is not None and len(value_val_ds) > 0 else None
     )
     print(
         f"[joint] action batches/epoch={len(action_loader)}  "
-        f"value batches/epoch={len(value_loader)}  "
+        f"value(train) batches/epoch={len(value_loader)}  "
+        f"value(holdout) batches={len(value_val_loader) if value_val_loader else 0}  "
         f"steps/epoch={max(len(action_loader), len(value_loader))}",
         flush=True,
     )
@@ -262,10 +390,19 @@ def train_joint(
     config = {
         "d_model": d_model, "n_steps": n_steps, "batch_size": batch_size,
         "epochs": epochs, "lr": lr, "launch_weight": launch_weight,
-        "fwd_gamma": fwd_gamma, "value_coef": value_coef,
+        "value_coef": value_coef, "value_dropout": value_dropout,
+        "warm_start": str(warm_start) if warm_start else None,
         "action_contract": "single_target_per_source_v1",
         "pair_cache_path": str(pair_cache_path),
         "cross_cache_path": str(cross_cache_path),
+        # Architecture (matches the EntityPretrainModel(...) built above) so
+        # runner.TransformerAgent.load() reconstructs the stack correctly
+        # instead of falling back to the legacy d_pair=128 / 4-head defaults.
+        "d_pair": d_model,
+        "entity_n_heads": 8, "cross_n_heads": 8, "cross_n_layers": 2,
+        "dual_n_heads": 8, "conditioner_n_layers": 1, "head_n_layers": 1,
+        "skip_l34": False, "with_consolidator": True, "with_value_heads": True,
+        "max_planets": 64, "max_fleets": 1024,
     }
 
     for epoch in range(1, epochs + 1):
@@ -281,7 +418,7 @@ def train_joint(
             total_loss, per_head = joint_train_step(
                 model, (fleet_enc, planet_enc, comet_enc),
                 action_batch, value_batch,
-                launch_weight=launch_weight, fwd_gamma=fwd_gamma,
+                launch_weight=launch_weight,
                 value_coef=value_coef,
             )
             opt.zero_grad()
@@ -312,8 +449,26 @@ def train_joint(
         )
         print(format_joint_per_head(mean_per_head, title=f"ep {epoch} train"), flush=True)
 
+        # --- held-out value eval on whole games never seen in training ---
+        val_metrics: dict[str, float] = {}
+        if value_val_loader is not None:
+            val_metrics = _value_holdout_eval(
+                model, (fleet_enc, planet_enc, comet_enc), value_val_loader, device)
+            model.train()  # restore (eval() was set inside)
+            print(format_joint_per_head(val_metrics, title=f"ep {epoch} HOLDOUT (val games)"),
+                  flush=True)
+            tr_wa = mean_per_head.get("val/win_acc")
+            ho_wa = val_metrics.get("holdout/win_acc")
+            if tr_wa is not None and ho_wa is not None:
+                # The memorization tell: train win_acc → 1.0 while held-out stays
+                # near the 0.5–0.67 base rate ⇒ the win head is memorizing games.
+                print(f"    [win memorization gap] train_win_acc={tr_wa:.3f}  "
+                      f"holdout_win_acc={ho_wa:.3f}  gap={tr_wa - ho_wa:+.3f}",
+                      flush=True)
+
         entry = {"epoch": epoch, "joint_total": mean_total,
-                 "per_head": mean_per_head, "elapsed_s": elapsed}
+                 "per_head": mean_per_head, "holdout": val_metrics,
+                 "elapsed_s": elapsed}
         log.append(entry)
         torch.save({"model": model.state_dict(), "epoch": epoch, "config": config}, last_path)
         if epoch == 1 or mean_total <= min(e["joint_total"] for e in log):
@@ -326,8 +481,6 @@ def train_joint(
 
 def main() -> None:
     import argparse
-
-    from .cross_entity import VALUE_FWD_GAMMA
 
     p = argparse.ArgumentParser(
         description="Joint action+value pretrain over one shared L2 "
@@ -352,11 +505,16 @@ def main() -> None:
     p.add_argument("--launch-weight", type=float, default=1.0,
                    help="up-weight launching source rows in the action CE "
                         "(single-target NOOP-imbalance control)")
-    p.add_argument("--fwd-gamma", type=float, default=VALUE_FWD_GAMMA,
-                   help="per-turn discount on the future is_ahead reward; "
-                        "large decay (small gamma) -> near-future focus")
     p.add_argument("--value-coef", type=float, default=1.0,
                    help="weight on the value loss relative to the action loss")
+    p.add_argument("--value-dropout", type=float, default=0.1,
+                   help="dropout on the value trunk/heads ONLY (decoupled from "
+                        "the action backbone) — regularizes the win head against "
+                        "memorizing the small set of training games")
+    p.add_argument("--warm-start", type=Path, default=None,
+                   help="previous joint_best.pt to warm-start the shared "
+                        "backbone + action head from (strict=False; the new "
+                        "value heads stay freshly initialized)")
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--seed", type=int, default=0)
@@ -377,8 +535,9 @@ def main() -> None:
         lr=args.lr,
         weight_decay=args.weight_decay,
         launch_weight=args.launch_weight,
-        fwd_gamma=args.fwd_gamma,
         value_coef=args.value_coef,
+        value_dropout=args.value_dropout,
+        warm_start=args.warm_start,
         num_workers=args.num_workers,
         device=args.device,
         seed=args.seed,

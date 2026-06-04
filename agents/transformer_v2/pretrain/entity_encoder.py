@@ -761,6 +761,7 @@ class EntityPretrainModel(nn.Module):
         with_value_heads: bool = False,
         value_trunk_n_layers: int = 2,
         value_head_n_layers: int = 2,
+        value_dropout: float | None = None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -896,11 +897,15 @@ class EntityPretrainModel(nn.Module):
                     "(the value branch reads player_state off L2)."
                 )
             from .value_heads import ValuePretrainHeads
+            # The value heads (esp. the per-game-constant win head) overfit on a
+            # small replay set; give them their OWN dropout, decoupled from the
+            # backbone's (the action backbone generalizes fine and wants 0).
+            v_drop = dropout if value_dropout is None else value_dropout
             self.value_heads = ValuePretrainHeads(
                 d_model,
                 trunk_n_layers=value_trunk_n_layers,
                 head_n_layers=value_head_n_layers,
-                dropout=dropout,
+                dropout=v_drop,
             )
         else:
             self.value_heads = None
@@ -1592,8 +1597,9 @@ def _pair_single_target_ce(
     empty = {
         "pair_ce": 0.0, "pair_acc": float("nan"),
         "noop_acc": float("nan"), "launch_acc": float("nan"),
+        "launch_recall": float("nan"), "launch_r@5": float("nan"),
         "n_rows": 0, "n_correct": 0, "n_noop": 0, "n_noop_correct": 0,
-        "n_launch": 0, "n_launch_correct": 0,
+        "n_launch": 0, "n_launch_correct": 0, "n_launch_recalled": 0,
         "rk1": 0, "rk5": 0, "rk10": 0, "ce_sum": 0.0,
     }
     if not bool(active.any()):
@@ -1638,6 +1644,14 @@ def _pair_single_target_ce(
         n_launch_correct = (
             int((pred[launch_sel] == lab[launch_sel]).sum()) if n_launch else 0
         )
+        # launch RECALL: of true-launch rows, did the model commit to ANY launch
+        # (argmax off the diagonal), regardless of hitting the exact target? This
+        # separates "decided to launch" from launch_acc's exact-target match — the
+        # key over-holding diagnostic (low launch_acc + high recall => right
+        # instinct, wrong target; low recall => still holding).
+        n_launch_recalled = (
+            int((pred[launch_sel] != src_of_row[launch_sel]).sum()) if n_launch else 0
+        )
         rk = {1: 0, 5: 0, 10: 0}
         if n_launch:
             lr = rl[launch_sel]                            # (Nl,P)
@@ -1651,9 +1665,12 @@ def _pair_single_target_ce(
         "pair_acc": n_correct / max(1, n_rows),
         "noop_acc": (n_noop_correct / n_noop) if n_noop else float("nan"),
         "launch_acc": (n_launch_correct / n_launch) if n_launch else float("nan"),
+        "launch_recall": (n_launch_recalled / n_launch) if n_launch else float("nan"),
+        "launch_r@5": (rk[5] / n_launch) if n_launch else float("nan"),
         "n_rows": n_rows, "n_correct": n_correct,
         "n_noop": n_noop, "n_noop_correct": n_noop_correct,
         "n_launch": n_launch, "n_launch_correct": n_launch_correct,
+        "n_launch_recalled": n_launch_recalled,
         "rk1": rk[1], "rk5": rk[5], "rk10": rk[10],
         "ce_sum": float(ce.detach()) * n_rows,
     }
@@ -1729,6 +1746,8 @@ def compute_multi_loss(
             per_head["pair_acc"] = ce_diag["pair_acc"]
             per_head["noop_acc"] = ce_diag["noop_acc"]
             per_head["launch_acc"] = ce_diag["launch_acc"]
+            per_head["launch_recall"] = ce_diag["launch_recall"]
+            per_head["launch_r@5"] = ce_diag["launch_r@5"]
             total = total + ce
         if "pair_frac" in enabled_heads and "pair_ships" in batch:
             ships = batch["pair_ships"].float()

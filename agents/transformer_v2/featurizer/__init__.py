@@ -55,6 +55,14 @@ from .action_featurizer import (
     save_episode_action_csv,
 )
 from .inference import featurize_observation
+from .swap import (
+    ClockwiseSeatSwap,
+    clockwise_owner_map,
+    clockwise_owner_map_from_initial_obs,
+    infer_num_players_from_obs,
+    spatial_rotation_from_initial_obs,
+    swap_observation_seats,
+)
 
 __all__ = [
     # fleet
@@ -100,4 +108,11 @@ __all__ = [
     "save_episode_action_csv",
     # inference (live obs → batch dict)
     "featurize_observation",
+    # optional pre-featurizer obs transforms
+    "ClockwiseSeatSwap",
+    "clockwise_owner_map",
+    "clockwise_owner_map_from_initial_obs",
+    "infer_num_players_from_obs",
+    "spatial_rotation_from_initial_obs",
+    "swap_observation_seats",
 ]

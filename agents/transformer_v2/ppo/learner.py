@@ -25,6 +25,7 @@ class PPOConfig:
     minibatch_size: int = 1024
     lr_heads: float = 1e-4
     lr_trunk: float | None = None         # None = trunk frozen (Phase 0)
+    lr_perception: float | None = None    # L2 cross+consolidator lr; None = fold into trunk. Set << lr_trunk (e.g. 1e-7) — perception drift at lr_trunk inflates policy entropy / destabilizes.
     value_coef: float = 0.5
     ent_coef: float = 0.01
     bc_coef: float = 0.05
@@ -54,16 +55,75 @@ def build_optimizer(policy: nn.Module, cfg: PPOConfig) -> torch.optim.Optimizer:
                 head_param_ids.add(id(p))
                 head_params.append(p)
 
+    # Deep L2 perception (cross + consolidator) gets its own (smaller) lr when
+    # cfg.lr_perception is set — layer-wise decay. At the trunk lr these layers
+    # drift and inflate the policy entropy (the L2 destabilization). None => fold
+    # them into the trunk group (legacy 2-group behaviour).
+    perception_param_ids: set[int] = set()
+    perception_params: list[torch.nn.Parameter] = []
+    if cfg.lr_perception is not None:
+        for name in ("cross", "consolidator"):
+            mod = getattr(policy.entity_model, name, None)
+            if mod is None:
+                continue
+            for p in mod.parameters():
+                if p.requires_grad and id(p) not in head_param_ids \
+                        and id(p) not in perception_param_ids:
+                    perception_param_ids.add(id(p))
+                    perception_params.append(p)
+
     trunk_params: list[torch.nn.Parameter] = []
     for p in policy.parameters():
-        if p.requires_grad and id(p) not in head_param_ids:
+        if p.requires_grad and id(p) not in head_param_ids \
+                and id(p) not in perception_param_ids:
             trunk_params.append(p)
 
     groups = [{"params": head_params, "lr": cfg.lr_heads}]
     if trunk_params:
         lr_trunk = cfg.lr_trunk if cfg.lr_trunk is not None else cfg.lr_heads
         groups.append({"params": trunk_params, "lr": lr_trunk})
+    if perception_params:
+        groups.append({"params": perception_params, "lr": cfg.lr_perception})
     return torch.optim.AdamW(groups, weight_decay=0.0)
+
+
+def _policy_device(policy: nn.Module) -> torch.device:
+    for p in policy.parameters():
+        return p.device
+    return torch.device("cpu")
+
+
+def _move_tree(x, device: torch.device):
+    if isinstance(x, torch.Tensor):
+        return x.to(device, non_blocking=True)
+    if isinstance(x, dict):
+        return {k: _move_tree(v, device) for k, v in x.items()}
+    return x
+
+
+def _move_ppo_minibatch(mb: PPOMinibatch, device: torch.device) -> PPOMinibatch:
+    return PPOMinibatch(
+        feats=_move_tree(mb.feats, device),
+        pair_mask=mb.pair_mask.to(device, non_blocking=True),
+        source_mask=mb.source_mask.to(device, non_blocking=True),
+        tgt_idx=mb.tgt_idx.to(device, non_blocking=True),
+        frac_raw=mb.frac_raw.to(device, non_blocking=True),
+        old_logp=mb.old_logp.to(device, non_blocking=True),
+        adv=mb.adv.to(device, non_blocking=True),
+        returns=mb.returns.to(device, non_blocking=True),
+        noop_logit_bias=mb.noop_logit_bias,
+    )
+
+
+def _move_bc_minibatch(mb: BCMinibatch | None, device: torch.device) -> BCMinibatch | None:
+    if mb is None:
+        return None
+    return BCMinibatch(
+        feats=_move_tree(mb.feats, device),
+        pair_mask=mb.pair_mask.to(device, non_blocking=True),
+        source_mask=mb.source_mask.to(device, non_blocking=True),
+        expert_tgt_idx=mb.expert_tgt_idx.to(device, non_blocking=True),
+    )
 
 
 def ppo_update_local(
@@ -99,14 +159,19 @@ def ppo_update_local(
     # GAE here, rebuild the minibatches.
 
     opt = build_optimizer(policy, cfg)
+    device = _policy_device(policy)
 
     epoch_metrics: list[dict[str, float]] = []
     for epoch in range(cfg.epochs):
         running_kl = 0.0
         n_mb = 0
         epoch_logs: dict[str, list[float]] = {}
-        for mb in ppo_minibatches:
-            bc_mb = bc_minibatch_source(mb.size) if cfg.bc_coef > 0 else None
+        for mb_cpu in ppo_minibatches:
+            mb = _move_ppo_minibatch(mb_cpu, device)
+            bc_mb = (
+                _move_bc_minibatch(bc_minibatch_source(mb.size), device)
+                if cfg.bc_coef > 0 else None
+            )
             loss, diag = ppo_minibatch_loss(
                 policy, mb, bc_mb,
                 clip=cfg.clip,

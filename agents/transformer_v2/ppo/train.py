@@ -619,7 +619,7 @@ def main():
             total_steps += len(ep.steps)
             total_invalid += sum(s.invalid_launch for s in ep.steps)
             total_emitted += sum(s.emitted_launch for s in ep.steps)
-            total_noop += sum(1 for s in ep.steps if s.action.source_id < 0)
+            total_noop += sum(1 for s in ep.steps if s.action.n_launch == 0)
         rollout_sec = time.time() - t_roll
         print(f"[train] rollout: {args.episodes_per_iter} eps "
               f"({max(1, args.rollout_workers)} workers), "

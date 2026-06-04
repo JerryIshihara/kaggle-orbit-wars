@@ -631,6 +631,40 @@ self-play pool. A startup calibration eval (`baseline` self-eval) bootstraps
 the relative thresholds for iter 1 and also catches eval-harness bugs
 (baseline-vs-baseline winrate must be `0.50 ± 0.05`).
 
+### ⚠️ IMPORTANT — Potential direction: the PPO clip can truncate a positively-skewed advantage signal
+
+> **Symptom seen across PPO iters:** low KL, slowly drifting entropy, and *no
+> winrate gain* vs `physical_v4` — the policy keeps moving but never improves.
+> Aggressive lr/clip degenerates; conservative settings are stable-but-flat.
+>
+> **Hypothesis.** PPO's clipped surrogate is **one-sided per advantage sign**, so
+> a *positively-skewed* advantage distribution makes the clip bite asymmetrically:
+>
+> - **A > 0** (action we want to reinforce): `min(r·A, clip(r, 1−ε, 1+ε)·A)`.
+>   Once `r > 1+ε` the term saturates at `(1+ε)·A` → **zero gradient**. The
+>   strongest-positive, highest-bootstrap transitions — exactly the ones we most
+>   want to reinforce — stop contributing the moment the policy starts moving
+>   toward them.
+> - **A < 0** (action we want to suppress): on the `r > 1` side the surrogate is
+>   **unclipped**, so the push *away* keeps full gradient.
+>
+> Net effect: the policy is **pushed away from many mediocre actions more freely
+> than it is pulled toward the few great ones.** With a heavy positive tail
+> (sparse big wins — terminal win bonus + PBRS shaping), the clip preferentially
+> kills the *reinforcing* half of the signal. This is consistent with the
+> observed "moves but doesn't get better."
+>
+> **Caveat — normalization does NOT fix this.** Standardizing advantages to
+> zero-mean / unit-variance removes magnitude and mean, but **the skew (3rd
+> moment) survives standardization** — the asymmetry is in the shape, not the scale.
+>
+> **Levers to test:**
+> - **Larger clip `ε`** (0.10 → **0.20**, currently under test) — lets the positive tail keep gradient longer before saturating.
+> - **Fewer PPO epochs per batch** — `r` drifts past `1+ε` less often.
+> - **Generous early-stop KL** (already raised to 0.05) — halts before the positive tail clips out.
+> - **Per-minibatch advantage clip / Huber on the advantage** instead of (or alongside) the ratio clip — bounds update *magnitude* without zeroing the high-advantage gradient.
+> - **Asymmetric clip** — drop (or loosen) the *upper* clip for `A > 0` while keeping the lower clip for stability; or a KL-penalty / trust-region variant that doesn't hard-saturate the positive side.
+
 ### Detail references
 
 | Doc | What's in it |

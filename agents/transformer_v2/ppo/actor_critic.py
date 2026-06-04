@@ -46,6 +46,10 @@ class PPOActorCritic(nn.Module):
         value_hidden: int | None = None,
         allow_debug_glob_critic: bool = False,
         critic_model: nn.Module | None = None,
+        reward_decomp: bool = False,
+        win_weight: float = 1.0,
+        signal_weights: list[float] | None = None,
+        value_gamma: float = 0.997,
     ):
         super().__init__()
         self.entity_model = entity_model
@@ -91,6 +95,23 @@ class PPOActorCritic(nn.Module):
         )
         nn.init.zeros_(self.value_head[-1].weight)
         nn.init.zeros_(self.value_head[-1].bias)
+
+        # ---- Design A reward-decomposition critic (optional) ----
+        # The shaped reward uses a terminal win indicator z∈{0,1} plus PBRS
+        # γΦ(s')−Φ(s). Match that scale directly:
+        #
+        #   V(s) = win_weight·P(win|s) − Φ(s) + residual(glob)
+        #
+        # using ONLY the pretrained win head (learner slot 0). The forward/back/
+        # survives/rank heads stay loaded to warm the shared value trunk, but are
+        # auxiliary here, not value terms. The signal weights and γ live on the
+        # reward side where Φ=Σwᵢsᵢ is calculated from stored step features.
+        self.reward_decomp = bool(reward_decomp)
+        self.win_weight = float(win_weight)
+        if self.reward_decomp and getattr(entity_model, "value_heads", None) is None:
+            raise ValueError(
+                "reward_decomp critic needs entity_model built with "
+                "with_value_heads=True (and the win head loaded).")
 
         # sigma is a fixed hyperparameter (CLI flag at the training driver),
         # registered as a buffer so it serializes with the checkpoint without
@@ -205,6 +226,7 @@ class PPOActorCritic(nn.Module):
         is_comet: torch.Tensor | None = None,
         pair_type_ids: torch.Tensor | None = None,
         planet_owner_oh: torch.Tensor | None = None,
+        phi: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         # Use the supervised model's forward_with_context, which returns
         # ``glob``, ``ctx_now``, and ``player_state`` alongside the actor's
@@ -216,7 +238,22 @@ class PPOActorCritic(nn.Module):
             planet_owner_oh=planet_owner_oh,
         )
 
-        if out["player_state"] is not None:
+        if self.reward_decomp and out["player_state"] is not None:
+            # Design A: calibrated win probability for the terminal z∈{0,1}
+            # reward, minus the current PBRS potential, plus a zero-init residual
+            # fine-tuned on shaped returns. The forward/survives/rank/back heads
+            # stay loaded to warm the shared value trunk but are auxiliary here.
+            vh = self.entity_model.value_heads(out["glob"], out["player_state"])
+            win_logit = vh["win"][:, 0]                              # (B,) learner slot 0
+            v_win = self.win_weight * torch.sigmoid(win_logit)
+            residual = self.value_head(out["glob"]).squeeze(-1)      # zero-init, fine-tuned
+            # subtract the CALCULATED potential Φ(s) (PBRS return ≈ win − Φ); phi is
+            # carried in from the rollout/minibatch. None at rollout time (Φ not yet
+            # computed) → the stored value is corrected by −Φ post-rollout instead.
+            phi_term = phi if phi is not None else 0.0
+            value = v_win - phi_term + residual
+            player_valid = None     # not needed by the reward-decomp critic
+        elif out["player_state"] is not None:
             # Post-L2 critic: PlayerConsolidator consumes L2 ctx_now, so the
             # value path is downstream of completed perception and never reads
             # L1 tokens.

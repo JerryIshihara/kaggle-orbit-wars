@@ -526,7 +526,7 @@ def main() -> int:
                     continue
                 episodes.append(ep)
                 nsteps = len(ep.steps); won = int(ep.winner == seat)
-                noop = sum(1 for s in ep.steps if s.action.source_id < 0)
+                noop = sum(1 for s in ep.steps if s.action.n_launch == 0)
                 meanv = (sum(s.value for s in ep.steps) / nsteps) if nsteps else 0.0
                 ep_meta.append({"seed": seed, "seat": seat, "num_players": n_players,
                                 "winner": ep.winner, "steps": nsteps, "won": won,
@@ -583,7 +583,7 @@ def main() -> int:
                 for ep, (seed, n_players, seat) in zip(eps, chunk):
                     episodes.append(ep)
                     nsteps = len(ep.steps); won = int(ep.winner == seat)
-                    noop = sum(1 for s in ep.steps if s.action.source_id < 0)
+                    noop = sum(1 for s in ep.steps if s.action.n_launch == 0)
                     meanv = (sum(s.value for s in ep.steps) / nsteps) if nsteps else 0.0
                     ep_meta.append({"seed": seed, "seat": seat, "num_players": n_players,
                                     "winner": ep.winner, "steps": nsteps, "won": won,
@@ -615,7 +615,7 @@ def main() -> int:
                 episodes.append(ep)
                 won = int(ep.winner == seat)
                 nsteps = len(ep.steps)
-                noop = sum(1 for s in ep.steps if s.action.source_id < 0)
+                noop = sum(1 for s in ep.steps if s.action.n_launch == 0)
                 meanv = (sum(s.value for s in ep.steps) / nsteps) if nsteps else 0.0
                 wall = time.time() - t_ep
                 ep_meta.append({"seed": seed, "seat": seat, "num_players": n_players,

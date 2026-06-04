@@ -1,166 +1,176 @@
-"""Shared explicit value-pretrain heads (the /tmp value_pretrain_design.md set).
+"""Value-pretrain heads (action-impact design).
 
-This module factors the value/momentum heads out of
-:class:`agents.transformer_v2.pretrain.cross_entity.CrossEntityCriticModel` so
-the SAME head set can be attached to the action model
-(:class:`agents.transformer_v2.pretrain.entity_encoder.EntityPretrainModel`),
-letting the action head (PairHead, off L3/L4) and the value heads (off the
-PlayerConsolidator) **branch from the one shared L2 backbone** and train
-jointly.
+Off the shared L2 (via ``feat = concat(glob, player_state)`` → ``value_trunk``):
 
-Forward consumes ``glob (B, d)`` + ``player_state (B, O, d)`` (O = owner/player
-slots, normally 4) — exactly what ``forward_with_context`` already returns — and
-emits the same dict keys as ``CrossEntityCriticModel.forward``'s value subset,
-so ``cross_entity.compute_loss_value_pretrain`` consumes the output unchanged.
+  TIER 1 (objective)   win            (O,)        terminal win/loss, BCE
+  TIER 2 (PPO value)   fwd            (O,5,5)     per-signal FUTURE LEVEL sᵢ(t+K),
+                                                  5 P1 signals × P1_FWD_HORIZONS, Huber
+  TIER 3 (aux)         back           (O,5,3)     backward Δ sᵢ(t)−sᵢ(t−K) (anti-shortcut), Huber
+                       rank           (O,)        final-rank ordering, ListMLE
+                       survives       (O,5)       alive at t+K, BCE
 
-Kept import-light on purpose: it imports only ``_build_mlp`` (from
-``consolidator_heads``) and ``CROSS_ENTITY_VALUE_HORIZONS`` (from the
-featurizer). It must NOT import ``cross_entity`` (that would create an
-``entity_encoder -> value_heads -> cross_entity -> entity_encoder`` cycle).
+The 5 P1 signals (see value_signals.P1_SIGNAL_NAMES) are all relative-to-the-
+strongest-enemy advantage shares in [0,1]; the heads predict their actual future
+level. ``compute_value_pretrain_loss`` returns ``(total, per_head)`` with the
+tiered weights and a per-head breakdown for verbose logging. Import-light (only
+consolidator_heads + value_signals constants) — never imports cross_entity /
+entity_encoder, so no cycle.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .consolidator_heads import _build_mlp
-from ..featurizer.entity_featurizer import CROSS_ENTITY_VALUE_HORIZONS
-
-# Mirrors cross_entity.VALUE_CURRENT_STAT_CHANNELS (kept here as the canonical
-# definition; cross_entity may import these from this module later). Order is
-# the channel order of the current-state regression head.
-VALUE_CURRENT_STAT_CHANNELS: tuple[str, ...] = (
-    "ship_share",
-    "production_share",
-    "planet_share",
-    "fleet_ship_share",
-    "score_adv_norm",
+from .value_signals import (
+    N_P1_SIGNALS,
+    P1_BACK_HORIZONS,
+    P1_FWD_HORIZONS,
+    P1_SIGNAL_NAMES,
 )
-VALUE_N_CURRENT_STATS: int = len(VALUE_CURRENT_STAT_CHANNELS)
+
+N_FWD = len(P1_FWD_HORIZONS)
+N_BACK = len(P1_BACK_HORIZONS)
 
 
-def _zero_last_linear(module: nn.Module) -> None:
-    """Zero-init the final Linear (weight + bias) so the head starts neutral."""
-    last = module[-1] if isinstance(module, nn.Sequential) else None
+def _zero_last_linear(m: nn.Module) -> None:
+    last = m[-1] if isinstance(m, nn.Sequential) else m
     if isinstance(last, nn.Linear):
         nn.init.zeros_(last.weight)
         nn.init.zeros_(last.bias)
 
 
 class ValuePretrainHeads(nn.Module):
-    """Explicit supervised value/advantage heads over ``[glob ‖ player_state]``.
-
-    Heads on the trunked feature ``value_h = value_trunk(feat)`` (board + own
-    detail, zero-init final layer so they start neutral):
-
-      * ``win_logit``        (B, O)      final-win BCE logit
-      * ``rank_score``       (B, O)      ListMLE ranking score
-      * ``final_score_adv``  (B, O)      terminal score-advantage (Huber)
-      * ``current_stats``    (B, O, C)   current resource shares (Huber)
-
-    Heads on the raw ``feat`` (anti-shortcut temporal anchors + horizon value):
-
-      * ``is_ahead_logits``  (B, O, H)   per-horizon "ahead" logit (H horizons)
-      * ``dships_back``/``dplanets_back``/``trend_back`` (B,O[,3])  backward momentum
-      * ``dships_fwd``/``future_score_adv``/``survives_fwd`` (B,O)  forward momentum
-      * ``slope_back``/``slope_fwd``  (B,)   learner-slot OLS slopes
-
-    Output dict keys are identical to ``CrossEntityCriticModel.forward``'s value
-    subset (minus ``pair_logits``/``player_state``/``glob`` which the host model
-    already owns), so ``compute_loss_value_pretrain`` consumes it unchanged.
-    """
-
     def __init__(
-        self,
-        d_model: int,
-        *,
-        n_horizons: int = len(CROSS_ENTITY_VALUE_HORIZONS),
-        trunk_n_layers: int = 2,
-        head_n_layers: int = 2,
-        dropout: float = 0.0,
+        self, d_model: int, *,
+        trunk_n_layers: int = 2, head_n_layers: int = 2, dropout: float = 0.0,
     ):
         super().__init__()
-        self.d_model = d_model
-        feat_dim = 2 * d_model                           # [glob ‖ player_state]
-
+        feat = 2 * d_model
         self.value_trunk = _build_mlp(
-            in_dim=feat_dim, hidden=d_model, out_dim=d_model,
+            in_dim=feat, hidden=d_model, out_dim=d_model,
             n_layers=trunk_n_layers, dropout=dropout,
         )
-        # Heads over the trunked feature (B, O, d).
-        self.win_logit_head = _build_mlp(
-            in_dim=d_model, hidden=d_model, out_dim=1,
-            n_layers=head_n_layers, dropout=dropout,
-        )
-        self.rank_score_head = _build_mlp(
-            in_dim=d_model, hidden=d_model, out_dim=1,
-            n_layers=head_n_layers, dropout=dropout,
-        )
-        self.final_score_adv_head = _build_mlp(
-            in_dim=d_model, hidden=d_model, out_dim=1,
-            n_layers=head_n_layers, dropout=dropout,
-        )
-        self.current_stats_head = _build_mlp(
-            in_dim=d_model, hidden=d_model, out_dim=VALUE_N_CURRENT_STATS,
-            n_layers=head_n_layers, dropout=dropout,
-        )
-        for head in (
-            self.win_logit_head, self.rank_score_head,
-            self.final_score_adv_head, self.current_stats_head,
-        ):
-            _zero_last_linear(head)
 
-        # Heads over the raw [glob ‖ player_state] feature (B, O, 2d).
-        self.is_ahead_head = _build_mlp(
-            in_dim=feat_dim, hidden=d_model, out_dim=n_horizons,
-            n_layers=head_n_layers, dropout=dropout,
-        )
-        _zero_last_linear(self.is_ahead_head)
+        def mlp(out):
+            return _build_mlp(in_dim=d_model, hidden=d_model, out_dim=out,
+                              n_layers=head_n_layers, dropout=dropout)
 
-        def _mlp() -> nn.Module:
-            return _build_mlp(
-                in_dim=feat_dim, hidden=d_model, out_dim=1, n_layers=2,
-                dropout=dropout,
-            )
+        self.win_head = mlp(1)                                       # (O,)
+        self.fwd_heads = nn.ModuleList([mlp(N_FWD) for _ in range(N_P1_SIGNALS)])
+        self.back_heads = nn.ModuleList([mlp(N_BACK) for _ in range(N_P1_SIGNALS)])
+        self.rank_head = mlp(1)
+        self.surv_head = mlp(N_FWD)
+        # Default init (no zero-init): regression/level heads start with small
+        # predictions and the trunk receives gradient from step 1. Only win is
+        # nudged neutral so V starts ~0.5 win-prob.
+        _zero_last_linear(self.win_head)
 
-        self.head_dships_back = _mlp()
-        self.head_dplanets_back = _mlp()
-        self.head_dships_fwd = _mlp()
-        self.head_future_score_adv = _mlp()
-        self.head_survives_fwd = _mlp()
-        self.head_trend_back = _build_mlp(
-            in_dim=feat_dim, hidden=d_model, out_dim=3, n_layers=2, dropout=dropout,
-        )
-        self.head_slope_back = _mlp()                    # learner slot only
-        self.head_slope_fwd = _mlp()                     # learner slot only
-
-    def forward(
-        self,
-        glob: torch.Tensor,            # (B, d)
-        player_state: torch.Tensor,    # (B, O, d)
-    ) -> dict[str, torch.Tensor]:
-        if glob.dim() != 2 or player_state.dim() != 3:
-            raise ValueError(
-                f"expected glob (B,d) + player_state (B,O,d); got "
-                f"{tuple(glob.shape)} and {tuple(player_state.shape)}"
-            )
+    def forward(self, glob: torch.Tensor, player_state: torch.Tensor) -> dict:
         O = player_state.size(1)
-        glob_b = glob.unsqueeze(1).expand(-1, O, -1)                 # (B, O, d)
-        feat = torch.cat([glob_b, player_state], dim=-1)            # (B, O, 2d)
-        value_h = self.value_trunk(feat)                            # (B, O, d)
+        feat = torch.cat([glob.unsqueeze(1).expand(-1, O, -1), player_state], dim=-1)
+        h = self.value_trunk(feat)                                  # (B,O,d)
+        fwd = torch.stack([hd(h) for hd in self.fwd_heads], dim=2)  # (B,O,5,N_FWD)
+        back = torch.stack([hd(h) for hd in self.back_heads], dim=2)  # (B,O,5,N_BACK)
         return {
-            "win_logit": self.win_logit_head(value_h).squeeze(-1),       # (B, O)
-            "rank_score": self.rank_score_head(value_h).squeeze(-1),     # (B, O)
-            "final_score_adv": self.final_score_adv_head(value_h).squeeze(-1),
-            "current_stats": self.current_stats_head(value_h),          # (B, O, C)
-            "is_ahead_logits": self.is_ahead_head(feat),               # (B, O, H)
-            "dships_back": self.head_dships_back(feat).squeeze(-1),     # (B, O)
-            "dplanets_back": self.head_dplanets_back(feat).squeeze(-1), # (B, O)
-            "trend_back": self.head_trend_back(feat),                  # (B, O, 3)
-            "dships_fwd": self.head_dships_fwd(feat).squeeze(-1),       # (B, O)
-            "future_score_adv": self.head_future_score_adv(feat).squeeze(-1),
-            "survives_fwd": self.head_survives_fwd(feat).squeeze(-1),   # (B, O)
-            "slope_back": self.head_slope_back(feat[:, 0]).squeeze(-1),   # (B,)
-            "slope_fwd": self.head_slope_fwd(feat[:, 0]).squeeze(-1),     # (B,)
+            "win": self.win_head(h).squeeze(-1),       # (B,O)
+            "fwd": fwd,                                  # (B,O,5,N_FWD)
+            "back": back,                                # (B,O,5,N_BACK)
+            "rank": self.rank_head(h).squeeze(-1),     # (B,O)
+            "survives": self.surv_head(h),             # (B,O,N_FWD)
         }
+
+
+# ---------- losses ----------
+def _mmean(term: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.to(term.dtype)
+    return (term * mask).sum() / mask.sum().clamp(min=1.0)
+
+
+def _listmle(scores, rank, valid):
+    neg = torch.finfo(scores.dtype).min
+    isv = valid > 0.5
+    s = scores.masked_fill(~isv, neg)
+    order = torch.argsort(rank.float().masked_fill(~isv, float("inf")), dim=-1)
+    s_sorted = torch.gather(s, 1, order)
+    valid_sorted = torch.gather(isv.float(), 1, order)
+    # log P(pick o_k | tail) = s[o_k] - logsumexp(s[o_k:])
+    rev_lse = torch.logcumsumexp(s_sorted.flip(-1), dim=-1).flip(-1)
+    ll = (s_sorted - rev_lse) * valid_sorted
+    n_valid = valid.sum(-1)
+    rows = n_valid >= 2
+    if not bool(rows.any()):
+        return scores.sum() * 0.0
+    return -(ll.sum(-1)[rows] / n_valid[rows].clamp(min=1)).mean()
+
+
+def compute_value_pretrain_loss(
+    preds: dict, batch: dict, *,
+    w_win: float = 1.0, w_fwd: float = 0.5, w_aux: float = 0.1,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Tiered value-pretrain loss. Targets come from the cache's P1 labels:
+      win:  final_rank==0     (B,O)
+      fwd:  p1_future         (B,O,5,N_FWD)  + p1_valid (B,N_FWD)
+      back: p1_back           (B,O,5,N_BACK) + valid_back (B,N_BACK)
+      survives: survives_future (B,O,N_FWD)
+      player_valid (B,O).
+    """
+    pv = batch["player_valid"].float()                              # (B,O)
+    dev = preds["win"].device
+    total = preds["win"].sum() * 0.0
+    per: dict[str, float] = {}
+
+    # TIER 1 — win
+    z = (batch["final_rank"].long() == 0).float()
+    bce = F.binary_cross_entropy_with_logits(preds["win"], z, reduction="none")
+    L_win = _mmean(bce, pv)
+    total = total + w_win * L_win
+    per["win"] = float(L_win.detach())
+    with torch.no_grad():
+        acc = (((preds["win"] > 0).float() == z) * pv).sum() / pv.sum().clamp(min=1)
+        per["win_acc"] = float(acc)
+
+    # TIER 2 — forward signal levels (per-signal, masked by valid horizon)
+    fut = batch["p1_future"]                                        # (B,O,5,N_FWD)
+    vfwd = batch["p1_valid"].float()                                # (B,N_FWD)
+    mask_f = pv[:, :, None, None] * vfwd[:, None, None, :]          # (B,O,1,N_FWD)->bcast
+    err = F.smooth_l1_loss(preds["fwd"], fut, reduction="none")     # (B,O,5,N_FWD)
+    L_fwd = _mmean(err, mask_f.expand_as(err))
+    total = total + w_fwd * L_fwd
+    per["fwd"] = float(L_fwd.detach())
+    for si, name in enumerate(P1_SIGNAL_NAMES):
+        per[f"fwd/{name}"] = float(_mmean(err[:, :, si], mask_f.expand_as(err)[:, :, si]).detach())
+
+    # TIER 3 — aux: backward Δ (anti-shortcut), rank, survives
+    if "p1_back" in batch:
+        vback = batch.get("valid_back")
+        mb = pv[:, :, None, None]
+        if vback is not None:
+            mb = mb * vback.float()[:, None, None, :]
+        eb = F.smooth_l1_loss(preds["back"], batch["p1_back"], reduction="none")
+        L_back = _mmean(eb, mb.expand_as(eb))
+        total = total + w_aux * L_back
+        per["aux/back"] = float(L_back.detach())
+    L_rank = _listmle(preds["rank"], batch["final_rank"].long(), pv)
+    total = total + w_aux * L_rank
+    per["aux/rank"] = float(L_rank.detach())
+    if "survives_future" in batch:
+        sb = F.binary_cross_entropy_with_logits(
+            preds["survives"], batch["survives_future"].float(), reduction="none")
+        L_surv = _mmean(sb, (pv[:, :, None] * vfwd[:, None, :]).expand_as(sb))
+        total = total + w_aux * L_surv
+        per["aux/survives"] = float(L_surv.detach())
+
+    return total, per
+
+
+def format_value_per_head(per: dict[str, float], *, title: str = "value") -> str:
+    lines = [f"    [{title}]"]
+    order = ["win", "win_acc", "fwd"] + [f"fwd/{n}" for n in P1_SIGNAL_NAMES] \
+        + ["aux/back", "aux/rank", "aux/survives"]
+    for k in order:
+        if k in per:
+            lines.append(f"      {k:<22s} {per[k]:.4f}")
+    return "\n".join(lines)

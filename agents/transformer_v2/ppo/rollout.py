@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 import torch
 
 from .env_adapter import EnvAdapter, Obs
-from .sampler import Action, legality_masks, project_to_env, sample_source_multi_target
+from .sampler import Action, legality_masks, project_to_env, sample_single_target
 
 
 @dataclass
@@ -92,32 +92,25 @@ def run_episode(
                 planet_exists=obs.planet_exists,
                 min_launch=min_launch,
             )
-            action = sample_source_multi_target(
+            action = sample_single_target(
                 pair_logits, frac_loc, out["sigma"],
                 pair_mask=pair_mask, source_mask=source_mask,
                 noop_logit_bias=noop_logit_bias,
             )
 
-            if action.source_id < 0:
-                env_actions: list[list[int]] = []
-                n_invalid = 0
-                invalid_reasons: list[str] = []
-                n_emitted = 0
-            else:
-                src_planet_id = obs.planet_ids[action.source_id]
-                proj = project_to_env(
-                    action,
-                    source_planet_id=src_planet_id,
-                    source_ships=int(obs.planet_surplus[action.source_id].item()),
-                    surplus=int(obs.planet_surplus[action.source_id].item()),
-                    min_launch=min_launch,
-                    plan_launch_fn=adapter.plan_launch,
-                    target_planet_ids=obs.planet_ids,
-                )
-                env_actions = proj.env_actions
-                n_invalid = proj.n_invalid
-                invalid_reasons = proj.invalid_reasons
-                n_emitted = proj.n_emitted
+            proj = project_to_env(
+                action,
+                source_mask=source_mask,
+                surplus=obs.planet_surplus,
+                source_planet_ids=obs.planet_ids,
+                target_planet_ids=obs.planet_ids,
+                min_launch=min_launch,
+                plan_launch_fn=adapter.plan_launch,
+            )
+            env_actions = proj.env_actions
+            n_invalid = proj.n_invalid
+            invalid_reasons = proj.invalid_reasons
+            n_emitted = proj.n_emitted
 
             step_result = adapter.step(env_actions)
             reward = reward_shaper(step_result.info, n_invalid)
@@ -131,7 +124,7 @@ def run_episode(
             shards.dones.append(1.0 if step_result.done else 0.0)
             shards.invalid_launch.append(n_invalid)
             shards.emitted_launch.append(n_emitted)
-            shards.n_selected_targets.append(int(action.target_bits.sum().item()))
+            shards.n_selected_targets.append(int(action.n_launch))
             shards.invalid_reasons.append(invalid_reasons)
 
             obs = step_result.obs_next

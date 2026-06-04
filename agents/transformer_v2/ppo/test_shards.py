@@ -19,16 +19,16 @@ from agents.transformer_v2.ppo.smoke import EpisodeBuffer, StepRecord, episodes_
 
 
 def _make_action(P: int) -> Action:
+    tgt_idx = torch.randint(0, P, (P,))
+    n_launch = int((tgt_idx != torch.arange(P)).sum().item())
     return Action(
-        source_id=int(torch.randint(-1, P, (1,)).item()),
-        target_bits=(torch.rand(P) > 0.5),
+        tgt_idx=tgt_idx,
         frac_raw=torch.rand(P),
         logprob=torch.randn(()),
-        logprob_source=torch.randn(()),
-        logprob_targets=torch.randn(()),
+        logprob_pair=torch.randn(()),
         logprob_frac=torch.randn(()),
-        empty_target_set=bool(torch.rand(1).item() > 0.5),
-        diagnostics={"row_max": 0.3, "k": 2.0},
+        n_launch=n_launch,
+        diagnostics={"n_launch": float(n_launch), "n_hold": 2.0},
     )
 
 
@@ -76,12 +76,11 @@ def _assert_step_equal(a: StepRecord, b: StepRecord) -> None:
     for f in shards.STEP_SCALAR_FIELDS:
         assert getattr(a, f) == getattr(b, f), f"scalar field {f} differs"
     assert a.invalid_reasons == b.invalid_reasons
-    assert a.action.source_id == b.action.source_id
-    assert torch.equal(a.action.target_bits, b.action.target_bits)
+    assert int(a.action.n_launch) == int(b.action.n_launch)
+    assert torch.equal(a.action.tgt_idx, b.action.tgt_idx)
     assert torch.equal(a.action.frac_raw, b.action.frac_raw)
     for f in shards.ACTION_LOGPROB_FIELDS:
         assert float(getattr(a.action, f)) == float(getattr(b.action, f)), f
-    assert a.action.empty_target_set == b.action.empty_target_set
     assert a.action.diagnostics == b.action.diagnostics
 
 

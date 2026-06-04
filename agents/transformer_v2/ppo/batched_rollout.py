@@ -7,8 +7,10 @@ per step instead of B. orbit_wars is simultaneous-move, so every active env
 needs every agent's action each step (clean lockstep; the active set only
 shrinks as games finish).
 
-Two batched forwards per step: the learner seats (one per env, recorded) and the
-opponent seats (B×(num_players-1), a frozen self-play snapshot, not recorded).
+When learner and opponents share the same frozen policy object, every active
+seat is merged into one batched forward per step. If a separate opponent policy
+is supplied, rollout falls back to two batched forwards per step: learner seats
+and opponent seats.
 Per-env state — ``FleetTracker`` + T-window history — is isolated per (env, seat)
 and stacked into the batch; the per-env legality/sample/project/record reuses
 ``smoke._finalize_step`` so each shard is IDENTICAL to the single-env path.
@@ -205,8 +207,14 @@ def run_batched_episodes(
     for t in range(max_steps):
         if not any(active):
             break
-        _batched_act(learner_seats, envs, active, policy, planet_enc, fleet_enc, comet_enc, **kw)
-        _batched_act(opp_seats, envs, active, opponent_policy, planet_enc, fleet_enc, comet_enc, **kw)
+        if opponent_policy is policy:
+            _batched_act(
+                learner_seats + opp_seats,
+                envs, active, policy, planet_enc, fleet_enc, comet_enc, **kw,
+            )
+        else:
+            _batched_act(learner_seats, envs, active, policy, planet_enc, fleet_enc, comet_enc, **kw)
+            _batched_act(opp_seats, envs, active, opponent_policy, planet_enc, fleet_enc, comet_enc, **kw)
         for ei, env in enumerate(envs):
             if not active[ei]:
                 continue

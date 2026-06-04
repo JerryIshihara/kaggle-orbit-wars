@@ -17,8 +17,8 @@ Usage::
 What this validates:
 
   * The full debug forward through PPOActorCritic (incl. legacy value_head on glob).
-  * `sample_source_multi_target` produces well-typed Actions.
-  * `project_to_env` emits valid env action triples that `plan_launch` accepts.
+  * `sample_single_target` produces well-typed Actions.
+  * the per-source projection emits valid env action triples.
   * Episodes terminate; per-step rewards are computed from score deltas.
   * `compute_advantages` runs on real rollouts (not synthetic).
   * `ppo_update_local` applies a gradient step on debug `value_head` + the
@@ -67,7 +67,7 @@ from .actor_critic import PPOActorCritic
 from .gae import Episode, compute_advantages
 from .learner import PPOConfig, ppo_update_local
 from .loss import PPOMinibatch
-from .sampler import Action, legality_masks, sample_source_multi_target
+from .sampler import Action, legality_masks, sample_single_target
 
 
 # --------------------------------------------------------------------------- #
@@ -98,10 +98,11 @@ class StepRecord:
     done: float = 0.0
     invalid_launch: int = 0
     emitted_launch: int = 0
-    n_selected_targets: int = 0            # count of target_bits True; for soft cap
-    invalid_reasons: list = None           # list[str] — per-target failure reasons
+    n_selected_targets: int = 0            # count of launching sources (tgt != s); for soft cap
+    invalid_reasons: list = None           # list[str] — per-source failure reasons
     score_my: int = 0           # total ships of learner at end of THIS turn
     score_enemy_max: int = 0
+    phi: float = 0.0            # calculated potential Φ(s)=Σwᵢsᵢ (design-A critic −Φ term)
 
     def __post_init__(self):
         if self.invalid_reasons is None:
@@ -231,6 +232,15 @@ def load_supervised(
         with_consolidator = bool(cfg["with_consolidator"])
     else:
         with_consolidator = any(k.startswith("consolidator.") for k in _keys)
+    # Build the pretrained value heads too when the ckpt carries them, so the
+    # reward-decomposition PPO critic (design A) can read the calibrated win
+    # head and warm the shared value trunk. Detected from keys (mirrors the
+    # consolidator handling above).
+    with_value_heads = any(k.startswith("value_heads.") for k in _keys)
+    # The pretrained value heads were built with this dropout (it changes the MLP
+    # module layout: dropout!=0 inserts a Dropout layer, shifting the 2nd Linear's
+    # index), so it MUST match for the 56 value tensors to load (else ~half miss).
+    value_dropout = float(cfg.get("value_dropout", 0.0))
 
     model = EntityPretrainModel(
         d_model=d_model, n_steps=n_steps, d_pair=d_pair,
@@ -242,8 +252,15 @@ def load_supervised(
         head_n_layers=head_n_layers,
         skip_l34=skip_l34,
         with_consolidator=with_consolidator,
+        with_value_heads=with_value_heads,
+        value_dropout=value_dropout,
     )
-    model.load_state_dict(model_state, strict=False)
+    res = model.load_state_dict(model_state, strict=False)
+    if with_value_heads:
+        _vh_missing = [k for k in res.missing_keys if k.startswith("value_heads.")]
+        if _vh_missing:
+            print(f"[load_supervised] WARNING {len(_vh_missing)} value_heads.* keys "
+                  f"missing — reward-decomp critic would read fresh heads", flush=True)
     return model.to(device), fleet_enc, planet_enc, comet_enc, cfg
 
 
@@ -342,6 +359,44 @@ def _forward_with_history(policy, planet_enc, fleet_enc, comet_enc, history, ste
     return out, store
 
 
+def _project_single_target(
+    action, *, source_mask, planet_surplus, slot_to_pid, planets, min_launch,
+):
+    """Per-source projection of a single_target_per_source_v1 action into env
+    moves. Each launching source (``source_mask[s]`` and ``tgt_idx[s] != s``)
+    emits ``round(frac_raw[s] * surplus[s])`` ships (gated by ``min_launch``).
+    PER-SOURCE budget — no shared-budget split. Mirrors runner ``single_target``.
+    Returns ``(env_moves, n_invalid, n_emitted, invalid_reasons)``."""
+    env_moves: list[list[float]] = []
+    n_invalid = 0
+    n_emitted = 0
+    invalid_reasons: list[str] = []
+    if not planets:
+        return env_moves, n_invalid, n_emitted, invalid_reasons
+    by_id = {int(p.id): p for p in planets}
+    src_rows = source_mask.nonzero(as_tuple=False).flatten().tolist()
+    for s in src_rows:
+        t = int(action.tgt_idx[s].item())
+        if t == s:
+            continue                                    # hold / NOOP
+        src_pid = slot_to_pid[s]
+        tgt_pid = slot_to_pid[t]
+        if src_pid < 0 or tgt_pid < 0:
+            n_invalid += 1; invalid_reasons.append("pad_slot"); continue
+        src_planet = by_id.get(int(src_pid))
+        tgt_planet = by_id.get(int(tgt_pid))
+        if src_planet is None or tgt_planet is None:
+            n_invalid += 1; invalid_reasons.append("no_planet"); continue
+        budget = max(0, int(planet_surplus[s].item()))
+        ships = int(round(float(action.frac_raw[s].item()) * budget))
+        if ships < int(min_launch):
+            n_invalid += 1; invalid_reasons.append("min_launch"); continue
+        angle = math.atan2(tgt_planet.y - src_planet.y, tgt_planet.x - src_planet.x)
+        env_moves.append([int(src_pid), float(angle), int(ships)])
+        n_emitted += 1
+    return env_moves, n_invalid, n_emitted, invalid_reasons
+
+
 def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
                    store, learner_slot, num_players, noop_logit_bias):
     """Legality masks -> sample -> project to env moves -> StepRecord. This is the
@@ -379,45 +434,15 @@ def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
         planet_owner=planet_owner_rel, surplus=planet_surplus,
         planet_exists=planet_exists, min_launch=int(min_launch),
     )
-    action = sample_source_multi_target(
+    action = sample_single_target(
         pair_logits, frac_loc, sigma_val, pair_mask=pair_mask,
         source_mask=source_mask, noop_logit_bias=noop_logit_bias,
     )
 
-    env_moves: list[list[float]] = []
-    n_invalid = 0
-    n_emitted = 0
-    invalid_reasons: list[str] = []
-    if action.source_id >= 0 and action.target_bits.sum().item() > 0:
-        src_idx = action.source_id
-        src_pid = slot_to_pid[src_idx]
-        src_planet = next((p for p in planets if int(p.id) == src_pid), None) if raw_planets else None
-        if src_planet is not None:
-            budget = max(0, int(planet_surplus[src_idx].item()))
-            selected = action.target_bits.nonzero(as_tuple=False).flatten().tolist()
-            raws = torch.stack([action.frac_raw[i] for i in selected])
-            weights = (raws / raws.sum().clamp_min(1e-8)).tolist()
-            raw_alloc = [w * budget for w in weights]
-            floored = [int(x) for x in raw_alloc]
-            remainder = budget - sum(floored)
-            frac_rem = sorted(
-                ((raw_alloc[i] - floored[i], i) for i in range(len(floored))), reverse=True,
-            )
-            for r, idx in frac_rem[:max(0, remainder)]:
-                floored[idx] += 1
-            for slot_i, sel_i in enumerate(selected):
-                ships = floored[slot_i]
-                if ships < int(min_launch):
-                    n_invalid += 1; invalid_reasons.append("min_launch"); continue
-                tgt_pid = slot_to_pid[sel_i]
-                if tgt_pid < 0:
-                    n_invalid += 1; invalid_reasons.append("pad_slot"); continue
-                tgt_planet = next((p for p in planets if int(p.id) == tgt_pid), None)
-                if tgt_planet is None:
-                    n_invalid += 1; invalid_reasons.append("no_planet"); continue
-                angle = math.atan2(tgt_planet.y - src_planet.y, tgt_planet.x - src_planet.x)
-                env_moves.append([int(src_pid), float(angle), int(ships)])
-                n_emitted += 1
+    env_moves, n_invalid, n_emitted, invalid_reasons = _project_single_target(
+        action, source_mask=source_mask, planet_surplus=planet_surplus,
+        slot_to_pid=slot_to_pid, planets=planets, min_launch=int(min_launch),
+    )
 
     score_my = sum(p.ships for p in planets if int(p.owner) == learner_slot) if raw_planets else 0
     score_my += sum(f.ships for f in fleets if int(f.owner) == learner_slot) if raw_fleets else 0
@@ -441,10 +466,10 @@ def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
         fleet_mask=store["fleet_mask"].detach().cpu(),
         planet_mask=store["planet_mask"].detach().cpu(),
         is_comet=store["is_comet"].detach().cpu(),
-        pair_type_ids=store["pair_type_ids"].detach().cpu(),
+        pair_type_ids=_current_pair_type_ids(store["pair_type_ids"]),
         pair_mask=pair_mask, source_mask=source_mask, action=action, value=value,
         invalid_launch=n_invalid, emitted_launch=n_emitted,
-        n_selected_targets=int(action.target_bits.sum().item()),
+        n_selected_targets=int(action.n_launch),
         invalid_reasons=list(invalid_reasons),
         score_my=score_my, score_enemy_max=score_enemy_max,
     )
@@ -467,7 +492,7 @@ def make_opponent_closure(
     history_window: int = 1,
 ):
     """Build an env-compatible opponent fn that samples from a FROZEN
-    PPOActorCritic using the same source_multi_target_v1 contract as the
+    PPOActorCritic using the same single_target_per_source_v1 contract as the
     learner. Opponent moves are not tracked for PPO, but it keeps its own
     ``history_window`` ring so a T=10 self-play opponent plays at the same
     window as the learner (no T-asymmetry in self-play).
@@ -540,48 +565,16 @@ def make_opponent_closure(
             planet_exists=planet_exists,
             min_launch=int(min_launch),
         )
-        action = sample_source_multi_target(
+        action = sample_single_target(
             pair_logits, frac_loc, sigma_val,
             pair_mask=pair_mask, source_mask=source_mask,
             noop_logit_bias=noop_logit_bias,
         )
 
-        env_moves: list[list[float]] = []
-        if action.source_id < 0 or action.target_bits.sum().item() == 0:
-            return env_moves
-        src_idx = action.source_id
-        src_pid = slot_to_pid[src_idx]
-        src_planet = next((p for p in planets if int(p.id) == src_pid), None)
-        if src_planet is None:
-            return env_moves
-        surplus_b = int(planet_surplus[src_idx].item())
-        budget = max(0, surplus_b)
-        selected = action.target_bits.nonzero(as_tuple=False).flatten().tolist()
-        raws = torch.stack([action.frac_raw[i] for i in selected])
-        weights = (raws / raws.sum().clamp_min(1e-8)).tolist()
-        raw_alloc = [w * budget for w in weights]
-        floored = [int(x) for x in raw_alloc]
-        remainder = budget - sum(floored)
-        frac_rem = sorted(
-            ((raw_alloc[i] - floored[i], i) for i in range(len(floored))),
-            reverse=True,
+        env_moves, _ni, _ne, _ir = _project_single_target(
+            action, source_mask=source_mask, planet_surplus=planet_surplus,
+            slot_to_pid=slot_to_pid, planets=planets, min_launch=int(min_launch),
         )
-        for r, idx in frac_rem[:max(0, remainder)]:
-            floored[idx] += 1
-        for slot_i, sel_i in enumerate(selected):
-            ships = floored[slot_i]
-            if ships < int(min_launch):
-                continue
-            tgt_pid = slot_to_pid[sel_i]
-            if tgt_pid < 0:
-                continue
-            tgt_planet = next((p for p in planets if int(p.id) == tgt_pid), None)
-            if tgt_planet is None:
-                continue
-            dx = tgt_planet.x - src_planet.x
-            dy = tgt_planet.y - src_planet.y
-            angle = math.atan2(dy, dx)
-            env_moves.append([int(src_pid), float(angle), int(ships)])
         return env_moves
 
     return opp_fn
@@ -661,6 +654,8 @@ def _make_learner_closure(
         planet_surplus = torch.zeros(P, dtype=torch.float32)
         planet_exists = torch.zeros(P, dtype=torch.bool)
         slot_to_pid = [-1] * P
+        planets: list = []
+        fleets: list = []
 
         if raw_planets:
             from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
@@ -686,64 +681,18 @@ def _make_learner_closure(
         )
 
         # 5. Sample action.
-        action = sample_source_multi_target(
+        action = sample_single_target(
             pair_logits, frac_loc, sigma_val,
             pair_mask=pair_mask,
             source_mask=source_mask,
             noop_logit_bias=noop_logit_bias,
         )
 
-        # 6. Project to env moves (with allocation).
-        env_moves: list[list[float]] = []
-        n_invalid = 0
-        n_emitted = 0
-        invalid_reasons: list[str] = []
-        if action.source_id >= 0 and action.target_bits.sum().item() > 0:
-            src_idx = action.source_id
-            src_pid = slot_to_pid[src_idx]
-            src_planet = next(
-                (p for p in planets if int(p.id) == src_pid), None,
-            ) if raw_planets else None
-            if src_planet is not None:
-                surplus_b = int(planet_surplus[src_idx].item())
-                budget = max(0, surplus_b)
-                selected = action.target_bits.nonzero(as_tuple=False).flatten().tolist()
-                raws = torch.stack([action.frac_raw[i] for i in selected])
-                weights = (raws / raws.sum().clamp_min(1e-8)).tolist()
-                # Largest-remainder allocation.
-                raw_alloc = [w * budget for w in weights]
-                floored = [int(x) for x in raw_alloc]
-                remainder = budget - sum(floored)
-                frac_rem = sorted(
-                    ((raw_alloc[i] - floored[i], i) for i in range(len(floored))),
-                    reverse=True,
-                )
-                for r, idx in frac_rem[:max(0, remainder)]:
-                    floored[idx] += 1
-                for slot_i, sel_i in enumerate(selected):
-                    ships = floored[slot_i]
-                    if ships < int(min_launch):
-                        n_invalid += 1
-                        invalid_reasons.append("min_launch")
-                        continue
-                    tgt_pid = slot_to_pid[sel_i]
-                    if tgt_pid < 0:
-                        n_invalid += 1
-                        invalid_reasons.append("pad_slot")
-                        continue
-                    tgt_planet = next(
-                        (p for p in planets if int(p.id) == tgt_pid), None,
-                    )
-                    if tgt_planet is None:
-                        n_invalid += 1
-                        invalid_reasons.append("no_planet")
-                        continue
-                    # Compute aim angle.
-                    dx = tgt_planet.x - src_planet.x
-                    dy = tgt_planet.y - src_planet.y
-                    angle = math.atan2(dy, dx)
-                    env_moves.append([int(src_pid), float(angle), int(ships)])
-                    n_emitted += 1
+        # 6. Project to env moves (per-source budget; matches runner single_target).
+        env_moves, n_invalid, n_emitted, invalid_reasons = _project_single_target(
+            action, source_mask=source_mask, planet_surplus=planet_surplus,
+            slot_to_pid=slot_to_pid, planets=planets, min_launch=int(min_launch),
+        )
 
         # 7. Compute per-step score (for reward shaping later).
         score_my = sum(p.ships for p in planets if int(p.owner) == learner_slot) if raw_planets else 0
@@ -771,14 +720,14 @@ def _make_learner_closure(
             fleet_mask=store["fleet_mask"].detach().cpu(),
             planet_mask=store["planet_mask"].detach().cpu(),
             is_comet=store["is_comet"].detach().cpu(),
-            pair_type_ids=store["pair_type_ids"].detach().cpu(),
+            pair_type_ids=_current_pair_type_ids(store["pair_type_ids"]),
             pair_mask=pair_mask,
             source_mask=source_mask,
             action=action,
             value=value,
             invalid_launch=n_invalid,
             emitted_launch=n_emitted,
-            n_selected_targets=int(action.target_bits.sum().item()),
+            n_selected_targets=int(action.n_launch),
             invalid_reasons=list(invalid_reasons),
             score_my=score_my,
             score_enemy_max=score_enemy_max,
@@ -933,97 +882,184 @@ def episodes_to_ppo(
 
     All tensors moved to ``device`` for the update step.
     """
-    # 1. Build Episode objects (values/rewards/dones).
-    ep_objs: list[Episode] = []
-    for ep in episodes:
-        if not ep.steps:
-            continue
-        ep_objs.append(Episode(
-            values=torch.tensor([s.value for s in ep.steps], dtype=torch.float32),
-            rewards=torch.tensor([s.reward for s in ep.steps], dtype=torch.float32),
-            dones=torch.tensor([s.done for s in ep.steps], dtype=torch.float32),
-        ))
+    packed = [_pack_episode_for_ppo(ep) for ep in episodes if ep.steps]
+    return _packed_episodes_to_ppo(
+        [p for p in packed if p is not None],
+        minibatch_size=minibatch_size,
+        device=device,
+    )
+
+
+_PACK_ROUTING_KEYS = (
+    "fleet_target_idx", "fleet_source_idx", "fleet_owner_slot",
+    "fleet_ships_log", "fleet_eta_norm", "fleet_mask",
+)
+
+
+def _current_pair_type_ids(x: torch.Tensor) -> torch.Tensor:
+    """Return compact current-frame pair type ids for PPO replay/archive.
+
+    Pair type ids have only 27 classes and the entity model consumes only the
+    current `(P, P)` matrix even when a temporal `(T, P, P)` tensor is supplied.
+    Keeping the whole T-window here multiplies rollout packing memory by T.
+    """
+    if x.dim() == 3:
+        x = x[-1]
+    return x.detach().cpu().to(torch.uint8)
+
+
+def _pack_episode_for_ppo(ep: EpisodeBuffer) -> dict | None:
+    """Stack one completed EpisodeBuffer into CPU tensors.
+
+    This is intentionally top-level and pickleable so train_local_trial can run it
+    in a small worker pool. The online rollout still featurizes each step before
+    acting; this stage prepares completed trajectory tensors for GAE/minibatching.
+    """
+    if not ep.steps:
+        return None
+
+    steps = ep.steps
+
+    def _stack(attr: str) -> torch.Tensor:
+        return torch.stack([getattr(s, attr) for s in steps]).cpu()
+
+    feats = {
+        "planet_features": _stack("planet_features"),
+        "fleet_features": _stack("fleet_features"),
+        "planet_mask": _stack("planet_mask"),
+        "is_comet": _stack("is_comet"),
+        "pair_type_ids": torch.stack([
+            _current_pair_type_ids(s.pair_type_ids) for s in steps
+        ]).cpu(),
+        "routing": {k: _stack(k) for k in _PACK_ROUTING_KEYS},
+        "phi": torch.tensor(
+            [float(getattr(s, "phi", 0.0)) for s in steps],
+            dtype=torch.float32,
+        ),
+    }
+
+    return {
+        "values": torch.tensor([s.value for s in steps], dtype=torch.float32),
+        "rewards": torch.tensor([s.reward for s in steps], dtype=torch.float32),
+        "dones": torch.tensor([s.done for s in steps], dtype=torch.float32),
+        "feats": feats,
+        "pair_mask": _stack("pair_mask"),
+        "source_mask": _stack("source_mask"),
+        "tgt_idx": torch.stack([s.action.tgt_idx for s in steps]).cpu().long(),
+        "frac_raw": torch.stack([s.action.frac_raw for s in steps]).cpu(),
+        "old_logp": torch.tensor(
+            [float(s.action.logprob.item()) for s in steps],
+            dtype=torch.float32,
+        ),
+    }
+
+
+def _cat_tensors(xs: list[torch.Tensor], *, device: str) -> torch.Tensor:
+    return torch.cat(xs, dim=0).to(device)
+
+
+def _packed_episodes_to_ppo(
+    packed: list[dict], *, minibatch_size: int, device: str,
+) -> tuple[list[Episode], list[PPOMinibatch]]:
+    ep_objs = [
+        Episode(values=p["values"], rewards=p["rewards"], dones=p["dones"])
+        for p in packed
+    ]
     compute_advantages(ep_objs, normalize=True)
+    if not ep_objs:
+        return ep_objs, []
 
-    # 2. Flatten all steps into a single training set, paired with advantages.
-    flat_steps: list[StepRecord] = []
-    flat_adv: list[float] = []
-    flat_ret: list[float] = []
-    for ep_obj, ep in zip(ep_objs, [e for e in episodes if e.steps]):
-        adv = ep_obj.advantages.tolist()
-        ret = ep_obj.returns.tolist()
-        for s, a, r in zip(ep.steps, adv, ret):
-            flat_steps.append(s)
-            flat_adv.append(a)
-            flat_ret.append(r)
-
-    # 3. Stack tensors and chunk into minibatches.
-    N = len(flat_steps)
+    adv = _cat_tensors([e.advantages for e in ep_objs if e.advantages is not None],
+                       device=device)
+    ret = _cat_tensors([e.returns for e in ep_objs if e.returns is not None],
+                       device=device)
+    N = int(adv.shape[0])
     if N == 0:
         return ep_objs, []
 
-    def _stack(attr: str) -> torch.Tensor:
-        return torch.stack([getattr(s, attr) for s in flat_steps])
-
     feats = {
-        "planet_features": _stack("planet_features").to(device),
-        "fleet_features": _stack("fleet_features").to(device),
-        "planet_mask": _stack("planet_mask").to(device),
-        "is_comet": _stack("is_comet").to(device),
-        "pair_type_ids": _stack("pair_type_ids").to(device),
+        "planet_features": _cat_tensors(
+            [p["feats"]["planet_features"] for p in packed], device=device),
+        "fleet_features": _cat_tensors(
+            [p["feats"]["fleet_features"] for p in packed], device=device),
+        "planet_mask": _cat_tensors(
+            [p["feats"]["planet_mask"] for p in packed], device=device),
+        "is_comet": _cat_tensors(
+            [p["feats"]["is_comet"] for p in packed], device=device),
+        "pair_type_ids": _cat_tensors(
+            [p["feats"]["pair_type_ids"] for p in packed], device=device),
+        "routing": {
+            k: _cat_tensors([p["feats"]["routing"][k] for p in packed], device=device)
+            for k in _PACK_ROUTING_KEYS
+        },
+        # Calculated potential Φ(s) per step — the design-A critic subtracts it
+        # (−Φ). Carried through the minibatch so the update's critic forward gets it.
+        "phi": _cat_tensors([p["feats"]["phi"] for p in packed], device=device),
     }
-    # Routing dict — also stacked.
-    routing_keys = ("fleet_target_idx", "fleet_source_idx", "fleet_owner_slot",
-                    "fleet_ships_log", "fleet_eta_norm", "fleet_mask")
-    feats["routing"] = {k: _stack(k).to(device) for k in routing_keys}
+    pair_mask = _cat_tensors([p["pair_mask"] for p in packed], device=device)
+    source_mask = _cat_tensors([p["source_mask"] for p in packed], device=device)
+    tgt_idx = _cat_tensors([p["tgt_idx"] for p in packed], device=device)
+    frac_raw = _cat_tensors([p["frac_raw"] for p in packed], device=device)
+    old_logp = _cat_tensors([p["old_logp"] for p in packed], device=device)
 
-    pair_mask = _stack("pair_mask").to(device)
-    source_mask = _stack("source_mask").to(device)
-    target_bits = torch.stack([s.action.target_bits for s in flat_steps]).to(device)
-    frac_raw = torch.stack([s.action.frac_raw for s in flat_steps]).to(device)
-
-    # source_id_plus: 0 = NOOP, else 1+source_idx.
-    src_plus = torch.tensor(
-        [0 if s.action.source_id < 0 else 1 + s.action.source_id for s in flat_steps],
-        dtype=torch.long, device=device,
-    )
-
-    old_logp = torch.tensor(
-        [float(s.action.logprob.item()) for s in flat_steps],
-        dtype=torch.float32, device=device,
-    )
-    adv = torch.tensor(flat_adv, dtype=torch.float32, device=device)
-    ret = torch.tensor(flat_ret, dtype=torch.float32, device=device)
-
-    # Chunk into minibatches.
     minibatches: list[PPOMinibatch] = []
     for start in range(0, N, minibatch_size):
         end = min(start + minibatch_size, N)
         idx = slice(start, end)
-        # Slice the routing dict.
-        feats_slice = {k: (v[idx] if isinstance(v, torch.Tensor) else
-                            {kk: vv[idx] for kk, vv in v.items()})
-                         for k, v in feats.items()}
-        # Note: PPOActorCritic.forward expects planet_tokens / fleet_tokens
-        # (post-L0). The smoke runner does NOT pre-compute L0 outputs into
-        # the shard — it stores raw features and re-runs L0 at update time.
-        # So we wrap the model's __call__ with a sub-wrapper that runs L0
-        # first. The minibatch carries the raw-feature feats dict; the
-        # train-time forward (see _PPOWithL0 below) handles L0.
+        feats_slice = {
+            k: (v[idx] if isinstance(v, torch.Tensor)
+                else {kk: vv[idx] for kk, vv in v.items()})
+            for k, v in feats.items()
+        }
+        # The minibatch carries raw features; train-time _PPOWithL0 runs frozen L0.
         minibatches.append(PPOMinibatch(
             feats=feats_slice,
             pair_mask=pair_mask[idx],
             source_mask=source_mask[idx],
-            source_id_plus=src_plus[idx],
-            target_bits=target_bits[idx],
+            tgt_idx=tgt_idx[idx],
             frac_raw=frac_raw[idx],
             old_logp=old_logp[idx],
             adv=adv[idx],
             returns=ret[idx],
             noop_logit_bias=0.0,
         ))
-
     return ep_objs, minibatches
+
+
+def episodes_to_ppo_parallel(
+    episodes: list[EpisodeBuffer],
+    *,
+    minibatch_size: int,
+    device: str,
+    num_workers: int,
+) -> tuple[list[Episode], list[PPOMinibatch]]:
+    """Parallel completed-trajectory packing, then global GAE/minibatching.
+
+    ``num_workers`` is for the post-rollout stage only. It does not change the
+    online policy featurization used to act inside each game step.
+    """
+    num_workers = int(num_workers)
+    todo = [ep for ep in episodes if ep.steps]
+    if num_workers <= 1 or len(todo) <= 1:
+        return episodes_to_ppo(todo, minibatch_size=minibatch_size, device=device)
+    if str(device).startswith("cuda"):
+        # Forking after CUDA initialization is unsafe; keep GPU update runs serial.
+        return episodes_to_ppo(todo, minibatch_size=minibatch_size, device=device)
+
+    import concurrent.futures as _fut
+    import multiprocessing as _mp
+
+    ctx = _mp.get_context("fork")
+    with _fut.ProcessPoolExecutor(
+        max_workers=min(num_workers, len(todo)),
+        mp_context=ctx,
+    ) as ex:
+        packed = list(ex.map(_pack_episode_for_ppo, todo, chunksize=1))
+    return _packed_episodes_to_ppo(
+        [p for p in packed if p is not None],
+        minibatch_size=minibatch_size,
+        device=device,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1053,7 +1089,7 @@ class _PPOWithL0(torch.nn.Module):
         return self.policy.freeze_for_phase(phase)
 
     def forward(self, planet_features, fleet_features, planet_mask,
-                 is_comet, pair_type_ids, routing):
+                 is_comet, pair_type_ids, routing, phi=None):
         # L0 frozen forward. Handles both rollout-time (B, P, dim) and
         # BC-anchor (B, T, P, dim) shapes — comet_features must match
         # planet_features' leading shape exactly.
@@ -1080,7 +1116,7 @@ class _PPOWithL0(torch.nn.Module):
         return self.policy(
             entity_self, fleet_tok, routing, planet_mask,
             is_comet=is_comet, pair_type_ids=pair_type_ids,
-            planet_owner_oh=owner_slice,
+            planet_owner_oh=owner_slice, phi=phi,
         )
 
 
@@ -1150,7 +1186,7 @@ def main():
             return 1
         episodes.append(ep)
         n_steps = len(ep.steps)
-        n_noop = sum(1 for s in ep.steps if s.action.source_id < 0)
+        n_noop = sum(1 for s in ep.steps if s.action.n_launch == 0)
         n_emit = sum(s.emitted_launch for s in ep.steps)
         n_inval = sum(s.invalid_launch for s in ep.steps)
         won = (ep.winner == learner_seat)

@@ -41,6 +41,7 @@ data/replays/**/*.json
 
 # derived pretrain CSVs (multi-GB total) — regenerable via
 # scripts/build_encoder_dataset.py + planet/entity/cross_entity/action featurizers.
+data/datasets/
 data/datasets/fleet/*.csv
 data/datasets/planet/*.csv
 data/datasets/entity/*.csv

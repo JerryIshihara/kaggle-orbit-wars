@@ -319,7 +319,13 @@ def _play_one(item):
     # row carries which core, which game (idx + seed + 2P/4P), the current step,
     # the live score, the worker's dynamic OMP thread count, and how many games this
     # worker has finished — so the monitor can show each core's live game. -------- #
-    def _publish_row(step: int, score_my: int, score_enemy_max: int) -> None:
+    def _publish_row(
+        step: int,
+        score_my: int,
+        score_enemy_max: int,
+        *,
+        status: str = "running",
+    ) -> None:
         if _WORKER_PROGRESS is None or _SLOT < 0:
             return
         try:
@@ -333,6 +339,7 @@ def _play_one(item):
                 "score_enemy_max": int(score_enemy_max),
                 "threads": int(torch.get_num_threads()),
                 "games_done": int(_GAMES_DONE),
+                "status": str(status),
             }
         except Exception:  # noqa: BLE001 — telemetry-grade; never kill the game
             pass
@@ -344,7 +351,7 @@ def _play_one(item):
         if step % _PROGRESS_STEP_EVERY == 0:
             _publish_row(step, score_my, score_enemy_max)
 
-    _publish_row(0, 0, 0)   # row visible the instant this core claims the game
+    _publish_row(0, 0, 0, status="running")   # row visible the instant this core claims the game
     try:
         # Self-play against the frozen snapshot when present; otherwise fall back
         # to a heuristic opponent. run_episode's guard wants EXACTLY one of
@@ -376,7 +383,8 @@ def _play_one(item):
         last = buf.steps[-1] if (buf is not None and buf.steps) else None
         _publish_row(nsteps,
                      int(getattr(last, "score_my", 0)),
-                     int(getattr(last, "score_enemy_max", 0)))
+                     int(getattr(last, "score_enemy_max", 0)),
+                     status="done")
         return idx, buf
     except Exception as exc:  # noqa: BLE001 — isolate one bad game
         import traceback
@@ -409,6 +417,7 @@ def run_pool_rollout(
                                 # the OMP team in a forked worker deadlocks step 0.
     worker_progress=None,
     progress_step_every: int = 10,
+    on_episode_done=None,
 ) -> list:
     """Roll out ``len(specs)`` games across a fork pool of ``n_procs`` workers.
 
@@ -437,6 +446,11 @@ def run_pool_rollout(
     progress_step_every:
         Throttle — each worker republishes its slot row every Nth learner step
         (default 10) to bound the shared-dict write rate.
+    on_episode_done:
+        Optional parent-process callback ``(idx, EpisodeBuffer | None)`` invoked
+        as soon as each game result arrives from ``imap_unordered``. This lets the
+        trainer feed completed trajectories into a downstream packing/GAE-prep
+        queue while other game workers are still stepping.
 
     Returns
     -------
@@ -531,6 +545,8 @@ def run_pool_rollout(
             # stealing. We tag each spec with its index and re-sort at the end.
             for idx, buf in pool.imap_unordered(_play_one, list(enumerate(specs))):
                 results[idx] = buf
+                if on_episode_done is not None:
+                    on_episode_done(idx, buf)
     finally:
         # Shut down a privately-created Manager (the caller's own dict is left for it
         # to drain). Best-effort — never mask a rollout result/exception.

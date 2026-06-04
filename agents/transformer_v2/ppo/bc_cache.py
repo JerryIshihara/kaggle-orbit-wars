@@ -1,4 +1,4 @@
-"""Pair-cache sampler for the factorized BC anchor.
+"""Pair-cache sampler for the single-target BC anchor.
 
 Wraps the existing ``CachedPairDataset`` (from
 ``scripts/build_pair_dataset_orbital_occle.py``) and produces
@@ -12,16 +12,15 @@ The cache stores per-snapshot:
   * ``pair_valid (P, P) bool`` — same as ``planet_mask × planet_mask``
     minus the diagonal
 
-For the factorized BC:
-  * ``expert_target_bits = pair_labels`` (the full P×P matrix; the loss
-    masks to the chosen source's row at compute time).
+For the single-target BC (matching pretrain ``_pair_single_target_ce``):
   * ``source_mask`` is derived from current-frame planet owner features so
-    the source categorical never trains on non-learner-owned rows.
-  * ``expert_source_idx_or_noop`` is derived per snapshot:
-        0  if no positives (NOOP — expert took no launch action)
-        1 + argmax_s(pair_ships[s, :].sum())  otherwise (the source
-        with the largest launched ship total among learner-owned rows,
-        canonical for coalition turns)
+    the source CE never trains on non-learner-owned rows.
+  * ``expert_tgt_idx (P,)`` is the per owned source row label:
+        diagonal ``s``                       if the row held (no positive),
+        argmax_t(pair_ships[s, t]) over its   otherwise (the dominant target
+        off-diagonal positives                column; ties -> lowest index).
+    Held rows supervise the diagonal HOLD slot; launching rows supervise the
+    chosen target column.
 
 ``pair_type_ids`` is computed on the fly via
 :func:`build_pair_type_ids` since the cache doesn't store it.
@@ -136,22 +135,24 @@ class BCCacheSampler:
             & pair_valid.any(dim=2)
         )
 
-        # expert_source_idx_or_noop:
-        #   0 if no legal positives (snapshot is NOOP for PPO source CE),
-        #   1 + argmax_s(total launched ships from legal source s) otherwise.
+        # expert_tgt_idx: per owned source row, the single-target label
+        # (mirrors pretrain _pair_single_target_ce):
+        #   diagonal s                            if the row held (no positive),
+        #   argmax_t(pair_ships[s, t]) over its    otherwise (dominant target;
+        #   off-diagonal positives                 ties -> lowest index).
+        B, P, _ = pair_labels.shape
+        pos = pair_labels & pair_valid                               # (B, P, P)
+        row_has_pos = pos.any(dim=2)                                 # (B, P)
         if "pair_ships" in items[0]:
-            pair_ships = torch.stack([
+            score = torch.stack([
                 it["pair_ships"].float() for it in items
             ]).to(self.device)
-            row_scores = pair_ships.sum(dim=2)
         else:
-            row_scores = pair_labels.float().sum(dim=2)
-        row_scores = row_scores.masked_fill(~source_mask, 0.0)       # (B, P)
-        has_any = row_scores.sum(dim=1) > 0                          # (B,)
-        argmax_src = row_scores.argmax(dim=1)                        # (B,)
-        expert_src = torch.where(
-            has_any, argmax_src + 1, torch.zeros_like(argmax_src),
-        ).long()
+            score = pair_labels.float()
+        score = score.masked_fill(~pos, -1.0)
+        dom_t = score.argmax(dim=2)                                  # (B, P)
+        diag_idx = torch.arange(P, device=self.device).expand(B, P)  # (B, P)
+        expert_tgt_idx = torch.where(row_has_pos, dom_t, diag_idx).long()  # (B, P)
 
         feats: dict[str, Any] = {
             "planet_features": planet_features,
@@ -165,6 +166,5 @@ class BCCacheSampler:
             feats=feats,
             pair_mask=pair_valid,
             source_mask=source_mask,
-            expert_source_idx_or_noop=expert_src,
-            expert_target_bits=pair_labels,
+            expert_tgt_idx=expert_tgt_idx,
         )

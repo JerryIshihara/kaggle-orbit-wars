@@ -160,7 +160,7 @@ class TransformerAgent:
     #: ``pair_logits`` into a launch list. Use ``threshold`` for the
     #: production multi-target rule; the other two are diagnostic
     #: alternatives wired up as separate dashboard agent ids.
-    INFERENCE_MODES = ("threshold", "row_argmax", "flat_argmax")
+    INFERENCE_MODES = ("threshold", "row_argmax", "flat_argmax", "single_target")
 
     def __init__(
         self,
@@ -206,7 +206,7 @@ class TransformerAgent:
         planet_run_dir: Path | None = None,
         fleet_run_dir: Path | None = None,
         comet_run_dir: Path | None = None,
-        inference_mode: str = "threshold",
+        inference_mode: str | None = None,
         logit_threshold: float = 2.0,
         disable_film: bool = False,
     ) -> "TransformerAgent":
@@ -232,6 +232,21 @@ class TransformerAgent:
         device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         cfg = ckpt.get("config") or {}
+        # Auto-select the decision rule from the ckpt's action contract when the
+        # caller did not pin one. A ``single_target_per_source_v1`` ckpt (joint /
+        # single-target pretrain) MUST decode per-source argmax over
+        # [targets + diagonal-NOOP]; using the default ``threshold`` rule on it
+        # silently mis-decodes (the over-holding diagnosis). Legacy ckpts have no
+        # ``action_contract`` and fall back to ``threshold`` exactly as before.
+        if inference_mode is None:
+            contract = cfg.get("action_contract")
+            inference_mode = (
+                "single_target"
+                if contract == "single_target_per_source_v1"
+                else "threshold"
+            )
+            print(f"[runner] inference_mode auto-selected: {inference_mode!r} "
+                  f"(action_contract={contract!r})", flush=True)
         d_model = int(cfg.get("d_model", 256))
         n_steps = int(cfg.get("n_steps", 6))
         # Older ckpts (pre-d_pair widening) did not save ``d_pair`` and
@@ -514,6 +529,37 @@ class TransformerAgent:
             )
             src_indices = torch.nonzero(keep, as_tuple=False).flatten()
             tgt_indices = row_best[src_indices]
+        elif inference_mode == "single_target":
+            # single_target_per_source_v1 contract: each launchable source
+            # picks the argmax over [legal off-diagonal targets PLUS its own
+            # diagonal == NOOP/hold]. If the diagonal wins, the source HOLDS
+            # (no launch). Requires a model trained with the single-target CE
+            # so pair_logits[s, s] is the calibrated hold logit.
+            diag = torch.arange(P, device=device)
+            row_legal = cell_legal.clone()
+            row_legal[diag, diag] = src_legal          # add the hold slot per launchable src
+            row_masked = pair_logits.masked_fill(~row_legal, neg_inf)
+            row_best = row_masked.argmax(dim=-1)                       # (P,) may be the diagonal
+            keep = (
+                src_legal
+                & (row_best != diag)                  # diagonal winning == hold -> drop
+                & (row_masked.gather(1, row_best.unsqueeze(-1)).squeeze(-1) > neg_inf)
+            )
+            src_indices = torch.nonzero(keep, as_tuple=False).flatten()
+            tgt_indices = row_best[src_indices]
+            # Opt-in decode diagnostics: how many launchable sources HELD
+            # (diagonal/NOOP won the row) vs LAUNCHED this turn. Set
+            # ``agent._debug_decode = True`` to accumulate into ``agent._dbg``.
+            if getattr(self, "_debug_decode", False):
+                dbg = self.__dict__.setdefault(
+                    "_dbg", {"turns": 0, "src_legal": 0, "launched": 0, "held": 0}
+                )
+                nsl = int(src_legal.sum())
+                nl = int(keep.sum())
+                dbg["turns"] += 1
+                dbg["src_legal"] += nsl
+                dbg["launched"] += nl
+                dbg["held"] += nsl - nl
         else:  # threshold
             # Per-cell: every legal cell whose logit clears the threshold.
             firing = (pair_logits > logit_threshold) & cell_legal

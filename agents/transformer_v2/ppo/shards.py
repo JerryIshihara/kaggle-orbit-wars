@@ -34,9 +34,9 @@ from typing import Any
 import torch
 
 # Bumped if the on-disk shard schema changes incompatibly.
-SHARD_FORMAT_VERSION = 1
-# Matches the sampler's action contract (sampler.Action / sample_source_multi_target).
-POLICY_ACTION_CONTRACT = "source_multi_target_v1"
+SHARD_FORMAT_VERSION = 2
+# Matches the sampler's action contract (sampler.Action / sample_single_target).
+POLICY_ACTION_CONTRACT = "single_target_per_source_v1"
 
 # Per-step StepRecord fields (smoke.StepRecord). Tensor fields are stacked along a
 # new leading step axis; for T=1 each is (P,...)/(F,...), for T=10 (T,P,...) etc.
@@ -50,11 +50,13 @@ STEP_TENSOR_FIELDS = (
 STEP_SCALAR_FIELDS = (
     "value", "reward", "done",
     "invalid_launch", "emitted_launch", "n_selected_targets",
-    "score_my", "score_enemy_max",
+    "score_my", "score_enemy_max", "phi",
 )
-# Action fields (sampler.Action).
-ACTION_TENSOR_FIELDS = ("target_bits", "frac_raw")
-ACTION_LOGPROB_FIELDS = ("logprob", "logprob_source", "logprob_targets", "logprob_frac")
+# Action fields (sampler.Action). single_target_per_source_v1:
+#   tgt_idx (P,) long — chosen target col per source (s == hold/NOOP),
+#   frac_raw (P,) float — clamped sigmoid per launching source.
+ACTION_TENSOR_FIELDS = ("tgt_idx", "frac_raw")
+ACTION_LOGPROB_FIELDS = ("logprob", "logprob_pair", "logprob_frac")
 
 
 class ShardVersionError(RuntimeError):
@@ -112,11 +114,8 @@ def episode_buffer_to_dict(ep: Any) -> dict[str, Any]:
         d["action_" + f] = torch.stack(
             [getattr(s.action, f).detach().cpu().reshape(()) for s in steps], dim=0
         )
-    d["action_source_id"] = torch.tensor(
-        [int(s.action.source_id) for s in steps], dtype=torch.long
-    )
-    d["action_empty_target_set"] = torch.tensor(
-        [bool(s.action.empty_target_set) for s in steps], dtype=torch.bool
+    d["action_n_launch"] = torch.tensor(
+        [int(s.action.n_launch) for s in steps], dtype=torch.long
     )
     d["action_diagnostics"] = [dict(s.action.diagnostics or {}) for s in steps]
     return d
@@ -131,14 +130,12 @@ def dict_to_episode_buffer(d: dict[str, Any]) -> Any:
     steps: list[Any] = []
     for i in range(n):
         action = Action(
-            source_id=int(d["action_source_id"][i].item()),
-            target_bits=d["action_target_bits"][i],
+            tgt_idx=d["action_tgt_idx"][i].long(),
             frac_raw=d["action_frac_raw"][i],
             logprob=d["action_logprob"][i],
-            logprob_source=d["action_logprob_source"][i],
-            logprob_targets=d["action_logprob_targets"][i],
+            logprob_pair=d["action_logprob_pair"][i],
             logprob_frac=d["action_logprob_frac"][i],
-            empty_target_set=bool(d["action_empty_target_set"][i].item()),
+            n_launch=int(d["action_n_launch"][i].item()),
             diagnostics=dict(d["action_diagnostics"][i]),
         )
         kw = {f: d[f][i] for f in STEP_TENSOR_FIELDS}
@@ -153,6 +150,7 @@ def dict_to_episode_buffer(d: dict[str, Any]) -> Any:
             invalid_reasons=list(d["invalid_reasons"][i]),
             score_my=int(d["score_my"][i].item()),
             score_enemy_max=int(d["score_enemy_max"][i].item()),
+            phi=float(d.get("phi", torch.zeros(n))[i].item()) if n else 0.0,
             **kw,
         ))
     return EpisodeBuffer(

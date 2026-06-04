@@ -1,23 +1,27 @@
-"""Action sampling and env projection for ``source_multi_target_v1``.
+"""Action sampling and env projection for ``single_target_per_source_v1``.
 
-One snapshot's actor decisions:
+This matches the pretrained actor (``entity_encoder._pair_single_target_ce``)
+and the runner ``single_target`` inference mode. One snapshot's actor decisions:
 
-  1. ``source_id``    — Categorical with a fixed-logit NOOP entry, scored
-                        per source by ``max_j(pair_logits[s, j])`` over the
-                        valid pair mask (row max, not logsumexp — see
-                        protocol "Known problems" #1 + "Resolutions" #1).
-  2. ``target_bits``  — Bernoulli per valid target on the chosen source's row.
-  3. ``frac_raw[j]``  — LogitNormal(loc=pair_frac[s, j], sigma) for every
-                        selected target. sigma is fixed (CLI hyperparameter).
+  1. Per OWNED source row ``s`` (``source_mask[s]`` true) we draw ONE
+     ``Categorical`` over the P target columns INCLUDING the diagonal
+     ``[s, s]`` (the HOLD/NOOP slot). The valid columns of row ``s`` are
+     ``pair_mask[s]`` with index ``s`` forced True.
+       * diagonal wins (``tgt_idx[s] == s``)  -> planet ``s`` HOLDS (NOOP),
+       * column ``t != s``                    -> launch ``s -> t``.
+     Sources act INDEPENDENTLY (one Categorical each), unlike the old
+     ``source_multi_target_v1`` single-source + per-target Bernoulli.
+  2. ``frac_raw[s]`` — for each LAUNCHING source, ``LogitNormal(loc=
+     pair_frac[s, tgt_idx[s]], sigma)``. sigma is fixed (CLI hyperparameter).
 
 The stored ``frac_raw`` is the numerically-clamped sigmoid; the launch-side
-clamp ``[0.02, 1.00]`` is applied only at env projection. PPO recomputes
-logprob from the stored value, so the two must agree exactly.
+ship rounding is applied only at env projection. PPO recomputes the logprob
+from the stored value, so the two must agree exactly (ratio == 1 for an
+unchanged policy).
 
-NOOP semantics: NOOP is the fixed-logit source option (``source_id = -1``).
-If a real source samples an empty target set, the rollout earns a small
-``empty_target_set`` penalty so the source categorical learns to prefer
-NOOP in those states.
+Ship budgeting is PER-SOURCE: source ``s`` launches ``round(frac_raw[s] *
+surplus_of_s)`` ships (gated by ``min_launch``), mirroring the runner
+``single_target`` semantics. There is NO shared-budget split across sources.
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import torch
-from torch.distributions import Bernoulli, Categorical, Normal
+from torch.distributions import Categorical, Normal
 
 
 # --------------------------------------------------------------------------- #
@@ -45,8 +49,9 @@ def legality_masks(
         learner-owned with surplus >= min_launch, target exists, and s != t.
 
     source_mask (P,) bool: row reduction of pair_mask (does this source
-        have any valid target?). Used as a mask on the source categorical so
-        sources with no valid target get -inf logit.
+        have any valid target?). Used to select which rows act: every such
+        source draws one Categorical over its legal targets + the diagonal
+        HOLD slot.
     """
     if planet_owner.dim() != 1 or surplus.dim() != 1 or planet_exists.dim() != 1:
         raise ValueError("planet_owner, surplus, planet_exists must be 1-D")
@@ -67,123 +72,105 @@ def legality_masks(
 # --------------------------------------------------------------------------- #
 @dataclass
 class Action:
-    """One snapshot's sampled action + per-component logprobs."""
+    """One snapshot's sampled action + per-component logprobs.
 
-    source_id: int                  # -1 = NOOP, else 0..P-1
-    target_bits: torch.Tensor       # (P,) bool — selected targets on the chosen source's row
-    frac_raw: torch.Tensor          # (P,) float — clamped sigmoid for selected targets; zeros elsewhere
-    logprob: torch.Tensor           # scalar — logp_source + logp_targets + logp_frac
-    logprob_source: torch.Tensor    # scalar
-    logprob_targets: torch.Tensor   # scalar (0.0 if NOOP)
-    logprob_frac: torch.Tensor      # scalar (0.0 if NOOP or no targets)
-    empty_target_set: bool          # True if a real source was chosen but no targets fired
+    ``tgt_idx (P,) long``: per source the chosen target column. ``tgt_idx[s]
+        == s`` means HOLD/NOOP; ``tgt_idx[s] != s`` means launch ``s ->
+        tgt_idx[s]``. Non-acting rows (``~source_mask``) stay at ``s`` (hold)
+        and contribute no logprob.
+    ``frac_raw (P,) float``: clamped sigmoid launch fraction per launching
+        source; zeros on hold / non-acting rows.
+    """
+
+    tgt_idx: torch.Tensor           # (P,) long — chosen target col per source (s == hold)
+    frac_raw: torch.Tensor          # (P,) float — clamped sigmoid for launching sources
+    logprob: torch.Tensor           # scalar — logp_pair + logp_frac
+    logprob_pair: torch.Tensor      # scalar — sum of per-source Categorical logprobs
+    logprob_frac: torch.Tensor      # scalar — sum of launching-source frac logprobs
+    n_launch: int                   # number of launching sources (tgt != s)
     diagnostics: dict[str, float] = field(default_factory=dict)
+
+
+# --------------------------------------------------------------------------- #
+# Frac logit-normal logprob (shared with loss.action_logprob)                  #
+# --------------------------------------------------------------------------- #
+def _frac_logp(loc: torch.Tensor, sigma: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
+    """log p(sigmoid(z)) for raw == clamped sigmoid(z), z ~ Normal(loc, sigma)."""
+    raw = raw.clamp(1e-4, 1 - 1e-4)
+    return (
+        Normal(loc, sigma).log_prob(torch.logit(raw))
+        - torch.log(raw)
+        - torch.log1p(-raw)
+    )
 
 
 # --------------------------------------------------------------------------- #
 # Sampling                                                                    #
 # --------------------------------------------------------------------------- #
-def sample_source_multi_target(
+def sample_single_target(
     pair_logits: torch.Tensor,        # (P, P) — actor logits for one snapshot
     frac_loc: torch.Tensor,            # (P, P) — actor frac means (pair_frac raw logit)
     sigma: torch.Tensor | float,       # () scalar — fixed frac stddev
     *,
     pair_mask: torch.Tensor,           # (P, P) bool
     source_mask: torch.Tensor,         # (P,) bool
-    noop_logit_bias: float = 0.0,
+    noop_logit_bias: float = 0.0,      # unused; kept for call-site compatibility
 ) -> Action:
-    """Draw one ``source_multi_target_v1`` action.
+    """Draw one ``single_target_per_source_v1`` action.
 
-    Source logits use ``row_max`` (not logsumexp) to avoid an
-    n-valid-targets count bias on the source pick — see protocol
-    "Known problems" #1.
+    Each owned source (``source_mask[s]``) draws one Categorical over its
+    legal targets PLUS the diagonal HOLD slot. The diagonal logit is the
+    actor's own ``pair_logits[s, s]`` (the calibrated hold logit a
+    single-target-trained model produces); ``noop_logit_bias`` is accepted
+    only for backwards-compatible call sites and is NOT applied (the contract
+    has no separate NOOP logit).
     """
     if pair_logits.dim() != 2:
         raise ValueError("sample is per-snapshot; expected pair_logits (P, P)")
     p = pair_logits.shape[0]
-    sigma_t = sigma if torch.is_tensor(sigma) else torch.tensor(float(sigma),
-                                                                 device=pair_logits.device)
+    device = pair_logits.device
+    sigma_t = sigma if torch.is_tensor(sigma) else torch.tensor(float(sigma), device=device)
 
-    masked_pairs = torch.where(pair_mask, pair_logits, torch.full_like(pair_logits, float("-inf")))
+    neg_inf = torch.full_like(pair_logits, float("-inf"))
+    diag = torch.arange(p, device=device)
 
-    # 1. Source categorical with fixed-logit NOOP at index 0.
-    #    row_max over valid targets — see "Resolutions" #1.
-    source_logits = masked_pairs.max(dim=1).values                          # (P,)
-    source_logits = torch.where(
-        source_mask, source_logits,
-        torch.full_like(source_logits, float("-inf")),
-    )
-    src_dist = Categorical(logits=torch.cat([
-        torch.tensor([float(noop_logit_bias)], device=pair_logits.device),
-        source_logits,
-    ]))
-    src_plus = src_dist.sample()
-    logp_source = src_dist.log_prob(src_plus)
+    tgt_idx = diag.clone()                                    # default: all hold (tgt == s)
+    frac_raw = torch.zeros(p, dtype=torch.float32, device=device)
+    logp_pair = torch.zeros((), device=device)
+    logp_frac = torch.zeros((), device=device)
+    n_launch = 0
 
-    if int(src_plus.item()) == 0:
-        # NOOP — no target / frac decisions.
-        zeros_p = torch.zeros(p, dtype=torch.float32, device=pair_logits.device)
-        bits = torch.zeros(p, dtype=torch.bool, device=pair_logits.device)
-        zero = torch.zeros((), device=pair_logits.device)
-        return Action(
-            source_id=-1, target_bits=bits, frac_raw=zeros_p,
-            logprob=logp_source, logprob_source=logp_source,
-            logprob_targets=zero, logprob_frac=zero,
-            empty_target_set=False,
-            diagnostics={"n_valid_sources": int(source_mask.sum().item())},
-        )
+    src_rows = source_mask.nonzero(as_tuple=False).flatten().tolist()
+    for s in src_rows:
+        # Valid columns for row s: legal off-diagonal targets + the diagonal hold.
+        row_valid = pair_mask[s].clone()
+        row_valid[s] = True
+        row_logits = torch.where(row_valid, pair_logits[s], neg_inf[s])
+        dist = Categorical(logits=row_logits)
+        t = dist.sample()
+        logp_pair = logp_pair + dist.log_prob(t)
+        ti = int(t.item())
+        tgt_idx[s] = ti
+        if ti != s:
+            n_launch += 1
+            loc = frac_loc[s, ti]
+            z = Normal(loc, sigma_t).sample()
+            raw = torch.sigmoid(z).clamp(1e-4, 1 - 1e-4)
+            frac_raw[s] = raw
+            logp_frac = logp_frac + _frac_logp(loc, sigma_t, raw)
 
-    src = int(src_plus.item()) - 1
-
-    # 2. Target Bernoulli over the chosen source's row (valid cells only).
-    valid_tgt_row = pair_mask[src]                                           # (P,)
-    row_logits = torch.where(
-        valid_tgt_row, pair_logits[src],
-        torch.full_like(pair_logits[src], float("-inf")),
-    )
-    target_dist = Bernoulli(logits=row_logits)
-    # Sample raw bits but force invalid cells off. The Bernoulli logprob is
-    # masked to valid cells only — invalid cells contribute 0 to logp.
-    raw_bits = target_dist.sample().bool()
-    target_bits = raw_bits & valid_tgt_row
-    log_probs_per_cell = target_dist.log_prob(target_bits.float())           # (P,)
-    logp_targets = torch.where(
-        valid_tgt_row, log_probs_per_cell, torch.zeros_like(log_probs_per_cell),
-    ).sum()
-
-    # 3. Frac sample per selected target — independent logit-normals.
-    frac_raw = torch.zeros(p, dtype=torch.float32, device=pair_logits.device)
-    logp_frac = torch.zeros((), device=pair_logits.device)
-    selected = target_bits.nonzero(as_tuple=False).flatten()
-    for tgt in selected.tolist():
-        loc = frac_loc[src, tgt]
-        z = Normal(loc, sigma_t).sample()
-        # Numerical clamp only — match PSEUDOCODE / protocol.
-        raw = torch.sigmoid(z).clamp(1e-4, 1 - 1e-4)
-        frac_raw[tgt] = raw
-        # log p(sigmoid(z)) = log p(z) - log|d sigmoid(z) / dz|
-        logp = (
-            Normal(loc, sigma_t).log_prob(torch.logit(raw))
-            - torch.log(raw)
-            - torch.log1p(-raw)
-        )
-        logp_frac = logp_frac + logp
-
-    empty = bool((target_bits.sum() == 0).item())
     diagnostics = {
         "n_valid_sources": int(source_mask.sum().item()),
-        "n_valid_targets_in_row": int(valid_tgt_row.sum().item()),
-        "n_selected_targets": int(target_bits.sum().item()),
-        "noop_sampled": False,
-        "empty_target_set": empty,
+        "n_launch": int(n_launch),
+        "n_hold": int(source_mask.sum().item()) - int(n_launch),
     }
     return Action(
-        source_id=src, target_bits=target_bits, frac_raw=frac_raw,
-        logprob=logp_source + logp_targets + logp_frac,
-        logprob_source=logp_source,
-        logprob_targets=logp_targets,
+        tgt_idx=tgt_idx,
+        frac_raw=frac_raw,
+        logprob=logp_pair + logp_frac,
+        logprob_pair=logp_pair,
         logprob_frac=logp_frac,
-        empty_target_set=empty,
+        n_launch=int(n_launch),
         diagnostics=diagnostics,
     )
 
@@ -194,7 +181,7 @@ def sample_source_multi_target(
 @dataclass
 class ProjectionResult:
     env_actions: list[list[int]]      # list of [from_planet_id, angle, ships]
-    ok: bool                           # False if any selected target was dropped
+    ok: bool                           # False if any launching source was dropped
     n_emitted: int
     n_invalid: int
     invalid_reasons: list[str]
@@ -203,71 +190,59 @@ class ProjectionResult:
 def project_to_env(
     action: Action,
     *,
-    source_planet_id: int,
-    source_ships: int,
-    surplus: int,
+    source_mask: torch.Tensor,        # (P,) bool — which rows are owned/legal sources
+    surplus: torch.Tensor,            # (P,) float/int — per-source ships available to launch
+    source_planet_ids: list[int],     # (P,) slot -> planet id (-1 if padded)
+    target_planet_ids: list[int],     # (P,) slot -> planet id (-1 if padded)
     min_launch: int,
-    plan_launch_fn,                  # (src_id, tgt_id, ships) -> object with .ok, .angle, .reason
-    target_planet_ids: list[int],
+    plan_launch_fn,                   # (src_id, tgt_id, ships) -> object with .ok, .angle, .reason
 ) -> ProjectionResult:
     """Project a sampled :class:`Action` into env-shaped launch commands.
 
-    Allocation: selected target ``frac_raw`` values are normalized into a
-    shared source budget — they are weights, not absolute fractions. The
-    semantic ``frac_raw`` stored in the shard is what PPO recomputes logprob
-    on; the budgeted ship count is only used for the env call.
+    PER-SOURCE budget: each launching source ``s`` (``source_mask[s]`` and
+    ``tgt_idx[s] != s``) emits ``round(frac_raw[s] * surplus[s])`` ships,
+    gated below ``min_launch``. There is NO shared-budget normalization
+    across sources — this matches the runner ``single_target`` semantics.
 
     NEVER resample on invalid — the original sampled action stays in the
-    buffer with its original logprob; the invalid target just doesn't fire
-    and the rollout earns an ``invalid_launch_penalty``.
+    buffer with its original logprob; an invalid launch just doesn't fire and
+    the rollout earns an ``invalid_launch_penalty``.
     """
-    if action.source_id < 0:
-        return ProjectionResult(env_actions=[], ok=True, n_emitted=0,
-                                 n_invalid=0, invalid_reasons=[])
-    if action.target_bits.sum().item() == 0:
-        # empty_target_set — no launch, but not an "invalid" per-target case.
-        return ProjectionResult(env_actions=[], ok=True, n_emitted=0,
-                                 n_invalid=0, invalid_reasons=[])
-
-    selected_idx = action.target_bits.nonzero(as_tuple=False).flatten().tolist()
-    raws = torch.stack([action.frac_raw[i] for i in selected_idx])
-    weights = raws / raws.sum().clamp_min(1e-8)
-    budget = max(int(surplus), 0)
-
+    tgt_idx = action.tgt_idx
     env_actions: list[list[int]] = []
     n_invalid = 0
+    n_emitted = 0
     invalid_reasons: list[str] = []
 
-    # Allocate ship budget across selected targets using stable rounding.
-    # Largest-remainder method preserves the total within +/- 1 ship.
-    raw_alloc = (weights * float(budget)).tolist()
-    floored = [int(x) for x in raw_alloc]
-    remainder = budget - sum(floored)
-    fracs = [(raw_alloc[i] - floored[i], i) for i in range(len(floored))]
-    fracs.sort(reverse=True)
-    for r, _ in fracs[:max(0, remainder)]:
-        # nudge top-remainder cells up by 1 ship
-        idx_in_selected = next(i for f, i in fracs if f == r)
-        floored[idx_in_selected] += 1
-
-    for slot_i, sel_i in enumerate(selected_idx):
-        ships = floored[slot_i]
-        if ships < min_launch:
+    src_rows = source_mask.nonzero(as_tuple=False).flatten().tolist()
+    for s in src_rows:
+        t = int(tgt_idx[s].item())
+        if t == s:
+            continue                                # hold / NOOP
+        src_pid = source_planet_ids[s]
+        tgt_pid = target_planet_ids[t]
+        if src_pid is None or src_pid < 0 or tgt_pid is None or tgt_pid < 0:
+            n_invalid += 1
+            invalid_reasons.append("pad_slot")
+            continue
+        budget = max(int(surplus[s].item()), 0)
+        ships = int(round(float(action.frac_raw[s].item()) * budget))
+        if ships < int(min_launch):
             n_invalid += 1
             invalid_reasons.append("min_launch")
             continue
-        tgt_planet_id = target_planet_ids[sel_i]
-        launch = plan_launch_fn(source_planet_id, tgt_planet_id, ships)
+        launch = plan_launch_fn(int(src_pid), int(tgt_pid), int(ships))
         if not getattr(launch, "ok", False):
             n_invalid += 1
             invalid_reasons.append(str(getattr(launch, "reason", "unknown")))
             continue
-        env_actions.append([source_planet_id, float(launch.angle), int(ships)])
+        env_actions.append([int(src_pid), float(launch.angle), int(ships)])
+        n_emitted += 1
 
     return ProjectionResult(
         env_actions=env_actions,
         ok=(n_invalid == 0),
-        n_emitted=len(env_actions),
+        n_emitted=n_emitted,
         n_invalid=n_invalid,
         invalid_reasons=invalid_reasons,
     )
