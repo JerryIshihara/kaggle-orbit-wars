@@ -202,3 +202,112 @@ listed is intentionally hard-coded at the design's default.
 --opponent               registered agent id; UNSET = self-play snapshot per iter
 --resume-ppo-ckpt        PATH to a prior policy_v*.pt to continue training
 ```
+
+---
+
+# 2026-06 update — multi-target contract, deep heads, agent-B-vs-A
+
+Everything above (Runs 1–3) used the **shallow** PairHead (257 params/head) and
+the single-shot action rule. The stack has since moved to **deep heads
+(`head_num_layers=3`) + the multi-target action contract**, and the active goal
+changed from "PPO can move the policy at all" to **"train an agent B that beats a
+fixed agent A"** (A = a strong multi-target checkpoint that beats `physical_v4`
+~93.8% in deploy). This section captures the current design, config, and the
+agent-B trials run on the RunPod 3090 (`infserver` rollout).
+
+## Current model design (`transformer_v2`)
+
+```
+d_model = 256,  T = 10 history (HISTORY_OFFSETS strided: t, t-5, … t-45)
+L0  frozen specialists:  planet_enc (18 scalars→256), fleet_enc, comet_enc (18+105→256)
+L1  per-entity tokens  →  L2 CrossEntityAttention (temporal, runs over the T=10 stack)
+L3  dual_role  →  L4 joint_role  →  PlayerConsolidator   (all load-bearing; see ablation)
+PairHead:  trunk + FiLM (conditioned on player/context) over source⊗target⊗context
+           ├─ pair_head        → pair_logits[s,t]   (SELECT logits)
+           └─ pair_frac_head   → frac_loc[s,t]      (ALLOCATION logits)
+Critic:    reward-decomp (pretrained win head + trainable residual value_decoder),
+           fed the full T=10 L1 stack (in-distribution with its pretraining)
+max_planets = 64,  max_fleets = 512  (fleet p99≈624; <512 truncates ~14% of steps)
+```
+
+**Action contract — `bernoulli_select_multinomial_alloc_v1` (multi-target):**
+per OWNED source row `s` (legal = owned + surplus ≥ `min_launch`):
+1. **Select (Bernoulli):** for each *legal* target column, fire ~ `Bernoulli(σ(pair_logits[s,t]/τ − select_logit_bias))`.
+2. **Allocate (Multinomial):** distribute the source's *full* ship count `N` over `[fired targets … , self]` with
+   `logits = [frac_loc[s, fired] , pair_logits[s,s]]/τ`. Fired-target counts = launch sizes; the self/HOLD count stays home.
+   - NB: the **HOLD logit reuses the select head's diagonal** `pair_logits[s,s]`, which was **never supervised in pretraining** → "launch vs hold" is shaped entirely by PPO from a near-random init (a likely early-instability contributor).
+
+**Deploy (shipped) rule — `inference_mode="threshold"`, `logit_threshold=2.0`:**
+every legal cell with `pair_logits>2.0` fires, sized `sigmoid(frac)·ships`, each launch
+**pre-validated through `plan_launch`** (drops wrong-planet/sun/boundary) + surplus-budgeted.
+This is the eval that matters; PPO trains the SAMPLED distribution above.
+
+## Current PPO config (agent-B vs frozen A)
+
+```
+rollout:    --rollout infserver  (two-policy: learner-seat→B, other seats→frozen A
+            via per-request is_learner flag; ~8x over batched). procs=32, T=10,
+            games=64 (mix 2P/4P), spool off /dev/shm → /root/ow_spool (OOM guard),
+            per-iter janitor prunes old rollouts/ (MooseFS quota guard).
+critic:     --reward-decomp (PBRS Φ-shaping), value-gamma 0.997
+reward:     win-weight 0.5  +  signal-weights [0.1, 0.2, 0.1, 0, 0.35]
+            (ship_adv, prod_adv, planet_adv, safety, fleet_spd from compute_p1_signals)
+contract:   --opponent-ckpt <A>  (frozen agent A);  sigma 0.35;  select-logit-bias 1.0
+update:     unfreeze L2, epochs 3, minibatch 64, value-coef 0.5
+logging:    per-iter PBRS signals bucketed in 25-step windows (apply_phi_shaping log_fn)
+infra:      RunPod 3090, image runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404,
+            125 GB cgroup; T=10 update peaks ~107 GB (clear dead-run rollout cache first).
+```
+
+`--rollout shm` (shared-memory request plane, infserver_shm_rollout.py) is wired
++ `--shm-forwarders`, but **stalls through `train_local_trial` on the 3090**
+(forwarder↔worker handshake → games=0/64; standalone test passes on L40). **Not
+production-ready — keep `infserver`.** The 1.6× shm win is marginal vs the env.step floor.
+
+## Trials — agent B vs frozen A (2026-06-06, RunPod 3090)
+
+All warm-started from a multi-target B checkpoint, opponent = frozen A (`policy_v5`).
+Sampled winrate ≈ 30–40 % throughout (= A's own training range; the deploy number is
+what matters). The lever under test was **invalid-launch reduction** (later shown moot).
+
+| trial | clip | lr-heads | target-kl | ent-coef | inval-coef | KL/update | inval_frac | outcome |
+|---|---|---|---|---|---|---|---|---|
+| **sig** (baseline) | 0.20 | 5e-5 | 0.05 | −0.05 | 0 | ~0.002 | 0.89 | **frozen** (KL 25× under target) |
+| **p1inval** | 0.20 | 1e-4 | 0.10 | −0.025 | 0.005 | 0.006→0.003 | flat ~0.88 | moves a little then re-freezes; invalid flat |
+| **accel** | 0.30 | **2e-4** | 0.10 | −0.025 | 0.01 | **0.084** | 0.895→**0.909** | **DETONATED** — invalid ↑, emit collapse, win 30→23% |
+| **controlled** | 0.30 | 1.25e-4 | 0.03 | −0.025 | 0.005 | ~0.005 | flat ~0.88 | back to **stuck** regime (no detonation, no progress) |
+
+**There is a cliff with no working middle:** lr-heads ≤1.25e-4 → KL ~0.005, invalid
+flat (policy doesn't move); lr-heads 2e-4 → KL 0.084, policy runs away into a *worse*
+region (detonation). 1.6× lr → 16× KL.
+
+### Key findings (these reframe the whole effort)
+
+1. **The ~88 % invalid-launch rate is BENIGN — it is *not* illegal moves.** The
+   sampler only ever fires *legal* pairs; the "invalid" count is essentially all
+   `min_launch` (the Multinomial spreads `N` across many fired targets + HOLD, so most
+   fired cells fall below the per-phase `min_launch` floor and are dropped). **Agent A —
+   the 93.8 % champion — trained at `inval_frac ≈ 0.857` with NO penalty.** And the
+   **deploy path emits env-valid launches** (it budgets surplus into a few targets +
+   `plan_launch`-validates), so sampled invalid_frac has **zero** effect on the shipped
+   policy. ⇒ Phase-1 "decrease invalid first" was a **red herring**; abandoned.
+
+2. **Deploy eval (the number that matters):** B (`policy_v4`, threshold) vs A
+   (`policy_v5`, threshold) = **29/64 = 45.3 %** (seat0 40.6 %, seat1 50.0 %). B ≈ A —
+   **genuine symmetric parity.** Separately, B beats `physical_v4` **4/4** in deploy, so
+   B is a strong agent; it is specifically *A* it cannot pass.
+
+3. **20/20 may be structurally unattainable.** Deploy is deterministic given a seed +
+   there's strong seat asymmetry (2p seat-0 ≈ 54 %). Even *champion A* only beats the
+   far-weaker `physical_v4` 93.8 % (not 20/20) — i.e. seat/seed variance caps winrate
+   below 100 %. Beating the *stronger* A on 20/20 seat-balanced seeds is almost certainly
+   above that ceiling. **Target definition needs pinning before more training** (literal
+   20/20 vs B-favorable-seat vs "high-winrate dominance").
+
+### Recommended next direction (not yet run — awaiting decision)
+
+Warm B **from A itself** (`policy_v5`) and exploit-train vs frozen A:
+win-weight 1.0 (optimize winning, not signals), **ent-coef +0.01** (real exploration —
+phase 2), no invalid penalty, controlled lr 1.25e-4 / target-kl 0.03 / clip 0.30. Since A
+is frozen + deterministic, this is an *exploitation* problem; the under-supervised HOLD
+diagonal (above) is the least-constrained spot where B can diverge from A.
