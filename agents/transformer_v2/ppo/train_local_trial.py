@@ -50,6 +50,7 @@ from . import shards
 from .actor_critic import PPOActorCritic
 from .batched_rollout import run_batched_episodes
 from .infserver_rollout import run_infserver_rollout
+from .infserver_shm_rollout import run_shm_rollout
 from .learner import PPOConfig, ppo_update_local
 from .pool_rollout import run_pool_rollout
 from .smoke import (
@@ -382,22 +383,34 @@ _P1_KEYS = ("planet_features", "planet_mask", "fleet_features", "fleet_mask",
             "fleet_ships_log", "fleet_eta_norm")
 
 
-def apply_phi_shaping(episodes, *, win_weight: float, signal_weights, gamma: float):
+_P1_SIGNAL_NAMES = ("ship_adv", "prod_adv", "planet_adv", "safety", "fleet_spd")
+
+
+def apply_phi_shaping(episodes, *, win_weight: float, signal_weights, gamma: float,
+                      inval_coef: float = 0.0, log_fn=None):
     """Overwrite each step's reward with the CALCULATED PBRS shaping + terminal win
     (design A). Φ(s)=Σ wᵢ sᵢ(s) from compute_p1_signals on the step's stored frame
     (learner-relative slot 0); r_t = γΦ(s_{t+1}) − Φ(s_t); the terminal step adds
     w_win·z where z=1 for a win and 0 otherwise. Weights are deliberately
     unconstrained; keep their scale small enough that shaping does not dominate
-    the terminal win objective. Returns (mean_phi, mean_shaping_abs) for logging."""
+    the terminal win objective.
+
+    ``inval_coef`` > 0 subtracts a DIRECT (non-PBRS) per-step cost on the invalid-
+    launch RATE — ``inval_coef · invalid/(invalid+emitted)`` ∈ [0, inval_coef] —
+    so the policy is pushed to stop firing illegal cells (the multi-target sampler
+    over-fires; ~88% of attempts can be invalid). Direct cost (not a potential
+    difference) because we WANT it to change the optimal policy, not stay neutral.
+    Returns (mean_phi, mean_shaping_abs) for logging."""
     from agents.transformer_v2.pretrain.value_signals import compute_p1_signals
     sw = torch.as_tensor(signal_weights, dtype=torch.float32)
     all_phi, all_sh = [], []
+    sig_buckets: dict[int, list] = {}  # bucket=(step//25) -> [sum(5,), count] across all eps
     with torch.no_grad():
         for ep in episodes:
             if not ep.steps:
                 continue
             phis = []
-            for s in ep.steps:
+            for t_s, s in enumerate(ep.steps):
                 batch = {}
                 for k in _P1_KEYS:
                     v = getattr(s, k, None)
@@ -407,17 +420,34 @@ def apply_phi_shaping(episodes, *, win_weight: float, signal_weights, gamma: flo
                 else:
                     sig = compute_p1_signals(batch)[0, 0]  # learner-relative slot 0 → (5,)
                     phis.append(float((sig * sw).sum()))
+                    b = t_s // 25                          # 25-step window bucket
+                    acc = sig_buckets.setdefault(b, [torch.zeros(5), 0])
+                    acc[0] += sig.detach().cpu(); acc[1] += 1
                     continue
                 phis.append(phis[-1] if phis else 0.0)     # missing-feature fallback
             for t, s in enumerate(ep.steps):
                 phi_next = phis[t + 1] if t + 1 < len(phis) else 0.0   # terminal Φ=0
                 s.reward = gamma * phi_next - phis[t]       # PBRS γΦ'−Φ
+                if inval_coef:
+                    n_inv = int(getattr(s, "invalid_launch", 0) or 0)
+                    n_emit = int(getattr(s, "emitted_launch", 0) or 0)
+                    inval_rate = n_inv / max(1, n_inv + n_emit)
+                    s.reward = s.reward - inval_coef * inval_rate  # direct invalid-firing cost
                 s.phi = phis[t]                              # critic reads −Φ analytically
                 s.value = s.value - phis[t]                  # keep stored GAE value = V−Φ
                 all_sh.append(abs(s.reward))
             z = 1.0 if ep.winner == ep.learner_seat else 0.0
             ep.steps[-1].reward += win_weight * z          # terminal win (z∈{1,0})
             all_phi.extend(phis)
+    # ---- per-iter signal diagnostics: mean of each P1 signal per 25-step window ----
+    if log_fn is not None and sig_buckets:
+        hdr = "  ".join(f"{n:>9}" for n in _P1_SIGNAL_NAMES)
+        log_fn(f"signals (mean per 25-step window) | step-window  n   {hdr}")
+        for b in sorted(sig_buckets):
+            tot, cnt = sig_buckets[b]
+            means = (tot / max(1, cnt)).tolist()
+            row = "  ".join(f"{m:>9.3f}" for m in means)
+            log_fn(f"  signals  [{b*25:>3}-{b*25+24:>3}]  {cnt:>4}   {row}")
     import statistics as _st
     return (_st.mean(all_phi) if all_phi else 0.0,
             _st.mean(all_sh) if all_sh else 0.0)
@@ -430,6 +460,7 @@ def _shape_and_pack_episode_job(
     win_weight: float,
     signal_weight: float,
     gamma: float,
+    inval_coef: float = 0.0,
 ):
     """Post-worker job for one completed game.
 
@@ -446,6 +477,7 @@ def _shape_and_pack_episode_job(
             win_weight=win_weight,
             signal_weights=[signal_weight] * 5,
             gamma=gamma,
+            inval_coef=inval_coef,
         )
     packed = _pack_episode_for_ppo(ep)
     return packed, {
@@ -463,6 +495,7 @@ def _shape_and_pack_episode_path_job(
     signal_weight: float,
     gamma: float,
     delete_after: bool = False,
+    inval_coef: float = 0.0,
 ):
     """Path-based post job: avoids sending large tensor EpisodeBuffers via mp queues."""
     try:
@@ -473,6 +506,7 @@ def _shape_and_pack_episode_path_job(
             win_weight=win_weight,
             signal_weight=signal_weight,
             gamma=gamma,
+            inval_coef=inval_coef,
         )
     finally:
         if delete_after:
@@ -682,6 +716,16 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt", required=True, type=Path, help="joint/supervised actor ckpt")
+    p.add_argument("--init-policy", type=Path, default=None,
+                   help="resume PPO from a prior policy_vK.pt: build the model from "
+                        "--ckpt (architecture) then load this checkpoint's 'policy' "
+                        "state_dict on top. Use to continue/tune from an earlier run.")
+    p.add_argument("--opponent-ckpt", type=Path, default=None,
+                   help="train the learner against a FIXED opponent policy_vK.pt "
+                        "(agent A) instead of self-play: the opponent fills all "
+                        "non-learner seats with these frozen weights. FORCES --rollout "
+                        "batched (infserver/pool are self-play-only). Use for agent-B "
+                        "training (B beats A).")
     p.add_argument("--planet-run-dir", type=Path, default=None)
     p.add_argument("--fleet-run-dir", type=Path, default=None)
     p.add_argument("--comet-run-dir", type=Path, default=None)
@@ -715,10 +759,16 @@ def main() -> int:
     p.add_argument("--delete-local-rollouts-after-upload", action="store_true",
                    help="after a successful GCS upload, delete local rollout artifact "
                         "directories and temporary infserver spool files")
-    p.add_argument("--rollout", default="infserver", choices=["batched", "pool", "infserver"],
+    p.add_argument("--rollout", default="infserver", choices=["batched", "pool", "infserver", "shm"],
                    help="batched=GPU lockstep forward (CUDA, single process); "
                         "infserver=CPU env workers + one parent-owned GPU batch "
-                        "forwarder; pool=CPU work-stealing fork pool (CPU only)")
+                        "forwarder; shm=infserver variant with shared-memory request "
+                        "plane (no per-step deserialize, ~1.6x faster); "
+                        "pool=CPU work-stealing fork pool (CPU only)")
+    p.add_argument("--shm-forwarders", type=int, default=1,
+                   help="number of parallel GPU forwarder processes for --rollout shm "
+                        "(L40 finding: >1 raises GPU util but not throughput, since "
+                        "env.step is the floor; keep 1 unless the GPU is saturated)")
     p.add_argument("--allow-cpu-forward-rollout", action="store_true",
                    help="permit --rollout pool CPU-forward debug runs. Without this, "
                         "pool is rejected to avoid accidentally burning GPU-pod time "
@@ -771,6 +821,13 @@ def main() -> int:
     p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--value-coef", type=float, default=0.5)
     p.add_argument("--sigma", type=float, default=0.35)
+    p.add_argument("--select-logit-bias", type=float, default=0.0,
+                   help="multi-target selection-Bernoulli logit shift: "
+                        "fire[s,t] ~ Bernoulli(sigmoid(pair_logits[s,t] - bias)). "
+                        "Positive => fewer (more confident) fires; b=2.0 mirrors the "
+                        "runner's pair_logits>2.0 threshold. Applied IDENTICALLY in the "
+                        "rollout sampler and the PPO update loss (the same value, else "
+                        "the ratio desyncs). Default 0.0 = unchanged behaviour.")
     # design A reward-decomposition critic + calculated Φ shaping
     p.add_argument("--reward-decomp", action="store_true",
                    help="design A: scalar-winrate critic warm-started from the pretrained "
@@ -786,6 +843,11 @@ def main() -> int:
                         "safety signal, e.g. '0.1,0.1,0.1,0,0.1'.")
     p.add_argument("--value-gamma", type=float, default=0.997,
                    help="γ for the PBRS shaping r=γΦ'−Φ (= the PPO discount)")
+    p.add_argument("--inval-coef", type=float, default=0.0,
+                   help="DIRECT per-step cost on the invalid-launch RATE "
+                        "invalid/(invalid+emitted)∈[0,1]: r -= inval_coef·rate. Pushes the "
+                        "over-firing multi-target policy to stop firing illegal cells. "
+                        "Default 0.0 = off. ~PBRS per-step |r| is ~0.006, so 0.02 ≈ 3× that.")
     args = p.parse_args()
     if args.rollout == "pool" and not args.allow_cpu_forward_rollout:
         raise SystemExit(
@@ -795,6 +857,9 @@ def main() -> int:
         )
     if args.rollout == "infserver" and not str(args.device).startswith("cuda"):
         raise SystemExit("--rollout infserver requires --device cuda")
+    if args.rollout == "shm" and not str(args.device).startswith("cuda"):
+        raise SystemExit("--rollout shm requires --device cuda (set OW_SHM_ALLOW_CPU=1 "
+                         "only for parity tests via scripts/test_shm_rollout.py)")
 
     t_start = time.time()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -884,10 +949,44 @@ def main() -> int:
         allow_debug_glob_critic=(critic_model is None and not args.reward_decomp),
         reward_decomp=args.reward_decomp, win_weight=args.win_weight,
     ).to(args.device)
+    if args.init_policy is not None:
+        _ist = torch.load(args.init_policy, map_location=args.device, weights_only=False)
+        _isd = _ist.get("policy", _ist)
+        _miss, _unexp = policy.load_state_dict(_isd, strict=False)
+        _log(f"init-policy: resumed from {args.init_policy} "
+             f"(was iter={_ist.get('iter')} sigma={_ist.get('sigma')}); "
+             f"loaded {len(_isd)} tensors, missing={len(_miss)} unexpected={len(_unexp)}")
+        if len(_miss) > 20 or len(_unexp) > 20:
+            _log(f"WARNING: large state_dict mismatch on --init-policy "
+                 f"(missing={len(_miss)} unexpected={len(_unexp)}) — architecture may differ")
     breakdown = _apply_unfreeze(policy, args.unfreeze)
     n_train = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     _log(f"unfreeze={args.unfreeze}: trainable={n_train:,} groups={breakdown}")
     train_policy = _PPOWithL0(policy, planet_enc, fleet_enc, comet_enc).to(args.device)
+
+    # ---- FIXED opponent (agent A) for agent-B training (else self-play) ----
+    fixed_opponent = None
+    if args.opponent_ckpt is not None:
+        import copy as _copy
+        opp_entity = _copy.deepcopy(entity_model)        # separate frozen instance
+        fixed_opponent = PPOActorCritic(
+            opp_entity, sigma=args.sigma, critic_model=None,
+            allow_debug_glob_critic=False, reward_decomp=args.reward_decomp,
+            win_weight=args.win_weight,
+        ).to(args.device)
+        _ost = torch.load(args.opponent_ckpt, map_location=args.device, weights_only=False)
+        _osd = _ost.get("policy", _ost)
+        _omiss, _ounexp = fixed_opponent.load_state_dict(_osd, strict=False)
+        fixed_opponent.eval()
+        for _p in fixed_opponent.parameters():
+            _p.requires_grad_(False)
+        _log(f"FIXED opponent (agent A) from {args.opponent_ckpt} "
+             f"(was iter={_ost.get('iter')}); loaded {len(_osd)} tensors, "
+             f"missing={len(_omiss)} unexpected={len(_ounexp)}")
+        if args.rollout == "pool":
+            _log("--opponent-ckpt set with --rollout pool → forcing batched "
+                 "(pool is self-play-only; infserver + batched support a fixed opponent)")
+            args.rollout = "batched"
 
     cfg_ppo = PPOConfig(
         clip=args.clip, target_kl=args.target_kl, epochs=args.epochs,
@@ -895,6 +994,7 @@ def main() -> int:
         lr_perception=args.lr_perception,
         value_coef=args.value_coef, ent_coef=args.ent_coef, bc_coef=0.0,
         bc_target_weight=1.0,
+        select_logit_bias=args.select_logit_bias,
     )
 
     init_ckpt, init_legacy = _save_policy_checkpoint(
@@ -928,7 +1028,10 @@ def main() -> int:
         # do one GPU forward across all active seats per env step. A separate
         # deep-copy opponent is available only as an explicit debug option.
         policy.eval()
-        if args.separate_opponent_copy:
+        if fixed_opponent is not None:
+            opp = fixed_opponent
+            _log("opponent: FIXED agent A (frozen; agent-B training, batched rollout)")
+        elif args.separate_opponent_copy:
             opp = _snapshot_opponent(policy, args.device)
             _log("self-play opponent: separate frozen deep-copy")
         else:
@@ -938,8 +1041,9 @@ def main() -> int:
 
         specs = build_specs(args.games, args.seed_base + K * args.games, args.num_players)
         n2 = sum(1 for s in specs if s[1] == 2)
+        _mode = "vs FIXED agent A" if fixed_opponent is not None else "self-play"
         _log(f"rollout[{args.rollout}]: {args.games} games (2P={n2} 4P={args.games - n2}) "
-             f"self-play, T={args.history_window}, device={args.device}")
+             f"{_mode}, T={args.history_window}, device={args.device}")
         _stream_progress({
             "stage": "rollout_start",
             "iter": int(K),
@@ -976,7 +1080,8 @@ def main() -> int:
                 planet_enc=planet_enc, fleet_enc=fleet_enc, comet_enc=comet_enc,
                 specs=specs, device=args.device,
                 max_planets=args.max_planets, max_fleets=args.max_fleets,
-                sigma=args.sigma, history_window=args.history_window, on_step=_on_step,
+                sigma=args.sigma, select_logit_bias=args.select_logit_bias,
+                history_window=args.history_window, on_step=_on_step,
             )
         elif args.rollout == "infserver":
             if args.post_procs > 1:
@@ -1002,6 +1107,7 @@ def main() -> int:
                         signal_weight=args.signal_weight,
                         gamma=args.value_gamma,
                         delete_after=args.delete_infserver_spool_after_post,
+                        inval_coef=args.inval_coef,
                     )
 
                 on_episode_file_done = _submit_post_path
@@ -1030,6 +1136,7 @@ def main() -> int:
 
             episodes, inf_stats = run_infserver_rollout(
                 policy=policy,
+                opponent_policy=fixed_opponent,  # None=self-play; agent A for agent-B training
                 planet_enc=planet_enc,
                 fleet_enc=fleet_enc,
                 comet_enc=comet_enc,
@@ -1040,6 +1147,7 @@ def main() -> int:
                 max_fleets=args.max_fleets,
                 sigma=args.sigma,
                 noop_logit_bias=0.0,
+                select_logit_bias=args.select_logit_bias,
                 history_window=args.history_window,
                 max_batch=args.infserver_max_batch,
                 batch_window_s=args.infserver_batch_window_ms / 1000.0,
@@ -1059,6 +1167,63 @@ def main() -> int:
             fm = inf_stats.get("fwd_ms") or []
             _log(
                 "infserver GPU summary: "
+                f"forwards={len(bs)} "
+                f"batch_mean={(sum(bs) / max(1, len(bs))):.1f} "
+                f"batch_max={(max(bs) if bs else 0)} "
+                f"fwd_ms_mean={(sum(fm) / max(1, len(fm))):.1f}"
+            )
+        elif args.rollout == "shm":
+            # shared-memory request plane: same two-policy routing + episode shape
+            # as infserver, but workers write the T=10 stack into pre-allocated
+            # shm slots (no per-step pickle) → ~1.6x rollout (env.step is the floor).
+            def _on_shm_progress(st):
+                _log(
+                    "[roll] shm "
+                    f"t={st.get('wall_s', 0):.1f}s "
+                    f"games={st.get('games_done', 0)}/{st.get('games_total', 0)} "
+                    f"workers_alive={st.get('workers_alive', 0)} "
+                    f"gpu_forwards={st.get('gpu_forwards', 0)} "
+                    f"batch(mean/max)={st.get('batch_mean', 0):.1f}/"
+                    f"{st.get('batch_max', 0)} "
+                    f"fwd_ms={st.get('fwd_ms_mean', 0):.1f}"
+                )
+                _stream_progress({
+                    "iter": int(K),
+                    "policy_version": int(policy_version),
+                    **dict(st),
+                })
+
+            episodes, inf_stats = run_shm_rollout(
+                policy=policy,
+                opponent_policy=fixed_opponent,  # None=self-play; agent A for agent-B
+                planet_enc=planet_enc,
+                fleet_enc=fleet_enc,
+                comet_enc=comet_enc,
+                specs=specs,
+                n_workers=args.procs,
+                device=args.device,
+                max_planets=args.max_planets,
+                max_fleets=args.max_fleets,
+                sigma=args.sigma,
+                n_forwarders=args.shm_forwarders,
+                noop_logit_bias=0.0,
+                select_logit_bias=args.select_logit_bias,
+                history_window=args.history_window,
+                max_batch=args.infserver_max_batch,
+                spool_dir=(
+                    (args.infserver_spool_dir / run_id / _vtag(policy_version))
+                    if args.infserver_spool_dir is not None
+                    else args.out_dir / "infserver_spool" / _vtag(policy_version)
+                ),
+                on_progress=_on_shm_progress,
+                log_every_s=args.infserver_log_every_s,
+                stall_timeout_s=args.infserver_stall_timeout_s,
+                progress_every=args.progress_step_every,
+            )
+            bs = inf_stats.get("batch_sizes") or []
+            fm = inf_stats.get("fwd_ms") or []
+            _log(
+                "shm GPU summary: "
                 f"forwards={len(bs)} "
                 f"batch_mean={(sum(bs) / max(1, len(bs))):.1f} "
                 f"batch_max={(max(bs) if bs else 0)} "
@@ -1097,6 +1262,7 @@ def main() -> int:
                         win_weight=args.win_weight,
                         signal_weight=args.signal_weight,
                         gamma=args.value_gamma,
+                        inval_coef=args.inval_coef,
                     )
 
                 on_episode_done = _submit_post
@@ -1106,6 +1272,7 @@ def main() -> int:
                 episodes = run_pool_rollout(
                     policy, opp, planet_enc, fleet_enc, comet_enc, specs, args.procs,
                     sigma=args.sigma, max_planets=args.max_planets, max_fleets=args.max_fleets,
+                    select_logit_bias=args.select_logit_bias,
                     history_window=args.history_window,
                     worker_progress=progress, progress_step_every=args.progress_step_every,
                     on_episode_done=on_episode_done,
@@ -1126,7 +1293,7 @@ def main() -> int:
             steps = sum(len(e.steps) for e in seg)
             return f"{npl}P: {wins}/{len(seg)} wins, {steps} learner-steps"
         total_steps = sum(len(e.steps) for e in ok)
-        noop = sum(1 for e in ok for s in e.steps if s.action.n_launch == 0)
+        noop = sum(1 for e in ok for s in e.steps if s.n_selected_targets == 0)
         emit = sum(s.emitted_launch for e in ok for s in e.steps)
         inval = sum(s.invalid_launch for e in ok for s in e.steps)
         _log(f"rollout done in {roll_s:.1f}s | {len(ok)} ok ({n_fail} failed) | "
@@ -1184,9 +1351,11 @@ def main() -> int:
             # win, set per-step Φ (critic reads −Φ), adjust stored value by −Φ.
             mphi, msh = apply_phi_shaping(
                 ok, win_weight=args.win_weight,
-                signal_weights=_sigw, gamma=args.value_gamma)
+                signal_weights=_sigw, gamma=args.value_gamma,
+                inval_coef=args.inval_coef, log_fn=_log)
             _log(f"Φ-shaping: mean Φ={mphi:.3f} mean|r_shape|={msh:.4f} "
-                 f"(w_win={args.win_weight}, w_sig={_sigw}, γ={args.value_gamma})")
+                 f"(w_win={args.win_weight}, w_sig={_sigw}, γ={args.value_gamma}, "
+                 f"inval_coef={args.inval_coef})")
         elif args.reward_decomp and live_post_stats:
             n_steps_phi = sum(s["n_steps"] for s in live_post_stats)
             mphi = (
@@ -1321,6 +1490,21 @@ def main() -> int:
                 f"nan_guarded={em.get('nan_guarded', 0):.1f}"
                 f"{' early_stop' if em.get('early_stopped') else ''}"
             )
+            if "ent/perplexity" in em:
+                # FLAT vs BUMPS: ppl≈coll≈K & norm≈1 -> flat (uniform collapse);
+                # coll small (2-4) with large K -> a few bumps (benign hedging).
+                prof = " ".join("%.2f" % em.get("ent/p%d" % i, float("nan"))
+                                for i in range(8))
+                _log(
+                    "  ent-shape: ppl=%.1f coll=%.1f K=%.1f norm=%.2f "
+                    "top1=%.2f top3=%.2f profile=[%s]"
+                    % (em.get("ent/perplexity", float("nan")),
+                       em.get("ent/collision", float("nan")),
+                       em.get("ent/K", float("nan")),
+                       em.get("ent/norm", float("nan")),
+                       em.get("ent/top1", float("nan")),
+                       em.get("ent/top3", float("nan")),
+                       prof))
         _log(f"update: {len(ems)} epochs ({time.time()-t_upd:.1f}s) "
              f"kl={last.get('approx_kl', float('nan')):.4f} "
              f"policy_loss={last.get('policy_loss', float('nan')):.4f} "
@@ -1340,6 +1524,7 @@ def main() -> int:
             "value_loss": last.get("value_loss"),
             "entropy": last.get("entropy"),
             "clip_frac": last.get("clip_frac"),
+            "ent_shape": {k[4:]: last.get(k) for k in last if k.startswith("ent/")},
             "early_stopped": bool(early),
         })
 
@@ -1358,6 +1543,7 @@ def main() -> int:
             "kl": last.get("approx_kl"), "policy_loss": last.get("policy_loss"),
             "value_loss": last.get("value_loss"), "entropy": last.get("entropy"),
             "clip_frac": last.get("clip_frac"), "early_stopped": early,
+            "ent_shape": {k[4:]: last.get(k) for k in last if k.startswith("ent/")},
             "iter_wall_s": round(time.time() - t_iter, 1),
             "rollout_dir": (str(rollout_root) if rollout_root is not None else None),
             "rollout_manifest": (

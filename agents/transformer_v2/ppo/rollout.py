@@ -19,7 +19,12 @@ from dataclasses import dataclass, field
 import torch
 
 from .env_adapter import EnvAdapter, Obs
-from .sampler import Action, legality_masks, project_to_env, sample_single_target
+from .sampler import (
+    MultiTargetAction,
+    legality_masks,
+    project_multi_target_to_env,
+    sample_multi_target,
+)
 
 
 @dataclass
@@ -30,8 +35,8 @@ class EpisodeShards:
     feats_per_step: list[dict[str, torch.Tensor]] = field(default_factory=list)
     pair_masks: list[torch.Tensor] = field(default_factory=list)
     source_masks: list[torch.Tensor] = field(default_factory=list)
-    # Sampled actions (one Action per learner step).
-    actions: list[Action] = field(default_factory=list)
+    # Sampled actions (one MultiTargetAction per learner step).
+    actions: list[MultiTargetAction] = field(default_factory=list)
     # Per-step scalars.
     values: list[float] = field(default_factory=list)
     rewards: list[float] = field(default_factory=list)
@@ -92,16 +97,19 @@ def run_episode(
                 planet_exists=obs.planet_exists,
                 min_launch=min_launch,
             )
-            action = sample_single_target(
-                pair_logits, frac_loc, out["sigma"],
+            # source_ships: per-source current ship count. The MVP EnvAdapter.Obs
+            # exposes surplus only; this standalone path (NOT the trial path) uses
+            # the integer surplus as the multinomial N. A real adapter should add
+            # a raw ship-count field to Obs.
+            source_ships = obs.planet_surplus.clamp_min(0).round().long()
+            action = sample_multi_target(
+                pair_logits, frac_loc, source_ships,
                 pair_mask=pair_mask, source_mask=source_mask,
-                noop_logit_bias=noop_logit_bias,
             )
 
-            proj = project_to_env(
+            proj = project_multi_target_to_env(
                 action,
                 source_mask=source_mask,
-                surplus=obs.planet_surplus,
                 source_planet_ids=obs.planet_ids,
                 target_planet_ids=obs.planet_ids,
                 min_launch=min_launch,
@@ -124,7 +132,7 @@ def run_episode(
             shards.dones.append(1.0 if step_result.done else 0.0)
             shards.invalid_launch.append(n_invalid)
             shards.emitted_launch.append(n_emitted)
-            shards.n_selected_targets.append(int(action.n_launch))
+            shards.n_selected_targets.append(int(action.diagnostics.get("n_fired_total", 0)))
             shards.invalid_reasons.append(invalid_reasons)
 
             obs = step_result.obs_next

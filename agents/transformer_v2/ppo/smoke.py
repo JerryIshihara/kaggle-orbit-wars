@@ -67,7 +67,12 @@ from .actor_critic import PPOActorCritic
 from .gae import Episode, compute_advantages
 from .learner import PPOConfig, ppo_update_local
 from .loss import PPOMinibatch
-from .sampler import Action, legality_masks, sample_single_target
+from .sampler import (
+    MultiTargetAction,
+    legality_masks,
+    project_multi_target_to_env,
+    sample_multi_target,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -91,7 +96,7 @@ class StepRecord:
     # Rollout-time computed:
     pair_mask: torch.Tensor                # (P, P) bool
     source_mask: torch.Tensor               # (P,) bool
-    action: Action
+    action: MultiTargetAction
     value: float
     # Rewards / dones are filled later from env score history.
     reward: float = 0.0
@@ -359,14 +364,16 @@ def _forward_with_history(policy, planet_enc, fleet_enc, comet_enc, history, ste
     return out, store
 
 
-def _project_single_target(
-    action, *, source_mask, planet_surplus, slot_to_pid, planets, min_launch,
+def _project_multi_target(
+    action, *, source_mask, slot_to_pid, planets, min_launch,
 ):
-    """Per-source projection of a single_target_per_source_v1 action into env
-    moves. Each launching source (``source_mask[s]`` and ``tgt_idx[s] != s``)
-    emits ``round(frac_raw[s] * surplus[s])`` ships (gated by ``min_launch``).
-    PER-SOURCE budget — no shared-budget split. Mirrors runner ``single_target``.
-    Returns ``(env_moves, n_invalid, n_emitted, invalid_reasons)``."""
+    """Per-cell projection of a bernoulli_select_multinomial_alloc_v1 action into
+    env moves. Each FIRED cell ``(s, t)`` (``action.select_mask[s, t]``) with
+    ``alloc_counts[s, t] >= min_launch`` emits one launch of ``ships =
+    alloc_counts[s, t]`` (the multinomial already routed N = source ships, so the
+    counts ARE the launch sizes — held ships stay home via ``self_counts``).
+    Cells below ``min_launch`` are dropped (invalid). Returns
+    ``(env_moves, n_invalid, n_emitted, invalid_reasons)``."""
     env_moves: list[list[float]] = []
     n_invalid = 0
     n_emitted = 0
@@ -376,34 +383,35 @@ def _project_single_target(
     by_id = {int(p.id): p for p in planets}
     src_rows = source_mask.nonzero(as_tuple=False).flatten().tolist()
     for s in src_rows:
-        t = int(action.tgt_idx[s].item())
-        if t == s:
-            continue                                    # hold / NOOP
-        src_pid = slot_to_pid[s]
-        tgt_pid = slot_to_pid[t]
-        if src_pid < 0 or tgt_pid < 0:
-            n_invalid += 1; invalid_reasons.append("pad_slot"); continue
-        src_planet = by_id.get(int(src_pid))
-        tgt_planet = by_id.get(int(tgt_pid))
-        if src_planet is None or tgt_planet is None:
-            n_invalid += 1; invalid_reasons.append("no_planet"); continue
-        budget = max(0, int(planet_surplus[s].item()))
-        ships = int(round(float(action.frac_raw[s].item()) * budget))
-        if ships < int(min_launch):
-            n_invalid += 1; invalid_reasons.append("min_launch"); continue
-        angle = math.atan2(tgt_planet.y - src_planet.y, tgt_planet.x - src_planet.x)
-        env_moves.append([int(src_pid), float(angle), int(ships)])
-        n_emitted += 1
+        fired_cols = action.select_mask[s].nonzero(as_tuple=False).flatten().tolist()
+        for t in fired_cols:
+            ships = int(action.alloc_counts[s, t].item())
+            if ships < int(min_launch):
+                n_invalid += 1; invalid_reasons.append("min_launch"); continue
+            src_pid = slot_to_pid[s]
+            tgt_pid = slot_to_pid[t]
+            if src_pid < 0 or tgt_pid < 0:
+                n_invalid += 1; invalid_reasons.append("pad_slot"); continue
+            src_planet = by_id.get(int(src_pid))
+            tgt_planet = by_id.get(int(tgt_pid))
+            if src_planet is None or tgt_planet is None:
+                n_invalid += 1; invalid_reasons.append("no_planet"); continue
+            angle = math.atan2(tgt_planet.y - src_planet.y, tgt_planet.x - src_planet.x)
+            env_moves.append([int(src_pid), float(angle), int(ships)])
+            n_emitted += 1
     return env_moves, n_invalid, n_emitted, invalid_reasons
 
 
 def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
-                   store, learner_slot, num_players, noop_logit_bias):
+                   store, learner_slot, num_players, noop_logit_bias,
+                   select_logit_bias: float = 0.0):
     """Legality masks -> sample -> project to env moves -> StepRecord. This is the
     post-forward logic shared by the single-env closure (see agent_fn) and the
     batched rollout (batched_rollout.py) so both produce IDENTICAL records.
     ``store`` is the per-field tensors for the StepRecord (single-frame or the
-    T-window stack). Returns ``(env_moves, StepRecord)``."""
+    T-window stack). ``select_logit_bias`` shifts the selection Bernoulli logit
+    down (fewer fires) and MUST match the learner's update-time bias. Returns
+    ``(env_moves, StepRecord)``."""
     get = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
     raw_planets = get("planets") or []
     raw_fleets = get("fleets") or []
@@ -412,6 +420,7 @@ def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
     P = int(pair_logits.shape[0])
     planet_owner_rel = torch.full((P,), 99, dtype=torch.long)
     planet_surplus = torch.zeros(P, dtype=torch.float32)
+    source_ships = torch.zeros(P, dtype=torch.long)
     planet_exists = torch.zeros(P, dtype=torch.bool)
     slot_to_pid = [-1] * P
     planets: list = []
@@ -429,18 +438,20 @@ def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
                 slot_to_pid[idx] = pid
                 planet_owner_rel[idx] = 0 if int(planet.owner) == learner_slot else 1
                 planet_surplus[idx] = float(compute_surplus(planet, enemy_fleets, defense_buffer))
+                source_ships[idx] = int(planet.ships)
 
     pair_mask, source_mask = legality_masks(
         planet_owner=planet_owner_rel, surplus=planet_surplus,
         planet_exists=planet_exists, min_launch=int(min_launch),
     )
-    action = sample_single_target(
-        pair_logits, frac_loc, sigma_val, pair_mask=pair_mask,
-        source_mask=source_mask, noop_logit_bias=noop_logit_bias,
+    action = sample_multi_target(
+        pair_logits, frac_loc, source_ships,
+        pair_mask=pair_mask, source_mask=source_mask,
+        select_logit_bias=select_logit_bias,
     )
 
-    env_moves, n_invalid, n_emitted, invalid_reasons = _project_single_target(
-        action, source_mask=source_mask, planet_surplus=planet_surplus,
+    env_moves, n_invalid, n_emitted, invalid_reasons = _project_multi_target(
+        action, source_mask=source_mask,
         slot_to_pid=slot_to_pid, planets=planets, min_launch=int(min_launch),
     )
 
@@ -469,7 +480,7 @@ def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
         pair_type_ids=_current_pair_type_ids(store["pair_type_ids"]),
         pair_mask=pair_mask, source_mask=source_mask, action=action, value=value,
         invalid_launch=n_invalid, emitted_launch=n_emitted,
-        n_selected_targets=int(action.n_launch),
+        n_selected_targets=int(action.diagnostics.get("n_fired_total", 0)),
         invalid_reasons=list(invalid_reasons),
         score_my=score_my, score_enemy_max=score_enemy_max,
     )
@@ -490,12 +501,15 @@ def make_opponent_closure(
     noop_logit_bias: float,
     num_players: int = 2,
     history_window: int = 1,
+    select_logit_bias: float = 0.0,
 ):
     """Build an env-compatible opponent fn that samples from a FROZEN
     PPOActorCritic using the same single_target_per_source_v1 contract as the
     learner. Opponent moves are not tracked for PPO, but it keeps its own
     ``history_window`` ring so a T=10 self-play opponent plays at the same
-    window as the learner (no T-asymmetry in self-play).
+    window as the learner (no T-asymmetry in self-play). ``select_logit_bias``
+    matches the learner's selection bias so the self-play opponent fires at the
+    same confidence threshold.
 
     Use this for self-play: load a frozen snapshot of the learner (or any
     other PPOActorCritic), wrap it here, pass the returned callable as the
@@ -541,6 +555,7 @@ def make_opponent_closure(
 
         planet_owner_rel = torch.full((P,), 99, dtype=torch.long)
         planet_surplus = torch.zeros(P, dtype=torch.float32)
+        source_ships = torch.zeros(P, dtype=torch.long)
         planet_exists = torch.zeros(P, dtype=torch.bool)
         slot_to_pid = [-1] * P
         planets: list = []
@@ -558,6 +573,7 @@ def make_opponent_closure(
                     planet_owner_rel[idx] = 0 if int(planet.owner) == opponent_slot else 1
                     surplus = compute_surplus(planet, enemy_fleets, defense_buffer)
                     planet_surplus[idx] = float(surplus)
+                    source_ships[idx] = int(planet.ships)
 
         pair_mask, source_mask = legality_masks(
             planet_owner=planet_owner_rel,
@@ -565,14 +581,14 @@ def make_opponent_closure(
             planet_exists=planet_exists,
             min_launch=int(min_launch),
         )
-        action = sample_single_target(
-            pair_logits, frac_loc, sigma_val,
+        action = sample_multi_target(
+            pair_logits, frac_loc, source_ships,
             pair_mask=pair_mask, source_mask=source_mask,
-            noop_logit_bias=noop_logit_bias,
+            select_logit_bias=select_logit_bias,
         )
 
-        env_moves, _ni, _ne, _ir = _project_single_target(
-            action, source_mask=source_mask, planet_surplus=planet_surplus,
+        env_moves, _ni, _ne, _ir = _project_multi_target(
+            action, source_mask=source_mask,
             slot_to_pid=slot_to_pid, planets=planets, min_launch=int(min_launch),
         )
         return env_moves
@@ -596,12 +612,17 @@ def _make_learner_closure(
     history_window: int = 1,
     num_players: int = 2,
     on_step=None,
+    select_logit_bias: float = 0.0,
 ):
     """Build an env.run-compatible agent fn that samples policy actions and
     accumulates per-step records into ``buffer``. With ``history_window > 1`` the
     closure feeds the model the HISTORY_OFFSETS T-window and each StepRecord
     carries the stacked ``(T, ...)`` inputs the learner replays. ``num_players``
     is 2 or 4 — the orbit_wars env + featurizer support both.
+
+    ``select_logit_bias`` shifts the selection Bernoulli logit down (fires fewer
+    targets); it MUST equal the learner's update-time bias so the stored action's
+    logprob is recomputed consistently (the PPO ratio is otherwise desynced).
 
     ``on_step`` (optional): called once per LEARNER turn AFTER the step's scores are
     computed, as ``on_step(step, num_players, score_my, score_enemy_max)``. No-op
@@ -652,6 +673,7 @@ def _make_learner_closure(
 
         planet_owner_rel = torch.full((P,), 99, dtype=torch.long)
         planet_surplus = torch.zeros(P, dtype=torch.float32)
+        source_ships = torch.zeros(P, dtype=torch.long)
         planet_exists = torch.zeros(P, dtype=torch.bool)
         slot_to_pid = [-1] * P
         planets: list = []
@@ -672,6 +694,7 @@ def _make_learner_closure(
                     planet_owner_rel[idx] = owner_rel
                     surplus = compute_surplus(planet, enemy_fleets, defense_buffer)
                     planet_surplus[idx] = float(surplus)
+                    source_ships[idx] = int(planet.ships)
 
         pair_mask, source_mask = legality_masks(
             planet_owner=planet_owner_rel,
@@ -680,17 +703,17 @@ def _make_learner_closure(
             min_launch=int(min_launch),
         )
 
-        # 5. Sample action.
-        action = sample_single_target(
-            pair_logits, frac_loc, sigma_val,
+        # 5. Sample action (bernoulli_select_multinomial_alloc_v1).
+        action = sample_multi_target(
+            pair_logits, frac_loc, source_ships,
             pair_mask=pair_mask,
             source_mask=source_mask,
-            noop_logit_bias=noop_logit_bias,
+            select_logit_bias=select_logit_bias,
         )
 
-        # 6. Project to env moves (per-source budget; matches runner single_target).
-        env_moves, n_invalid, n_emitted, invalid_reasons = _project_single_target(
-            action, source_mask=source_mask, planet_surplus=planet_surplus,
+        # 6. Project to env moves (counts ARE launch sizes; held ships stay home).
+        env_moves, n_invalid, n_emitted, invalid_reasons = _project_multi_target(
+            action, source_mask=source_mask,
             slot_to_pid=slot_to_pid, planets=planets, min_launch=int(min_launch),
         )
 
@@ -727,7 +750,7 @@ def _make_learner_closure(
             value=value,
             invalid_launch=n_invalid,
             emitted_launch=n_emitted,
-            n_selected_targets=int(action.n_launch),
+            n_selected_targets=int(action.diagnostics.get("n_fired_total", 0)),
             invalid_reasons=list(invalid_reasons),
             score_my=score_my,
             score_enemy_max=score_enemy_max,
@@ -767,6 +790,7 @@ def run_episode(
     num_players: int = 2,
     opponent_policy=None,
     on_step=None,
+    select_logit_bias: float = 0.0,
 ) -> EpisodeBuffer:
     """Roll out one learner episode (2P or 4P — orbit_wars supports both).
 
@@ -780,6 +804,12 @@ def run_episode(
     LEARNER turn as ``on_step(step, num_players, score_my, score_enemy_max)`` with
     cheap stats. No-op when None — zero overhead and unchanged behaviour for every
     existing caller. Used by the pool rollout to stream per-core live progress.
+
+    ``select_logit_bias`` (multi-target contract): shifts the selection Bernoulli
+    logit down so the policy fires fewer (more confident) targets. Forwarded to
+    BOTH the learner and the self-play opponent closures, and MUST equal the
+    learner's update-time bias (``PPOConfig.select_logit_bias``). Default 0.0
+    leaves behaviour identical to before.
     """
     from kaggle_environments import make
     import agents as _agents
@@ -792,7 +822,7 @@ def run_episode(
         max_planets=max_planets, max_fleets=max_fleets,
         sigma=sigma, noop_logit_bias=noop_logit_bias,
         history_window=history_window, num_players=num_players,
-        on_step=on_step,
+        on_step=on_step, select_logit_bias=select_logit_bias,
     )
     n_opp = sum(x is not None for x in (opponent_fn, opponent_id, opponent_policy))
     if n_opp != 1:
@@ -814,6 +844,7 @@ def run_episode(
                 fleet_enc=fleet_enc, comet_enc=comet_enc, opponent_slot=seat,
                 device=device, max_planets=max_planets, max_fleets=max_fleets,
                 sigma=sigma, noop_logit_bias=noop_logit_bias, num_players=num_players,
+                select_logit_bias=select_logit_bias,
             )
         elif opponent_id is not None:
             fns[seat] = _agents.Agent(id=opponent_id).fn
@@ -945,8 +976,10 @@ def _pack_episode_for_ppo(ep: EpisodeBuffer) -> dict | None:
         "feats": feats,
         "pair_mask": _stack("pair_mask"),
         "source_mask": _stack("source_mask"),
-        "tgt_idx": torch.stack([s.action.tgt_idx for s in steps]).cpu().long(),
-        "frac_raw": torch.stack([s.action.frac_raw for s in steps]).cpu(),
+        # bernoulli_select_multinomial_alloc_v1 action fields.
+        "select_mask": torch.stack([s.action.select_mask for s in steps]).cpu().bool(),
+        "alloc_counts": torch.stack([s.action.alloc_counts for s in steps]).cpu().long(),
+        "self_counts": torch.stack([s.action.self_counts for s in steps]).cpu().long(),
         "old_logp": torch.tensor(
             [float(s.action.logprob.item()) for s in steps],
             dtype=torch.float32,
@@ -998,8 +1031,9 @@ def _packed_episodes_to_ppo(
     }
     pair_mask = _cat_tensors([p["pair_mask"] for p in packed], device=device)
     source_mask = _cat_tensors([p["source_mask"] for p in packed], device=device)
-    tgt_idx = _cat_tensors([p["tgt_idx"] for p in packed], device=device)
-    frac_raw = _cat_tensors([p["frac_raw"] for p in packed], device=device)
+    select_mask = _cat_tensors([p["select_mask"] for p in packed], device=device)
+    alloc_counts = _cat_tensors([p["alloc_counts"] for p in packed], device=device)
+    self_counts = _cat_tensors([p["self_counts"] for p in packed], device=device)
     old_logp = _cat_tensors([p["old_logp"] for p in packed], device=device)
 
     minibatches: list[PPOMinibatch] = []
@@ -1016,8 +1050,9 @@ def _packed_episodes_to_ppo(
             feats=feats_slice,
             pair_mask=pair_mask[idx],
             source_mask=source_mask[idx],
-            tgt_idx=tgt_idx[idx],
-            frac_raw=frac_raw[idx],
+            select_mask=select_mask[idx],
+            alloc_counts=alloc_counts[idx],
+            self_counts=self_counts[idx],
             old_logp=old_logp[idx],
             adv=adv[idx],
             returns=ret[idx],
@@ -1186,7 +1221,7 @@ def main():
             return 1
         episodes.append(ep)
         n_steps = len(ep.steps)
-        n_noop = sum(1 for s in ep.steps if s.action.n_launch == 0)
+        n_noop = sum(1 for s in ep.steps if s.n_selected_targets == 0)
         n_emit = sum(s.emitted_launch for s in ep.steps)
         n_inval = sum(s.invalid_launch for s in ep.steps)
         won = (ep.winner == learner_seat)

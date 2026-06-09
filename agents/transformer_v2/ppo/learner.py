@@ -32,6 +32,7 @@ class PPOConfig:
     bc_target_weight: float = 1.0
     max_grad_norm: float = 0.5
     early_stop_kl_factor: float = 1.5     # break the epoch if running avg KL > this * target_kl
+    select_logit_bias: float = 0.0        # multi-target selection-Bernoulli logit shift; MUST match the rollout sampler's value (else the PPO ratio desyncs)
 
 
 def build_optimizer(policy: nn.Module, cfg: PPOConfig) -> torch.optim.Optimizer:
@@ -102,15 +103,21 @@ def _move_tree(x, device: torch.device):
 
 
 def _move_ppo_minibatch(mb: PPOMinibatch, device: torch.device) -> PPOMinibatch:
+    def _mv(t):
+        return None if t is None else t.to(device, non_blocking=True)
+
     return PPOMinibatch(
         feats=_move_tree(mb.feats, device),
         pair_mask=mb.pair_mask.to(device, non_blocking=True),
         source_mask=mb.source_mask.to(device, non_blocking=True),
-        tgt_idx=mb.tgt_idx.to(device, non_blocking=True),
-        frac_raw=mb.frac_raw.to(device, non_blocking=True),
         old_logp=mb.old_logp.to(device, non_blocking=True),
         adv=mb.adv.to(device, non_blocking=True),
         returns=mb.returns.to(device, non_blocking=True),
+        tgt_idx=_mv(mb.tgt_idx),
+        frac_raw=_mv(mb.frac_raw),
+        select_mask=_mv(mb.select_mask),
+        alloc_counts=_mv(mb.alloc_counts),
+        self_counts=_mv(mb.self_counts),
         noop_logit_bias=mb.noop_logit_bias,
     )
 
@@ -179,6 +186,10 @@ def ppo_update_local(
                 ent_coef=cfg.ent_coef,
                 bc_coef=cfg.bc_coef,
                 bc_target_weight=cfg.bc_target_weight,
+                select_logit_bias=cfg.select_logit_bias,
+                # entropy-shape diagnostic on the first minibatch of each epoch
+                # only (a subsample — cheap but not free)
+                collect_shape=(n_mb == 0),
             )
             opt.zero_grad(set_to_none=True)
             loss.backward()

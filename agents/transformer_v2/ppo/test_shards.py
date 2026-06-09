@@ -14,21 +14,26 @@ import torch
 import torch.nn as nn
 
 from agents.transformer_v2.ppo import shards
-from agents.transformer_v2.ppo.sampler import Action
+from agents.transformer_v2.ppo.sampler import MultiTargetAction
 from agents.transformer_v2.ppo.smoke import EpisodeBuffer, StepRecord, episodes_to_ppo
 
 
-def _make_action(P: int) -> Action:
-    tgt_idx = torch.randint(0, P, (P,))
-    n_launch = int((tgt_idx != torch.arange(P)).sum().item())
-    return Action(
-        tgt_idx=tgt_idx,
-        frac_raw=torch.rand(P),
+def _make_action(P: int) -> MultiTargetAction:
+    select_mask = (torch.rand(P, P) > 0.6)
+    eye = torch.eye(P, dtype=torch.bool)
+    select_mask = select_mask & ~eye                      # fired targets are off-diagonal
+    alloc_counts = (torch.randint(0, 5, (P, P)) * select_mask.long())
+    self_counts = torch.randint(0, 5, (P,))
+    n_fired = int(select_mask.sum().item())
+    return MultiTargetAction(
+        select_mask=select_mask,
+        alloc_counts=alloc_counts,
+        self_counts=self_counts,
         logprob=torch.randn(()),
-        logprob_pair=torch.randn(()),
-        logprob_frac=torch.randn(()),
-        n_launch=n_launch,
-        diagnostics={"n_launch": float(n_launch), "n_hold": 2.0},
+        logprob_select=torch.randn(()),
+        logprob_alloc=torch.randn(()),
+        n_terms=n_fired + 2,
+        diagnostics={"n_fired_total": float(n_fired), "n_launch_sources": 2.0},
     )
 
 
@@ -76,9 +81,10 @@ def _assert_step_equal(a: StepRecord, b: StepRecord) -> None:
     for f in shards.STEP_SCALAR_FIELDS:
         assert getattr(a, f) == getattr(b, f), f"scalar field {f} differs"
     assert a.invalid_reasons == b.invalid_reasons
-    assert int(a.action.n_launch) == int(b.action.n_launch)
-    assert torch.equal(a.action.tgt_idx, b.action.tgt_idx)
-    assert torch.equal(a.action.frac_raw, b.action.frac_raw)
+    assert int(a.action.n_terms) == int(b.action.n_terms)
+    assert torch.equal(a.action.select_mask, b.action.select_mask)
+    assert torch.equal(a.action.alloc_counts, b.action.alloc_counts)
+    assert torch.equal(a.action.self_counts, b.action.self_counts)
     for f in shards.ACTION_LOGPROB_FIELDS:
         assert float(getattr(a.action, f)) == float(getattr(b.action, f)), f
     assert a.action.diagnostics == b.action.diagnostics

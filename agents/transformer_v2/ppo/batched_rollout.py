@@ -91,7 +91,8 @@ class _Seat:
 
 
 def _batched_act(seats, envs, active, policy, planet_enc, fleet_enc, comet_enc,
-                 *, max_planets, max_fleets, noop_logit_bias, device):
+                 *, max_planets, max_fleets, noop_logit_bias, device,
+                 select_logit_bias=0.0):
     """Featurize every ACTIVE seat, run ONE batched forward, then per-seat
     sample/project/record. Writes ``seat.moves`` for each acting seat."""
     items = []   # (seat, obs, pid_to_idx, store)
@@ -130,6 +131,7 @@ def _batched_act(seats, envs, active, policy, planet_enc, fleet_enc, comet_enc,
             value=float(vals[j].item()), sigma_val=sigma_val, store=store,
             learner_slot=seat.seat, num_players=seat.num_players,
             noop_logit_bias=noop_logit_bias,
+            select_logit_bias=select_logit_bias,
         )
         seat.moves = moves
         if seat.records and seat.buffer is not None:
@@ -169,6 +171,7 @@ def run_batched_episodes(
     max_fleets: int,
     sigma: float,
     noop_logit_bias: float = 0.0,
+    select_logit_bias: float = 0.0,
     target_cap_k_max: int = 4,
     target_cap_lambda: float = 0.0,
     history_window: int = 1,
@@ -203,7 +206,8 @@ def run_batched_episodes(
     active = [not envs[i].done for i in range(B)]
     env_steps = [0] * B          # learner-turns taken per env (frozen when done)
     kw = dict(max_planets=max_planets, max_fleets=max_fleets,
-              noop_logit_bias=noop_logit_bias, device=device)
+              noop_logit_bias=noop_logit_bias, device=device,
+              select_logit_bias=select_logit_bias)
     for t in range(max_steps):
         if not any(active):
             break

@@ -132,7 +132,10 @@ def _worker_play_one(
                 else histories[seat].stack(step_idx)
             )
             req_id = (idx, step_idx, seat)
-            req_q.put((wid, req_id, seat, _store_to_ipc(store)))
+            # 5th field: is_learner — routes to the learner policy (B) vs the
+            # fixed opponent policy (A) in the two-policy forwarder; ignored in
+            # self-play (single policy serves all seats).
+            req_q.put((wid, req_id, seat, _store_to_ipc(store), seat == learner_seat))
             obss[seat] = obs
             pid_maps[seat] = pid_to_idx
             stores[seat] = store
@@ -161,6 +164,7 @@ def _worker_play_one(
                 learner_slot=seat,
                 num_players=num_players,
                 noop_logit_bias=float(cfg.get("noop_logit_bias", 0.0)),
+                select_logit_bias=float(cfg.get("select_logit_bias", 0.0)),
             )
             moves[seat] = env_moves
             if seat == learner_seat:
@@ -302,6 +306,7 @@ def _drain_results(
 def run_infserver_rollout(
     *,
     policy,
+    opponent_policy=None,
     planet_enc,
     fleet_enc,
     comet_enc,
@@ -312,6 +317,7 @@ def run_infserver_rollout(
     max_fleets: int,
     sigma: float,
     noop_logit_bias: float = 0.0,
+    select_logit_bias: float = 0.0,
     history_window: int = 10,
     max_batch: int = 256,
     batch_window_s: float = 0.003,
@@ -351,6 +357,7 @@ def run_infserver_rollout(
         "max_fleets": int(max_fleets),
         "history_window": int(history_window),
         "noop_logit_bias": float(noop_logit_bias),
+        "select_logit_bias": float(select_logit_bias),
         "progress_every": int(progress_every),
         "target_cap_k_max": int(target_cap_k_max),
         "target_cap_lambda": float(target_cap_lambda),
@@ -358,9 +365,23 @@ def run_infserver_rollout(
     }
 
     policy.eval()
+    if opponent_policy is not None:
+        opponent_policy.eval()
     planet_enc.eval()
     fleet_enc.eval()
     comet_enc.eval()
+
+    def _fwd_items(pol, items):
+        """One batched forward of `pol` over a list of batch request tuples;
+        returns CPU (pair_logits, frac_loc, values, sigma_scalar)."""
+        stores = [_store_from_ipc(it[3]) for it in items]
+        with torch.inference_mode():
+            out = _batched_forward(pol, planet_enc, fleet_enc, comet_enc, stores, device)
+            pl = torch.nan_to_num(out["pair_logits"], nan=-1e9, posinf=1e9, neginf=-1e9).detach().cpu()
+            fl = torch.nan_to_num(out["frac_loc"], nan=0.0, posinf=0.0, neginf=0.0).detach().cpu()
+            vv = torch.nan_to_num(out["value"], nan=0.0, posinf=0.0, neginf=0.0).detach().cpu()
+            sv = float(out["sigma"].detach().cpu().item())
+        return pl, fl, vv, sv
 
     workers = []
     for wid in range(n_workers):
@@ -468,39 +489,29 @@ def run_infserver_rollout(
                 batch.append(item)
 
         if batch:
-            stores = [_store_from_ipc(it[3]) for it in batch]
             tf = time.perf_counter()
-            with torch.inference_mode():
-                out = _batched_forward(
-                    policy,
-                    planet_enc,
-                    fleet_enc,
-                    comet_enc,
-                    stores,
-                    device,
-                )
-                pair_logits = torch.nan_to_num(
-                    out["pair_logits"], nan=-1e9, posinf=1e9, neginf=-1e9,
-                ).detach().cpu()
-                frac_loc = torch.nan_to_num(
-                    out["frac_loc"], nan=0.0, posinf=0.0, neginf=0.0,
-                ).detach().cpu()
-                values = torch.nan_to_num(
-                    out["value"], nan=0.0, posinf=0.0, neginf=0.0,
-                ).detach().cpu()
-                sigma_val = float(out["sigma"].detach().cpu().item())
+            # res[batch_index] = (pair_logits_k, frac_loc_k, value_k_float, sigma)
+            res: dict[int, tuple] = {}
+            if opponent_policy is None:
+                pl, fl, vv, sv = _fwd_items(policy, batch)            # self-play: one forward
+                for k in range(len(batch)):
+                    res[k] = (pl[k], fl[k], float(vv[k].item()), sv)
+            else:
+                # two-policy: route learner seats → B (policy), others → A.
+                learner_idx = [k for k, it in enumerate(batch) if it[4]]
+                opp_idx = [k for k, it in enumerate(batch) if not it[4]]
+                for pol, idxs in ((policy, learner_idx), (opponent_policy, opp_idx)):
+                    if not idxs:
+                        continue
+                    pl, fl, vv, sv = _fwd_items(pol, [batch[k] for k in idxs])
+                    for j, k in enumerate(idxs):
+                        res[k] = (pl[j], fl[j], float(vv[j].item()), sv)
             fwd_ms.append((time.perf_counter() - tf) * 1e3)
             batch_sizes.append(len(batch))
             mark_progress()
-            for k, (wid, req_id, seat, _store) in enumerate(batch):
-                res_qs[int(wid)].put((
-                    req_id,
-                    int(seat),
-                    pair_logits[k],
-                    frac_loc[k],
-                    float(values[k].item()),
-                    sigma_val,
-                ))
+            for k, it in enumerate(batch):
+                pl_k, fl_k, v_k, sv_k = res[k]
+                res_qs[int(it[0])].put((it[1], int(it[2]), pl_k, fl_k, v_k, sv_k))
 
         if (
             stall_timeout_s

@@ -9,10 +9,15 @@ Phase 0 minimal-actor implementation matching the design captured in
     0 to valid opponent slots, using post-L2 ``PlayerConsolidator`` state plus
     L2 ``glob``. If the actor ckpt has no consolidator, the old L2 ``glob``
     value_head is an explicit debug fallback.
-  * action contract = ``single_target_per_source_v1`` (each owned source row is
-    one Categorical over its legal targets + the diagonal HOLD slot; launching
-    rows add a logit-normal frac with fixed sigma)
-  * BC anchor = single-target CE to match the action contract
+  * action contract = ``bernoulli_select_multinomial_alloc_v1`` (per owned
+    source row: a per-cell Bernoulli selection over legal targets, then ONE
+    Multinomial over the fired targets + a ``self`` HOLD category that routes
+    the source's ships; reuses ``frac_loc`` + the diagonal ``pair_logits[s,s]``
+    so NO new params — a single-target ckpt loads via ``strict=False`` at 0/0).
+    The ``single_target_per_source_v1`` sampler/loss helpers are retained for
+    reference + the (currently-off) BC anchor.
+  * BC anchor = single-target CE (matches the supervised pretrain labeling;
+    OFF by default — ``bc_coef=0``)
   * L0-L3 frozen for the entire PPO run
 
 This package only implements the **single-machine Phase 0** path. The
@@ -38,23 +43,37 @@ from __future__ import annotations
 from .actor_critic import PPOActorCritic
 from .gae import compute_advantages
 from .learner import ppo_update_local
-from .loss import action_logprob, ppo_minibatch_loss, single_target_bc
+from .loss import (
+    action_logprob,
+    action_logprob_multi,
+    multi_target_entropy,
+    ppo_minibatch_loss,
+    single_target_bc,
+)
 from .sampler import (
     Action,
+    MultiTargetAction,
     legality_masks,
+    project_multi_target_to_env,
     project_to_env,
+    sample_multi_target,
     sample_single_target,
 )
 
 __all__ = [
     "Action",
+    "MultiTargetAction",
     "PPOActorCritic",
     "action_logprob",
+    "action_logprob_multi",
     "compute_advantages",
     "legality_masks",
+    "multi_target_entropy",
     "ppo_minibatch_loss",
     "ppo_update_local",
+    "project_multi_target_to_env",
     "project_to_env",
+    "sample_multi_target",
     "sample_single_target",
     "single_target_bc",
 ]

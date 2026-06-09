@@ -29,7 +29,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import torch
-from torch.distributions import Categorical, Normal
+import torch.nn.functional as F
+from torch.distributions import Categorical, Multinomial, Normal
 
 
 # --------------------------------------------------------------------------- #
@@ -238,6 +239,242 @@ def project_to_env(
             continue
         env_actions.append([int(src_pid), float(launch.angle), int(ships)])
         n_emitted += 1
+
+    return ProjectionResult(
+        env_actions=env_actions,
+        ok=(n_invalid == 0),
+        n_emitted=n_emitted,
+        n_invalid=n_invalid,
+        invalid_reasons=invalid_reasons,
+    )
+
+
+# =========================================================================== #
+# bernoulli_select_multinomial_alloc_v1                                       #
+# =========================================================================== #
+# Per OWNED source row ``s`` (``source_mask[s]``), with ``pair_mask[s]`` = legal
+# off-diagonal targets:
+#
+#   Stage 1 — Selection (independent per-cell Bernoulli): for each legal
+#     off-diagonal target ``t``, ``fire[s,t] ~ Bernoulli(sigmoid(pair_logits
+#     [s,t]))``. The fired set ``F_s = {t : fired}``. The selection logprob is
+#     the sum over ALL legal cells (fired AND not-fired) of the Bernoulli
+#     log-likelihood, i.e. ``-BCE_with_logits(pair_logits[s, legal], fired_bits,
+#     reduction='sum')``.
+#
+#   Stage 2 — Allocation (one Multinomial over [F_s ∪ self], N = source ships):
+#     a categorical over the fired targets PLUS a ``self`` (keep/hold) category.
+#     Category logits, in a FIXED order (fired targets in ascending column index,
+#     then ``self`` last):
+#         target t ∈ F_s : ``frac_loc[s, t]``    (REUSE the existing pair_frac raw
+#                                                  logit — no new head)
+#         self           : ``pair_logits[s, s]``  (the diagonal HOLD logit)
+#     ``probs = softmax([frac_loc[s, F_s], pair_logits[s, s]])`` and ``counts ~
+#     Multinomial(S, probs)`` with ``S = source_ships[s]``. ``ships[s,t] =
+#     counts[t]`` for ``t ∈ F_s``; ``held[s] = counts[self]``. So each of the S
+#     ships is routed individually and the counts ARE the launch sizes. The
+#     allocation logprob is ``Σ_{F_s ∪ self} counts · log(probs)`` (the
+#     multinomial coefficient is dropped — it depends only on the stored counts
+#     and cancels in the PPO ratio; the recompute uses the SAME Σ c·log p form).
+#
+# Reusing ``frac_loc`` and ``pair_logits[s, s]`` means NO new parameters, so a
+# single-target-pretrained checkpoint loads via ``load_state_dict(strict=False)``
+# with 0 missing / 0 unexpected keys (the architecture is unchanged).
+@dataclass
+class MultiTargetAction:
+    """One snapshot's ``bernoulli_select_multinomial_alloc_v1`` action.
+
+    ``select_mask (P, P) bool``: per owned source row, the fired off-diagonal
+        targets ``F_s`` (a subset of ``pair_mask[s]``). Rows for non-owned /
+        non-acting sources are all-False.
+    ``alloc_counts (P, P) long``: ships routed to each fired target,
+        ``alloc_counts[s, t] = counts[t]`` for ``t ∈ F_s``; 0 elsewhere.
+    ``self_counts (P,) long``: ships kept/held on each owned source
+        (the ``self`` multinomial category); 0 on non-acting rows.
+    ``logprob`` scalar: ``logprob_select + logprob_alloc``.
+    ``logprob_select`` scalar: sum over owned rows of the all-legal-cell
+        Bernoulli log-likelihood.
+    ``logprob_alloc`` scalar: sum over owned rows of ``Σ counts · log(probs)``
+        over ``F_s ∪ self``.
+    ``n_terms`` int: number of summed logprob components — one per legal
+        Bernoulli cell across all owned rows, plus one per acting source (its
+        allocation multinomial). Used to normalize the PPO KL to a
+        per-component scale, exactly as the single-target path does.
+    """
+
+    select_mask: torch.Tensor       # (P, P) bool — fired targets per owned source
+    alloc_counts: torch.Tensor      # (P, P) long — ships per fired target
+    self_counts: torch.Tensor       # (P,) long — ships held on each owned source
+    logprob: torch.Tensor           # scalar — select + alloc
+    logprob_select: torch.Tensor    # scalar — sum of per-cell Bernoulli logliks
+    logprob_alloc: torch.Tensor     # scalar — sum of per-source Σ c·log p
+    n_terms: int                    # Bernoulli cells + one per acting source
+    diagnostics: dict[str, float] = field(default_factory=dict)
+
+
+def sample_multi_target(
+    pair_logits: torch.Tensor,        # (P, P) — actor logits for one snapshot
+    frac_loc: torch.Tensor,            # (P, P) — actor pair_frac raw logit (alloc logits)
+    source_ships: torch.Tensor,        # (P,) long — current ship count per source slot
+    *,
+    pair_mask: torch.Tensor,           # (P, P) bool — legal off-diagonal targets
+    source_mask: torch.Tensor,         # (P,) bool — owned/legal source rows
+    temperature: float = 1.0,
+    select_logit_bias: float = 0.0,
+) -> MultiTargetAction:
+    """Draw one ``bernoulli_select_multinomial_alloc_v1`` action.
+
+    A per-owned-source Python loop (mirrors :func:`sample_single_target`). The
+    stored logprobs are recomputed EXACTLY by
+    :func:`agents.transformer_v2.ppo.loss.action_logprob_multi`, so the PPO
+    ratio is 1 for an unchanged policy. ``temperature`` divides BOTH the
+    selection logits and the allocation logits (a global softmax/sigmoid
+    temperature); pass 1.0 for the contract default.
+
+    ``select_logit_bias`` shifts ONLY the per-cell selection Bernoulli logit:
+    ``fire[s,t] ~ Bernoulli(sigmoid(pair_logits[s,t]/tau - select_logit_bias))``.
+    A positive bias fires fewer (more confident) targets — directly reducing
+    over-firing. b=2.0 mirrors the runner's ``pair_logits > 2.0`` threshold. The
+    ALLOCATION multinomial is UNCHANGED; the bias touches the selection only.
+    The same value MUST be passed to
+    :func:`agents.transformer_v2.ppo.loss.action_logprob_multi` and
+    :func:`agents.transformer_v2.ppo.loss.multi_target_entropy` at update time
+    or the recomputed logprob desyncs the PPO ratio.
+    """
+    if pair_logits.dim() != 2:
+        raise ValueError("sample is per-snapshot; expected pair_logits (P, P)")
+    p = pair_logits.shape[0]
+    device = pair_logits.device
+    tau = float(temperature)
+    sel_bias = float(select_logit_bias)
+
+    select_mask = torch.zeros((p, p), dtype=torch.bool, device=device)
+    alloc_counts = torch.zeros((p, p), dtype=torch.long, device=device)
+    self_counts = torch.zeros(p, dtype=torch.long, device=device)
+    logp_select = torch.zeros((), device=device)
+    logp_alloc = torch.zeros((), device=device)
+    n_terms = 0
+    n_launch_sources = 0
+    n_fired_total = 0
+    n_ships_launched = 0
+
+    src_rows = source_mask.nonzero(as_tuple=False).flatten().tolist()
+    for s in src_rows:
+        legal_cols = pair_mask[s].nonzero(as_tuple=False).flatten()
+        n_legal = int(legal_cols.numel())
+        if n_legal == 0:
+            continue  # owned but no legal target (should not happen given source_mask)
+
+        # --- Stage 1: independent per-cell Bernoulli over legal targets ---
+        # select_logit_bias shifts the fire probability DOWN (positive bias ->
+        # fewer fires); the recompute applies the SAME shift before sigmoid.
+        sel_logits = pair_logits[s, legal_cols] / tau - sel_bias     # (n_legal,)
+        probs1 = torch.sigmoid(sel_logits)
+        fired_bits = torch.bernoulli(probs1)                          # (n_legal,) in {0,1}
+        # Selection logprob = sum of Bernoulli log-likelihood over ALL legal
+        # cells (fired AND not-fired). -BCE_with_logits(reduction='sum') is
+        # exactly Σ [b·log σ(x) + (1-b)·log(1-σ(x))].
+        logp_select = logp_select - F.binary_cross_entropy_with_logits(
+            sel_logits, fired_bits, reduction="sum",
+        )
+        n_terms += n_legal
+
+        fired_local = fired_bits.bool()                               # (n_legal,)
+        fired_cols = legal_cols[fired_local]                          # (n_fired,) ascending
+        select_mask[s, fired_cols] = True
+        n_fired = int(fired_cols.numel())
+        n_fired_total += n_fired
+
+        # --- Stage 2: one Multinomial over [F_s ∪ self], N = source ships ---
+        # Category order (FIXED, must match the recompute): fired targets in
+        # ascending column index, then ``self`` last.
+        ship_n = int(source_ships[s].item())
+        alloc_logits = torch.cat([
+            frac_loc[s, fired_cols],                                  # (n_fired,)
+            pair_logits[s, s].reshape(1),                             # self (diagonal)
+        ]) / tau                                                      # (n_fired + 1,)
+        log_probs2 = torch.log_softmax(alloc_logits, dim=-1)          # (n_fired + 1,)
+        if ship_n > 0:
+            counts = Multinomial(
+                total_count=ship_n, logits=alloc_logits,
+            ).sample()                                                # (n_fired + 1,) float
+        else:
+            counts = torch.zeros_like(alloc_logits)
+        # Allocation logprob = Σ counts · log(probs) over F_s ∪ self (drop the
+        # multinomial coefficient; it cancels in the PPO ratio).
+        logp_alloc = logp_alloc + (counts * log_probs2).sum()
+        n_terms += 1  # one allocation multinomial per acting source
+
+        counts_long = counts.round().long()
+        if n_fired > 0:
+            alloc_counts[s, fired_cols] = counts_long[:n_fired]
+            n_launch_sources += 1
+        self_counts[s] = counts_long[n_fired]
+        n_ships_launched += int(counts_long[:n_fired].sum().item())
+
+    diagnostics = {
+        "n_valid_sources": int(source_mask.sum().item()),
+        "n_launch_sources": int(n_launch_sources),
+        "n_fired_total": int(n_fired_total),
+        "n_ships_launched": int(n_ships_launched),
+    }
+    return MultiTargetAction(
+        select_mask=select_mask,
+        alloc_counts=alloc_counts,
+        self_counts=self_counts,
+        logprob=logp_select + logp_alloc,
+        logprob_select=logp_select,
+        logprob_alloc=logp_alloc,
+        n_terms=int(n_terms),
+        diagnostics=diagnostics,
+    )
+
+
+def project_multi_target_to_env(
+    action: MultiTargetAction,
+    *,
+    source_mask: torch.Tensor,        # (P,) bool — owned/legal source rows
+    source_planet_ids: list[int],     # (P,) slot -> planet id (-1 if padded)
+    target_planet_ids: list[int],     # (P,) slot -> planet id (-1 if padded)
+    min_launch: int,
+    plan_launch_fn,                   # (src_id, tgt_id, ships) -> obj with .ok, .angle, .reason
+) -> ProjectionResult:
+    """Project a :class:`MultiTargetAction` into env-shaped launch commands.
+
+    Each fired cell ``(s, t)`` with ``alloc_counts[s, t] > 0`` emits a launch of
+    ``ships = alloc_counts[s, t]`` (the counts ARE the launch sizes — N = S was
+    already routed in the multinomial). Cells below ``min_launch`` are dropped;
+    held ships (``self_counts``) stay home. Invalid launches are NOT resampled —
+    the stored action keeps its original logprob and the rollout earns the
+    existing invalid penalty.
+    """
+    env_actions: list[list[int]] = []
+    n_invalid = 0
+    n_emitted = 0
+    invalid_reasons: list[str] = []
+
+    src_rows = source_mask.nonzero(as_tuple=False).flatten().tolist()
+    for s in src_rows:
+        fired_cols = action.select_mask[s].nonzero(as_tuple=False).flatten().tolist()
+        for t in fired_cols:
+            ships = int(action.alloc_counts[s, t].item())
+            if ships < int(min_launch):
+                n_invalid += 1
+                invalid_reasons.append("min_launch")
+                continue
+            src_pid = source_planet_ids[s]
+            tgt_pid = target_planet_ids[t]
+            if src_pid is None or src_pid < 0 or tgt_pid is None or tgt_pid < 0:
+                n_invalid += 1
+                invalid_reasons.append("pad_slot")
+                continue
+            launch = plan_launch_fn(int(src_pid), int(tgt_pid), int(ships))
+            if not getattr(launch, "ok", False):
+                n_invalid += 1
+                invalid_reasons.append(str(getattr(launch, "reason", "unknown")))
+                continue
+            env_actions.append([int(src_pid), float(launch.angle), int(ships)])
+            n_emitted += 1
 
     return ProjectionResult(
         env_actions=env_actions,

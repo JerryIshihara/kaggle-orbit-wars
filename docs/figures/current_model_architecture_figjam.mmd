@@ -1,0 +1,39 @@
+flowchart LR
+  OBS["Observation window T=10, P <= 64, F <= 512"] --> L0["L0 frozen specialists: Planet, Comet, Fleet encoders"]
+  L0 --> L1["L1 PlanetEntityEncoder: planets attend relation-aware fleets"]
+  L1 --> L2["L2 CrossEntityAttention: Pre-LN Transformer over CLS plus T by P tokens"]
+  L2 --> CTX["ctx_now and glob: world perception complete"]
+
+  CTX --> L3["L3 DualRoleAttention: source-to-target and target-to-source"]
+  L3 --> L4["L4 JointRoleAttention: self-attention over 2P role tokens"]
+  L4 --> PH["PairHead trunk"]
+  L1 -. "tactical L1 skip" .-> FILM["FiLM conditioner: L1 source, L1 target, pair type"]
+  FILM --> PH
+  PH --> AOUT["Actor outputs: pair logits and fraction loc"]
+  AOUT --> SAMPLE["Masked sampler: launch pair, fraction, or NOOP"]
+
+  CTX --> PC["PlayerConsolidator: post-L2 player state"]
+  PC --> VH["Pretrained value heads: learner win logit"]
+  CTX --> RES["Zero-init residual value head from glob"]
+  SIG["Analytic Phi: ship, production, planet, safety, fleet speed"] --> VAL["Reward-decomp critic: win weight times sigmoid win minus Phi plus residual"]
+  VH --> VAL
+  RES --> VAL
+  VAL --> PPO["PPO update: clipped policy, value MSE, entropy, BC anchor"]
+  SAMPLE --> PPO
+  GAE["GAE with shaped rewards and terminal win reward"] --> PPO
+
+  W["CPU env workers: build T=10 features, no model forward"] --> Q["Parent request queue: batch ready seats"]
+  Q --> GPU["One CUDA model instance: batched forward"]
+  GPU --> R["Logits and value back to workers"]
+  R --> W
+  GPU -. "same actor and critic forward" .-> AOUT
+  GPU -. "same actor and critic forward" .-> VAL
+
+  classDef perception fill:#DCEBFF,stroke:#4A5568,stroke-width:2px,color:#1A202C;
+  classDef actor fill:#E4F4E8,stroke:#4A5568,stroke-width:2px,color:#1A202C;
+  classDef critic fill:#FFF0D6,stroke:#4A5568,stroke-width:2px,color:#1A202C;
+  classDef runtime fill:#F1E7FF,stroke:#4A5568,stroke-width:2px,color:#1A202C;
+  class OBS,L0,L1,L2,CTX perception;
+  class L3,L4,PH,FILM,AOUT,SAMPLE actor;
+  class PC,VH,RES,SIG,VAL,GAE critic;
+  class PPO,W,Q,GPU,R runtime;

@@ -34,9 +34,10 @@ from typing import Any
 import torch
 
 # Bumped if the on-disk shard schema changes incompatibly.
-SHARD_FORMAT_VERSION = 2
-# Matches the sampler's action contract (sampler.Action / sample_single_target).
-POLICY_ACTION_CONTRACT = "single_target_per_source_v1"
+SHARD_FORMAT_VERSION = 3
+# Matches the sampler's action contract (sampler.MultiTargetAction /
+# sample_multi_target).
+POLICY_ACTION_CONTRACT = "bernoulli_select_multinomial_alloc_v1"
 
 # Per-step StepRecord fields (smoke.StepRecord). Tensor fields are stacked along a
 # new leading step axis; for T=1 each is (P,...)/(F,...), for T=10 (T,P,...) etc.
@@ -52,11 +53,12 @@ STEP_SCALAR_FIELDS = (
     "invalid_launch", "emitted_launch", "n_selected_targets",
     "score_my", "score_enemy_max", "phi",
 )
-# Action fields (sampler.Action). single_target_per_source_v1:
-#   tgt_idx (P,) long — chosen target col per source (s == hold/NOOP),
-#   frac_raw (P,) float — clamped sigmoid per launching source.
-ACTION_TENSOR_FIELDS = ("tgt_idx", "frac_raw")
-ACTION_LOGPROB_FIELDS = ("logprob", "logprob_pair", "logprob_frac")
+# Action fields (sampler.MultiTargetAction). bernoulli_select_multinomial_alloc_v1:
+#   select_mask (P, P) bool — fired off-diagonal targets per owned source,
+#   alloc_counts (P, P) long — ships routed to each fired target,
+#   self_counts (P,) long — ships held on each owned source (self category).
+ACTION_TENSOR_FIELDS = ("select_mask", "alloc_counts", "self_counts")
+ACTION_LOGPROB_FIELDS = ("logprob", "logprob_select", "logprob_alloc")
 
 
 class ShardVersionError(RuntimeError):
@@ -114,8 +116,8 @@ def episode_buffer_to_dict(ep: Any) -> dict[str, Any]:
         d["action_" + f] = torch.stack(
             [getattr(s.action, f).detach().cpu().reshape(()) for s in steps], dim=0
         )
-    d["action_n_launch"] = torch.tensor(
-        [int(s.action.n_launch) for s in steps], dtype=torch.long
+    d["action_n_terms"] = torch.tensor(
+        [int(s.action.n_terms) for s in steps], dtype=torch.long
     )
     d["action_diagnostics"] = [dict(s.action.diagnostics or {}) for s in steps]
     return d
@@ -123,19 +125,20 @@ def episode_buffer_to_dict(ep: Any) -> dict[str, Any]:
 
 def dict_to_episode_buffer(d: dict[str, Any]) -> Any:
     """Rebuild an EpisodeBuffer (list[StepRecord]) from ``episode_buffer_to_dict``."""
-    from .sampler import Action          # lazy: avoids heavy imports at module load
+    from .sampler import MultiTargetAction   # lazy: avoids heavy imports at module load
     from .smoke import EpisodeBuffer, StepRecord
 
     n = int(d["n_steps"])
     steps: list[Any] = []
     for i in range(n):
-        action = Action(
-            tgt_idx=d["action_tgt_idx"][i].long(),
-            frac_raw=d["action_frac_raw"][i],
+        action = MultiTargetAction(
+            select_mask=d["action_select_mask"][i].bool(),
+            alloc_counts=d["action_alloc_counts"][i].long(),
+            self_counts=d["action_self_counts"][i].long(),
             logprob=d["action_logprob"][i],
-            logprob_pair=d["action_logprob_pair"][i],
-            logprob_frac=d["action_logprob_frac"][i],
-            n_launch=int(d["action_n_launch"][i].item()),
+            logprob_select=d["action_logprob_select"][i],
+            logprob_alloc=d["action_logprob_alloc"][i],
+            n_terms=int(d["action_n_terms"][i].item()),
             diagnostics=dict(d["action_diagnostics"][i]),
         )
         kw = {f: d[f][i] for f in STEP_TENSOR_FIELDS}
