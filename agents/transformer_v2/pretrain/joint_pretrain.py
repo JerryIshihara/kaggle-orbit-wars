@@ -297,6 +297,15 @@ def train_joint(
     device: str | None = None,
     seed: int = 0,
     progress_every: int = 50,
+    # --- arch injection points (transformer_v3 driver) ------------------
+    # ``model_cls``: alternative EntityPretrainModel subclass (same ctor
+    # kwargs). ``history_offsets``: override the temporal window both
+    # caches are restacked to (default: this package's HISTORY_OFFSETS).
+    # ``warm_start_adapter``: callable(sd) -> sd applied to the checkpoint
+    # state dict before load_state_dict (e.g. v2->v3 L2 key mapping).
+    model_cls: type | None = None,
+    history_offsets: tuple[int, ...] | None = None,
+    warm_start_adapter=None,
 ) -> Path:
     """Joint action+value pretrain loop with L2+ unfreeze + verbose per-head logs.
 
@@ -322,13 +331,16 @@ def train_joint(
             p.requires_grad_(False)
         enc.eval()
 
-    model = EntityPretrainModel(
+    model = (model_cls or EntityPretrainModel)(
         d_model=d_model, n_steps=n_steps,
         conditioner_n_layers=conditioner_n_layers,
         head_n_layers=head_n_layers,
         with_consolidator=True, with_value_heads=True,
         value_dropout=value_dropout,
     ).to(device)
+    if model_cls is not None:
+        print(f"[joint] model_cls={model_cls.__name__} "
+              f"arch={getattr(model, 'ARCH', 'v2')}", flush=True)
     if warm_start is not None:
         ck = torch.load(warm_start, map_location=device, weights_only=False)
         sd = ck.get("model", ck)
@@ -341,6 +353,11 @@ def train_joint(
         # out guarantees the new value heads initialize fresh.
         n_drop = sum(1 for k in sd if k.startswith("value_heads."))
         sd = {k: v for k, v in sd.items() if not k.startswith("value_heads.")}
+        if warm_start_adapter is not None:
+            n_in = len(sd)
+            sd = warm_start_adapter(sd)
+            print(f"[joint] warm_start_adapter: {n_in} -> {len(sd)} tensors",
+                  flush=True)
         res = model.load_state_dict(sd, strict=False)
         non_value_missing = [k for k in res.missing_keys
                              if not k.startswith("value_heads.")]
@@ -364,7 +381,11 @@ def train_joint(
     # and stack lazily at __getitem__, so restacking is a metadata override,
     # not a rebuild. This also matches the cross-entity (value) cache, closing
     # the documented T=6/T=10 mismatch.
-    from ..history import HISTORY_OFFSETS
+    from ..history import HISTORY_OFFSETS as _DEFAULT_OFFSETS
+    HISTORY_OFFSETS = (
+        tuple(history_offsets) if history_offsets is not None
+        else _DEFAULT_OFFSETS
+    )
     if tuple(action_full.history_offsets) != HISTORY_OFFSETS:
         print(f"[joint]   pair cache stored history_offsets="
               f"{tuple(action_full.history_offsets)} -> OVERRIDING to model "
@@ -416,7 +437,9 @@ def train_joint(
         flush=True,
     )
     print(f"[joint] value  cache: {cross_cache_path}", flush=True)
-    value_ds = CachedCrossEntitySnapshotDataset(cross_cache_path)
+    value_ds = CachedCrossEntitySnapshotDataset(
+        cross_cache_path, history_offsets=HISTORY_OFFSETS,
+    )
     # --- game-level train/val split for the value branch ---
     # The win head's label is a per-game CONSTANT, so a snapshot-level split
     # leaks (sibling snapshots of the same game land in both sides) and the head
@@ -480,6 +503,10 @@ def train_joint(
         "max_planets": int(cache_cfg.get("max_planets", 64)),
         "max_fleets": int(cache_cfg.get("max_fleets", 1024)),
     }
+    # Arch-specific self-description (e.g. transformer_v3 dual-rate L2
+    # stamps arch + union/long/short offset tuples) — lets the runner and
+    # PPO loaders reconstruct non-default architectures from the ckpt.
+    config.update(getattr(model, "config_extra", {}) or {})
     print(f"[joint] action_contract={config['action_contract']}  "
           f"max_planets={config['max_planets']} max_fleets={config['max_fleets']} "
           f"(from pair cache)", flush=True)
@@ -617,7 +644,25 @@ def main() -> None:
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--progress-every", type=int, default=50)
+    p.add_argument("--arch", choices=("v2", "v3"), default="v2",
+                   help="v3 = transformer_v3 dual-rate L2 (long T=10@5 + "
+                        "short T=10@2 branches, zero-init fusion); both "
+                        "caches are restacked to the 18-frame union and a "
+                        "v2 --warm-start is key-mapped onto both branches")
     args = p.parse_args()
+
+    arch_kwargs: dict[str, Any] = {}
+    if args.arch == "v3":
+        from ...transformer_v3 import (
+            EntityPretrainModelV3,
+            UNION_HISTORY_OFFSETS,
+            adapt_v2_state_dict,
+        )
+        arch_kwargs = dict(
+            model_cls=EntityPretrainModelV3,
+            history_offsets=UNION_HISTORY_OFFSETS,
+            warm_start_adapter=adapt_v2_state_dict,
+        )
 
     train_joint(
         out_dir=args.out_dir,
@@ -645,6 +690,7 @@ def main() -> None:
         device=args.device,
         seed=args.seed,
         progress_every=args.progress_every,
+        **arch_kwargs,
     )
 
 

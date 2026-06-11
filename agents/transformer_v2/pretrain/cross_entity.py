@@ -525,7 +525,15 @@ class CachedCrossEntitySnapshotDataset(torch.utils.data.Dataset):
         "fleet_owner_slot", "fleet_ships_log", "fleet_eta_norm",
     )
 
-    def __init__(self, payload_or_path, per_frame_label_keys=None, with_posterior=False):
+    def __init__(self, payload_or_path, per_frame_label_keys=None,
+                 with_posterior=False, history_offsets=None):
+        # ``history_offsets``: override the lazy-stack window (default:
+        # the module-level HISTORY_OFFSETS constant). Same metadata-only
+        # mechanism as CachedPairDataset.history_offsets — used by the
+        # transformer_v3 dual-rate pretrain to stack the 18-frame union.
+        self.history_offsets: tuple[int, ...] = tuple(
+            history_offsets if history_offsets is not None else HISTORY_OFFSETS
+        )
         # ``per_frame_label_keys``: when set, ``__getitem__`` also stacks
         # each named label across the T history frames (yielding
         # ``{key}_perT`` with shape ``(T, *label_shape)``) and emits a
@@ -561,22 +569,23 @@ class CachedCrossEntitySnapshotDataset(torch.utils.data.Dataset):
         self._key_to_idx: dict[tuple[str, int], int] = {
             k: i for i, k in enumerate(self.keys)
         }
+        offs = self.history_offsets
         self._history_indices = torch.full(
-            (len(self.keys), len(HISTORY_OFFSETS)),
+            (len(self.keys), len(offs)),
             -1,
             dtype=torch.long,
         )
         for i, (ep, t) in enumerate(self.keys):
-            for j, off in enumerate(HISTORY_OFFSETS):
+            for j, off in enumerate(offs):
                 self._history_indices[i, j] = self._key_to_idx.get((ep, t - off), -1)
-        # Posterior (future) window indices: slot j -> turn t + HISTORY_OFFSETS[j],
+        # Posterior (future) window indices: slot j -> turn t + offs[j],
         # so the anchor (offset 0) lands in the LAST slot, mirroring the prior.
         if self.with_posterior:
             self._future_indices = torch.full(
-                (len(self.keys), len(HISTORY_OFFSETS)), -1, dtype=torch.long,
+                (len(self.keys), len(offs)), -1, dtype=torch.long,
             )
             for i, (ep, t) in enumerate(self.keys):
-                for j, off in enumerate(HISTORY_OFFSETS):
+                for j, off in enumerate(offs):
                     self._future_indices[i, j] = self._key_to_idx.get((ep, t + off), -1)
 
     def __len__(self) -> int:
@@ -585,8 +594,8 @@ class CachedCrossEntitySnapshotDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         """Same lazy T-stack as the live ``CrossEntitySnapshotDataset``.
 
-        ``HISTORY_OFFSETS`` is read from the module constant — change
-        ``agents.transformer_v2.history.HISTORY_OFFSETS`` to retune the
+        The window follows ``self.history_offsets`` (ctor arg; defaults
+        to ``agents.transformer_v2.history.HISTORY_OFFSETS``) — retune the
         temporal window without rebuilding the cache.
         """
         cur = self._frame(idx)
