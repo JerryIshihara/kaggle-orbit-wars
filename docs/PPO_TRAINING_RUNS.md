@@ -419,3 +419,11 @@ epoch-1 hot-brake pattern: 4 of updates 7-14 braked hot in epoch 1
 were the weakest sampled rollouts of the run. Lineage best stays v0010
 (68.8%). Decision pending (user): --epochs 1 (epoch 1 is mostly braked
 anyway; saves ~80-130s/iter) vs ride to a v0020 gate for a noise read.
+GATE at v0020 (same panel): seat0 7/16, seat1 11/16, OVERALL 18/32 = 56.2%
+— identical to v0015 despite updates 16-19 all landing clean (kl
+0.017-0.031, no brakes). Hot-epoch-damage hypothesis weakened. Pooled
+v0005/10/15/20: 78/128 = 60.9% +/- 4.3 (all four gates within ~1.5 SE of
+flat 61%; seat0 pooled 29/64 = 45%, seat1 49/64 = 77%). Read: the graft
+moved deploy from 25% -> ~61% and PPO is HOLDING it there, not climbing.
+20/20 needs a different lever (topmeta re-anchor pretrain / opponent-form
+fix / ent phase), not more iters of this config.
