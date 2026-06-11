@@ -411,3 +411,11 @@ progress on top of the graft step-change; trajectory toward 20/20 positive.
 Update-loop note: epoch-1 hot-brakes in 3 of 4 updates (kl 0.066-0.090, epoch 0
 always in-target) — brake bounding damage; --epochs 1 is the standing lever if
 gates stall. Next gate ~v0015.
+GATE at v0015 (same panel): seat0 6/16 = 37.5%, seat1 12/16 = 75.0%,
+OVERALL 18/32 = 56.2% — first down-tick (-12.6pp vs v0010; ~1.4 SE on a
+32-game panel, so within noise, but direction-consistent with the
+epoch-1 hot-brake pattern: 4 of updates 7-14 braked hot in epoch 1
+(kl 0.064-0.090, one at ratio 0.69 / policy_loss 0.60), and iters 13-14
+were the weakest sampled rollouts of the run. Lineage best stays v0010
+(68.8%). Decision pending (user): --epochs 1 (epoch 1 is mostly braked
+anyway; saves ~80-130s/iter) vs ride to a v0020 gate for a noise read.
