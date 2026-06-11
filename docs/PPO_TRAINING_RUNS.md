@@ -405,3 +405,9 @@ gone. Attribution is graft-dominant (decisive allocation survives the deploy
 form); env shift affects both seats symmetrically. Next reads: gate again at
 ~v0010-v0012 to separate PPO progress from graft step-change; 20/20 still the
 target.
+GATE at v0010 (same 16-seed panel): seat0 8/16 = 50.0%, seat1 14/16 = 87.5%,
+OVERALL 22/32 = 68.8% (+6.3pp over v0005) — post-graft PPO adds deploy
+progress on top of the graft step-change; trajectory toward 20/20 positive.
+Update-loop note: epoch-1 hot-brakes in 3 of 4 updates (kl 0.066-0.090, epoch 0
+always in-target) — brake bounding damage; --epochs 1 is the standing lever if
+gates stall. Next gate ~v0015.
