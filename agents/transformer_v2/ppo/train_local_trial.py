@@ -1747,6 +1747,24 @@ def main() -> int:
                 f"nan_guarded={em.get('nan_guarded', 0):.1f}"
                 f"{' early_stop' if em.get('early_stopped') else ''}"
             )
+            if "ent/sel_ent" in em:
+                # v3 per-stage entropy split: SELECT (targets+self softmax on
+                # drawing rows) vs ALLOC ([fired..., HOLD] softmax on acting
+                # rows); spikes = modes carrying >10% mass.
+                _log(
+                    "  ent-split: SEL ent=%.2f ppl=%.1f top1=%.2f "
+                    "spikes=%.1f p_self=%.2f | ALLOC ent=%.2f ppl=%.1f "
+                    "top1=%.2f spikes=%.1f hold=%.2f"
+                    % (em.get("ent/sel_ent", float("nan")),
+                       em.get("ent/sel_ppl", float("nan")),
+                       em.get("ent/sel_top1", float("nan")),
+                       em.get("ent/sel_spikes", float("nan")),
+                       em.get("ent/sel_pself", float("nan")),
+                       em.get("ent/al_ent", float("nan")),
+                       em.get("ent/al_ppl", float("nan")),
+                       em.get("ent/al_top1", float("nan")),
+                       em.get("ent/al_spikes", float("nan")),
+                       em.get("ent/al_hold", float("nan"))))
             if "ent/perplexity" in em:
                 # FLAT vs BUMPS: ppl≈coll≈K & norm≈1 -> flat (uniform collapse);
                 # coll small (2-4) with large K -> a few bumps (benign hedging).

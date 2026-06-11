@@ -514,6 +514,76 @@ def bounded_k_entropy(
     return ent_sel.sum(dim=1) + ent_al.sum(dim=1)
 
 
+@torch.no_grad()
+def bounded_k_ent_breakdown(
+    pair_logits: torch.Tensor,
+    frac_loc: torch.Tensor,
+    *,
+    pair_mask: torch.Tensor,
+    source_mask: torch.Tensor,
+    act,
+    temperature: float = 1.0,
+    self_logit_bias: float = 0.0,
+    spike_p: float = 0.10,
+) -> dict[str, float]:
+    """Per-stage entropy decomposition for the v3 contract (diagnostic).
+
+    Splits the combined entropy bonus into its two stages and characterizes
+    each distribution's SHAPE on this minibatch:
+
+      ent/sel_ent   mean select-softmax entropy per drawing row (nats)
+      ent/sel_ppl   exp(H) — effective # of select modes (targets + self)
+      ent/sel_top1  mean max-probability token
+      ent/sel_spikes mean # tokens with p > ``spike_p`` (the "bumps")
+      ent/sel_pself mean probability mass on the self token
+      ent/al_*      same four for the allocation softmax over [fired, self]
+      ent/al_hold   mean HOLD share of the alloc softmax
+
+    Computed on the SAMPLED supports (drawing rows / acting rows), matching
+    bounded_k_entropy's terms, so sel_ent/al_ent average to the same scale
+    the entropy bonus sums.
+    """
+    tau = float(temperature)
+    B, P, _ = pair_logits.shape
+    logp_sel, logp_al, drew, has_fired = _bounded_k_log_softmaxes(
+        pair_logits, frac_loc, pair_mask, source_mask,
+        act.select_counts, tau, float(self_logit_bias),
+    )
+    # Rebuild the true supports: _bounded_k_log_softmaxes zeroes masked
+    # logp entries, which exp() to a bogus p=1 — probabilities must be
+    # zeroed outside the support before any shape statistic.
+    legal = pair_mask & source_mask.unsqueeze(2)
+    sel_support = torch.cat([legal, drew.unsqueeze(-1)], dim=-1)
+    fired = act.select_counts[..., :P] >= 1
+    al_support = torch.cat([fired, has_fired.unsqueeze(-1)], dim=-1)
+    out: dict[str, float] = {}
+
+    def _stats(logp, support, rows, prefix):
+        if not bool(rows.any()):
+            for k in ("ent", "ppl", "top1", "spikes"):
+                out[f"ent/{prefix}_{k}"] = float("nan")
+            return None
+        pr = torch.where(support, logp.exp(), torch.zeros_like(logp))
+        ent = -(pr * torch.where(support, logp, torch.zeros_like(logp))
+                ).sum(dim=-1)                              # (B,P)
+        ent_r = ent[rows]
+        pr_r = pr[rows]                                    # (N,P+1)
+        out[f"ent/{prefix}_ent"] = float(ent_r.mean())
+        out[f"ent/{prefix}_ppl"] = float(ent_r.exp().mean())
+        out[f"ent/{prefix}_top1"] = float(pr_r.max(dim=-1).values.mean())
+        out[f"ent/{prefix}_spikes"] = float(
+            (pr_r > spike_p).sum(dim=-1).float().mean())
+        return pr_r
+
+    pr_sel = _stats(logp_sel, sel_support, drew, "sel")
+    if pr_sel is not None:
+        out["ent/sel_pself"] = float(pr_sel[:, -1].mean())
+    pr_al = _stats(logp_al, al_support, has_fired, "al")
+    if pr_al is not None:
+        out["ent/al_hold"] = float(pr_al[:, -1].mean())
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Entropy SHAPE diagnostics (flat vs. a few bumps)                            #
 # --------------------------------------------------------------------------- #
@@ -781,7 +851,16 @@ def ppo_minibatch_loss(
     # (benign hedging)? Cheap, no_grad; gated so it runs on a subsample only.
     # Wrapped: a diagnostic failure must never kill a long training run.
     shape_diag: dict[str, float] = {}
-    if collect_shape and getattr(mb, "select_mask", None) is None:
+    if collect_shape and getattr(mb, "select_counts", None) is not None:
+        try:
+            shape_diag = bounded_k_ent_breakdown(
+                out["pair_logits"], out["frac_loc"],
+                pair_mask=mb.pair_mask, source_mask=mb.source_mask, act=mb,
+                self_logit_bias=select_logit_bias,
+            )
+        except Exception:
+            shape_diag = {}
+    elif collect_shape and getattr(mb, "select_mask", None) is None:
         # The per-row Categorical shape diagnostic is single-target-specific
         # (the multi-target contract has no single per-source Categorical).
         try:
