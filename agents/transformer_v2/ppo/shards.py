@@ -37,7 +37,7 @@ import torch
 SHARD_FORMAT_VERSION = 3
 # Matches the sampler's action contract (sampler.MultiTargetAction /
 # sample_multi_target).
-POLICY_ACTION_CONTRACT = "bernoulli_select_multinomial_alloc_v1"
+POLICY_ACTION_CONTRACT = "bernoulli_select_multinomial_alloc_v2"
 
 # Per-step StepRecord fields (smoke.StepRecord). Tensor fields are stacked along a
 # new leading step axis; for T=1 each is (P,...)/(F,...), for T=10 (T,P,...) etc.
@@ -53,11 +53,16 @@ STEP_SCALAR_FIELDS = (
     "invalid_launch", "emitted_launch", "n_selected_targets",
     "score_my", "score_enemy_max", "phi",
 )
-# Action fields (sampler.MultiTargetAction). bernoulli_select_multinomial_alloc_v1:
+# Action fields (sampler.MultiTargetAction). bernoulli_select_multinomial_alloc_v2:
 #   select_mask (P, P) bool — fired off-diagonal targets per owned source,
 #   alloc_counts (P, P) long — ships routed to each fired target,
 #   self_counts (P,) long — ships held on each owned source (self category).
 ACTION_TENSOR_FIELDS = ("select_mask", "alloc_counts", "self_counts")
+# bounded_k_select_multinomial_alloc_v3 (sampler.BoundedKAction):
+#   select_counts (P, P+1) long — draws per [targets..., self token],
+#   alloc_extras (P, P) long — extras beyond the min_launch floor per fired,
+#   self_extras (P,) long — extras held on acting rows.
+ACTION_TENSOR_FIELDS_V3 = ("select_counts", "alloc_extras", "self_extras")
 ACTION_LOGPROB_FIELDS = ("logprob", "logprob_select", "logprob_alloc")
 
 
@@ -108,7 +113,9 @@ def episode_buffer_to_dict(ep: Any) -> dict[str, Any]:
     for f in STEP_SCALAR_FIELDS:
         d[f] = torch.tensor([getattr(s, f) for s in steps])
     d["invalid_reasons"] = [list(s.invalid_reasons or []) for s in steps]
-    for f in ACTION_TENSOR_FIELDS:
+    is_v3 = hasattr(steps[0].action, "select_counts")
+    d["action_contract"] = "v3" if is_v3 else "v2"
+    for f in (ACTION_TENSOR_FIELDS_V3 if is_v3 else ACTION_TENSOR_FIELDS):
         d["action_" + f] = torch.stack(
             [getattr(s.action, f).detach().cpu() for s in steps], dim=0
         )
@@ -125,22 +132,35 @@ def episode_buffer_to_dict(ep: Any) -> dict[str, Any]:
 
 def dict_to_episode_buffer(d: dict[str, Any]) -> Any:
     """Rebuild an EpisodeBuffer (list[StepRecord]) from ``episode_buffer_to_dict``."""
-    from .sampler import MultiTargetAction   # lazy: avoids heavy imports at module load
+    from .sampler import BoundedKAction, MultiTargetAction  # lazy import
     from .smoke import EpisodeBuffer, StepRecord
 
     n = int(d["n_steps"])
+    is_v3 = d.get("action_contract") == "v3" or "action_select_counts" in d
     steps: list[Any] = []
     for i in range(n):
-        action = MultiTargetAction(
-            select_mask=d["action_select_mask"][i].bool(),
-            alloc_counts=d["action_alloc_counts"][i].long(),
-            self_counts=d["action_self_counts"][i].long(),
-            logprob=d["action_logprob"][i],
-            logprob_select=d["action_logprob_select"][i],
-            logprob_alloc=d["action_logprob_alloc"][i],
-            n_terms=int(d["action_n_terms"][i].item()),
-            diagnostics=dict(d["action_diagnostics"][i]),
-        )
+        if is_v3:
+            action = BoundedKAction(
+                select_counts=d["action_select_counts"][i].long(),
+                alloc_extras=d["action_alloc_extras"][i].long(),
+                self_extras=d["action_self_extras"][i].long(),
+                logprob=d["action_logprob"][i],
+                logprob_select=d["action_logprob_select"][i],
+                logprob_alloc=d["action_logprob_alloc"][i],
+                n_terms=int(d["action_n_terms"][i].item()),
+                diagnostics=dict(d["action_diagnostics"][i]),
+            )
+        else:
+            action = MultiTargetAction(
+                select_mask=d["action_select_mask"][i].bool(),
+                alloc_counts=d["action_alloc_counts"][i].long(),
+                self_counts=d["action_self_counts"][i].long(),
+                logprob=d["action_logprob"][i],
+                logprob_select=d["action_logprob_select"][i],
+                logprob_alloc=d["action_logprob_alloc"][i],
+                n_terms=int(d["action_n_terms"][i].item()),
+                diagnostics=dict(d["action_diagnostics"][i]),
+            )
         kw = {f: d[f][i] for f in STEP_TENSOR_FIELDS}
         steps.append(StepRecord(
             action=action,
@@ -180,15 +200,22 @@ def save_shard(
     """Serialize one EpisodeBuffer to ``path``; return its manifest entry."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    ep_dict = episode_buffer_to_dict(ep)
+    # Stamp the contract the episode was actually sampled under (the dict
+    # carries "v3" for BoundedKAction steps); v2 keeps the module constant.
+    contract = (
+        "bounded_k_select_multinomial_alloc_v3"
+        if ep_dict.get("action_contract") == "v3" else POLICY_ACTION_CONTRACT
+    )
     payload = {
         "format_version": SHARD_FORMAT_VERSION,
         "policy_version": int(policy_version),
-        "policy_action_contract": POLICY_ACTION_CONTRACT,
+        "policy_action_contract": contract,
         "history_window": int(history_window),
         "git_sha": git_sha_str or git_sha(),
         "vm_id": vm_id,
         "opponent_ckpt": opponent_ckpt,
-        "episode": episode_buffer_to_dict(ep),
+        "episode": ep_dict,
     }
     torch.save(payload, path)
     return {

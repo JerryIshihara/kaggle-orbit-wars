@@ -90,16 +90,24 @@ def joint_train_step(
     *,
     launch_weight: float = 1.0,
     value_coef: float = 1.0,
+    multinomial_alloc: bool = False,
+    pair_pos_weight: float = 600.0,
+    alloc_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Combined action + value loss over the shared L2.
 
     ``total = action_loss + value_coef * value_loss`` where the action loss is
-    the single-target PairHead objective (``compute_multi_loss(single_target=
-    True)``) on the pair-cache batch, and the value loss is the action-impact
-    ``compute_value_pretrain_loss`` (win tier-1 + 5 future-level signal heads
-    tier-2 + aux tier-3) on the cross-entity batch. Either batch may be ``None``
-    (loader exhaustion) — only the present side contributes. Per-head losses are
-    returned namespaced ``act/<head>`` and ``val/<head>``.
+    the PairHead objective on the pair-cache batch — by default the
+    single-target contract (``compute_multi_loss(single_target=True)``), or
+    with ``multinomial_alloc=True`` the
+    ``bernoulli_select_multinomial_alloc_v2`` contract (whole-grid select BCE
+    with ``pair_pos_weight`` + stage-2 allocation CE that supervises
+    ``frac_loc`` and the HOLD diagonal in PPO's exact softmax) — and the value
+    loss is the action-impact ``compute_value_pretrain_loss`` (win tier-1 + 5
+    future-level signal heads tier-2 + aux tier-3) on the cross-entity batch.
+    Either batch may be ``None`` (loader exhaustion) — only the present side
+    contributes. Per-head losses are returned namespaced ``act/<head>`` and
+    ``val/<head>``.
     """
     from .value_heads import compute_value_pretrain_loss
 
@@ -111,11 +119,19 @@ def joint_train_step(
         act_out = _forward_context_from_batch(
             model, fleet_enc, planet_enc, comet_enc, action_batch,
         )
-        act_loss, act_terms = compute_multi_loss(
-            act_out, action_batch,
-            single_target=True,
-            single_target_launch_weight=launch_weight,
-        )
+        if multinomial_alloc:
+            act_loss, act_terms = compute_multi_loss(
+                act_out, action_batch,
+                multinomial_alloc=True,
+                pair_pos_weight=pair_pos_weight,
+                alloc_weight=alloc_weight,
+            )
+        else:
+            act_loss, act_terms = compute_multi_loss(
+                act_out, action_batch,
+                single_target=True,
+                single_target_launch_weight=launch_weight,
+            )
         total = act_loss if total is None else total + act_loss
         for k, v in act_terms.items():
             per_head[f"act/{k}"] = v
@@ -264,6 +280,8 @@ def train_joint(
     cross_cache_path: Path,
     d_model: int = 256,
     n_steps: int = 10,
+    conditioner_n_layers: int = 1,
+    head_n_layers: int = 1,
     batch_size: int = 16,
     epochs: int = 20,
     lr: float = 1e-4,
@@ -271,6 +289,9 @@ def train_joint(
     launch_weight: float = 1.0,
     value_coef: float = 1.0,
     value_dropout: float = 0.1,
+    multinomial_alloc: bool = False,
+    pair_pos_weight: float = 600.0,
+    alloc_weight: float = 1.0,
     warm_start: Path | None = None,
     num_workers: int = 0,
     device: str | None = None,
@@ -303,6 +324,8 @@ def train_joint(
 
     model = EntityPretrainModel(
         d_model=d_model, n_steps=n_steps,
+        conditioner_n_layers=conditioner_n_layers,
+        head_n_layers=head_n_layers,
         with_consolidator=True, with_value_heads=True,
         value_dropout=value_dropout,
     ).to(device)
@@ -335,6 +358,49 @@ def train_joint(
 
     print(f"[joint] action cache: {pair_cache_path}", flush=True)
     action_full = CachedPairDataset(pair_cache_path)
+    # --- force the MODEL's temporal contract onto the pair cache ---
+    # The deployed stack is T=10 strided (history.HISTORY_OFFSETS); legacy pair
+    # caches were built T=6-consecutive but store EVERY turn as single frames
+    # and stack lazily at __getitem__, so restacking is a metadata override,
+    # not a rebuild. This also matches the cross-entity (value) cache, closing
+    # the documented T=6/T=10 mismatch.
+    from ..history import HISTORY_OFFSETS
+    if tuple(action_full.history_offsets) != HISTORY_OFFSETS:
+        print(f"[joint]   pair cache stored history_offsets="
+              f"{tuple(action_full.history_offsets)} -> OVERRIDING to model "
+              f"HISTORY_OFFSETS={HISTORY_OFFSETS} (T={len(HISTORY_OFFSETS)})",
+              flush=True)
+        action_full.history_offsets = HISTORY_OFFSETS
+    # Context-coverage probe: strided lookback only works if the cache kept
+    # per-turn context frames. Old acted-only caches (no stored context) would
+    # silently stack zero frames — refuse those.
+    _key_set = set(action_full.keys)
+    _acted_probe = list(getattr(action_full, "acted_indices", []) or [])
+    _sample = _acted_probe[:: max(1, len(_acted_probe) // 500)] or [0]
+    _full = sum(
+        all((ep, t - off) in _key_set for off in HISTORY_OFFSETS
+            if off <= t)
+        for ep, t in (action_full.keys[i] for i in _sample)
+    )
+    _cov = _full / max(1, len(_sample))
+    print(f"[joint]   strided-T{len(HISTORY_OFFSETS)} context coverage: "
+          f"{_full}/{len(_sample)} sampled acted rows have every in-game "
+          f"lookback frame ({_cov:.0%}; pre-game offsets zero-fill like the "
+          f"deploy deque)", flush=True)
+    if _cov < 0.5:
+        raise ValueError(
+            "pair cache lacks per-turn context frames for strided T=10 "
+            "stacking — rebuild it with the current builder (which stores "
+            "every turn), e.g. the Ebi_T6 cache layout.",
+        )
+    _probe_item = action_full[_acted_probe[0] if _acted_probe else 0]
+    _pf = _probe_item["planet_features"]
+    assert _pf.dim() == 3 and _pf.shape[0] == len(HISTORY_OFFSETS), (
+        f"expected stacked planet_features (T={len(HISTORY_OFFSETS)}, P, D), "
+        f"got {tuple(_pf.shape)}"
+    )
+    print(f"[joint]   probe item planet_features={tuple(_pf.shape)} "
+          f"(T axis verified)", flush=True)
     # Train the action head ONLY on acted (launch) turns — non-acted snapshots
     # are kept in the cache solely as T-history context. Iterating the whole
     # cache (all snapshots) floods the single-target CE with pure-NOOP turns
@@ -387,12 +453,19 @@ def train_joint(
     best_path = out_dir / "joint_best.pt"
     last_path = out_dir / "joint_last.pt"
     log: list[dict[str, Any]] = []
+    cache_cfg = getattr(action_full, "config", {}) or {}
     config = {
         "d_model": d_model, "n_steps": n_steps, "batch_size": batch_size,
         "epochs": epochs, "lr": lr, "launch_weight": launch_weight,
         "value_coef": value_coef, "value_dropout": value_dropout,
+        "multinomial_alloc": multinomial_alloc,
+        "pair_pos_weight": pair_pos_weight, "alloc_weight": alloc_weight,
         "warm_start": str(warm_start) if warm_start else None,
-        "action_contract": "single_target_per_source_v1",
+        "action_contract": (
+            "bernoulli_select_multinomial_alloc_v2" if multinomial_alloc
+            else "single_target_per_source_v1"
+        ),
+        "pair_history_offsets": list(action_full.history_offsets),
         "pair_cache_path": str(pair_cache_path),
         "cross_cache_path": str(cross_cache_path),
         # Architecture (matches the EntityPretrainModel(...) built above) so
@@ -400,10 +473,16 @@ def train_joint(
         # instead of falling back to the legacy d_pair=128 / 4-head defaults.
         "d_pair": d_model,
         "entity_n_heads": 8, "cross_n_heads": 8, "cross_n_layers": 2,
-        "dual_n_heads": 8, "conditioner_n_layers": 1, "head_n_layers": 1,
+        "dual_n_heads": 8,
+        "conditioner_n_layers": conditioner_n_layers,
+        "head_n_layers": head_n_layers,
         "skip_l34": False, "with_consolidator": True, "with_value_heads": True,
-        "max_planets": 64, "max_fleets": 1024,
+        "max_planets": int(cache_cfg.get("max_planets", 64)),
+        "max_fleets": int(cache_cfg.get("max_fleets", 1024)),
     }
+    print(f"[joint] action_contract={config['action_contract']}  "
+          f"max_planets={config['max_planets']} max_fleets={config['max_fleets']} "
+          f"(from pair cache)", flush=True)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -420,6 +499,9 @@ def train_joint(
                 action_batch, value_batch,
                 launch_weight=launch_weight,
                 value_coef=value_coef,
+                multinomial_alloc=multinomial_alloc,
+                pair_pos_weight=pair_pos_weight,
+                alloc_weight=alloc_weight,
             )
             opt.zero_grad()
             total_loss.backward()
@@ -502,9 +584,25 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--conditioner-n-layers", type=int, default=1,
+                   help="FiLM conditioner hidden layers (deep-heads design: 2)")
+    p.add_argument("--head-n-layers", type=int, default=1,
+                   help="per-head decoder MLP depth (deep-heads design: 3)")
     p.add_argument("--launch-weight", type=float, default=1.0,
                    help="up-weight launching source rows in the action CE "
                         "(single-target NOOP-imbalance control)")
+    p.add_argument("--multinomial-alloc", action="store_true",
+                   help="train the bernoulli_select_multinomial_alloc_v2 "
+                        "contract: whole-grid select BCE + allocation-"
+                        "multinomial CE over [frac_loc, HOLD diagonal] — the "
+                        "contract PPO samples (replaces --launch-weight's "
+                        "single-target CE)")
+    p.add_argument("--pair-pos-weight", type=float, default=600.0,
+                   help="positive-cell weight of the whole-grid select BCE "
+                        "(multinomial-alloc contract only)")
+    p.add_argument("--alloc-weight", type=float, default=1.0,
+                   help="weight of the allocation-multinomial CE term "
+                        "(multinomial-alloc contract only)")
     p.add_argument("--value-coef", type=float, default=1.0,
                    help="weight on the value loss relative to the action loss")
     p.add_argument("--value-dropout", type=float, default=0.1,
@@ -530,6 +628,8 @@ def main() -> None:
         cross_cache_path=args.cross_cache_path,
         d_model=args.d_model,
         n_steps=args.n_steps,
+        conditioner_n_layers=args.conditioner_n_layers,
+        head_n_layers=args.head_n_layers,
         batch_size=args.batch_size,
         epochs=args.epochs,
         lr=args.lr,
@@ -537,6 +637,9 @@ def main() -> None:
         launch_weight=args.launch_weight,
         value_coef=args.value_coef,
         value_dropout=args.value_dropout,
+        multinomial_alloc=args.multinomial_alloc,
+        pair_pos_weight=args.pair_pos_weight,
+        alloc_weight=args.alloc_weight,
         warm_start=args.warm_start,
         num_workers=args.num_workers,
         device=args.device,

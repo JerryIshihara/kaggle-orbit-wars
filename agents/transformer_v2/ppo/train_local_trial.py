@@ -17,7 +17,8 @@ Known TRIAL simplifications (fine for an infra/throughput trial, fix before a re
 see /tmp/ppo_single_machine_plan.md §1):
   * legacy critic fallback is still available only when ``--reward-decomp`` is
     not set;
-  * PPO sampler is single_target_per_source_v1, matching the joint actor;
+  * PPO sampler is bernoulli_select_multinomial_alloc_v2 (HOLD = the frac
+    head's diagonal), matching v2 --multinomial-alloc pretrained actors;
   * optimizer is rebuilt per iter inside ``ppo_update_local``.
 
 Example (local tiny smoke):
@@ -278,6 +279,12 @@ def _save_policy_checkpoint(
             "max_planets": args.max_planets,
             "max_fleets": args.max_fleets,
             "reward_decomp": bool(args.reward_decomp),
+            "action_contract": (
+                "bounded_k_select_multinomial_alloc_v3"
+                if args.action_contract == "v3"
+                else "bernoulli_select_multinomial_alloc_v2"
+            ),
+            "select_k_max": int(args.select_k_max),
             "created_ts": shards.utcnow_iso(),
             "metrics": dict(metrics or {}),
         },
@@ -337,7 +344,7 @@ def _save_rollout_artifacts(
                 "format": "ppo_packed_v1",
                 "policy_version": int(policy_version),
                 "history_window": int(args.history_window),
-                "policy_action_contract": shards.POLICY_ACTION_CONTRACT,
+                "policy_action_contract": ("bounded_k_select_multinomial_alloc_v3" if args.action_contract == "v3" else shards.POLICY_ACTION_CONTRACT),
                 "created_ts": shards.utcnow_iso(),
                 "packed": p,
             }
@@ -354,7 +361,7 @@ def _save_rollout_artifacts(
         "format": "ppo_rollout_manifest_v2",
         "policy_version": int(policy_version),
         "policy_tag": tag,
-        "policy_action_contract": shards.POLICY_ACTION_CONTRACT,
+        "policy_action_contract": ("bounded_k_select_multinomial_alloc_v3" if args.action_contract == "v3" else shards.POLICY_ACTION_CONTRACT),
         "history_window": int(args.history_window),
         "machine_id": machine_id,
         "created_ts": shards.utcnow_iso(),
@@ -421,8 +428,20 @@ def apply_phi_shaping(episodes, *, win_weight: float, signal_weights, gamma: flo
                     sig = compute_p1_signals(batch)[0, 0]  # learner-relative slot 0 → (5,)
                     phis.append(float((sig * sw).sum()))
                     b = t_s // 25                          # 25-step window bucket
-                    acc = sig_buckets.setdefault(b, [torch.zeros(5), 0])
+                    # [sig_sum(5,), n, inval, emit, fired, fleets, my_fleets]
+                    acc = sig_buckets.setdefault(
+                        b, [torch.zeros(5), 0, 0, 0, 0, 0.0, 0.0])
                     acc[0] += sig.detach().cpu(); acc[1] += 1
+                    acc[2] += int(getattr(s, "invalid_launch", 0) or 0)
+                    acc[3] += int(getattr(s, "emitted_launch", 0) or 0)
+                    acc[4] += int(getattr(s, "n_selected_targets", 0) or 0)
+                    fm = batch["fleet_mask"][0]            # (T, F) — current frame last
+                    cur_mask = fm[-1] if fm.dim() == 2 else fm
+                    acc[5] += float(cur_mask.sum())
+                    fo = batch.get("fleet_owner_slot")
+                    if fo is not None:
+                        fo = fo[0][-1] if fo[0].dim() == 2 else fo[0]
+                        acc[6] += float(((fo == 0) & cur_mask.bool()).sum())
                     continue
                 phis.append(phis[-1] if phis else 0.0)     # missing-feature fallback
             for t, s in enumerate(ep.steps):
@@ -439,18 +458,163 @@ def apply_phi_shaping(episodes, *, win_weight: float, signal_weights, gamma: flo
             z = 1.0 if ep.winner == ep.learner_seat else 0.0
             ep.steps[-1].reward += win_weight * z          # terminal win (z∈{1,0})
             all_phi.extend(phis)
-    # ---- per-iter signal diagnostics: mean of each P1 signal per 25-step window ----
-    if log_fn is not None and sig_buckets:
-        hdr = "  ".join(f"{n:>9}" for n in _P1_SIGNAL_NAMES)
-        log_fn(f"signals (mean per 25-step window) | step-window  n   {hdr}")
-        for b in sorted(sig_buckets):
-            tot, cnt = sig_buckets[b]
-            means = (tot / max(1, cnt)).tolist()
-            row = "  ".join(f"{m:>9.3f}" for m in means)
-            log_fn(f"  signals  [{b*25:>3}-{b*25+24:>3}]  {cnt:>4}   {row}")
+    # Plain-python bucket dict (mp-picklable): {bucket: [sig5_list, n, inval,
+    # emit, fired, fleets, my_fleets]} — returned so parallel post workers can
+    # ship their buckets back for a merged parent-side table.
+    buckets_out = {
+        int(b): [acc[0].tolist(), int(acc[1]), int(acc[2]), int(acc[3]),
+                 int(acc[4]), float(acc[5]), float(acc[6])]
+        for b, acc in sig_buckets.items()
+    }
+    if log_fn is not None and buckets_out:
+        _log_window_tables(buckets_out, log_fn)
     import statistics as _st
     return (_st.mean(all_phi) if all_phi else 0.0,
-            _st.mean(all_sh) if all_sh else 0.0)
+            _st.mean(all_sh) if all_sh else 0.0,
+            buckets_out)
+
+
+def _merge_window_buckets(dicts):
+    """Merge per-episode/job window-bucket dicts (element-wise sums)."""
+    merged: dict[int, list] = {}
+    for d in dicts:
+        for b, row in (d or {}).items():
+            b = int(b)
+            if b not in merged:
+                merged[b] = [list(row[0]), *row[1:]]
+                continue
+            m = merged[b]
+            m[0] = [a + b2 for a, b2 in zip(m[0], row[0])]
+            for i in range(1, 7):
+                m[i] += row[i]
+    return merged
+
+
+def _log_window_tables(buckets: dict, log_fn) -> None:
+    """Print the per-iter 25-step-window tables: 5 P1 signals + rollout stats."""
+    if not buckets:
+        return
+    hdr = "  ".join(f"{n:>9}" for n in _P1_SIGNAL_NAMES)
+    log_fn(f"signals (mean per 25-step window) | step-window  n   {hdr}")
+    for b in sorted(buckets):
+        sig, cnt = buckets[b][0], buckets[b][1]
+        row = "  ".join(f"{s / max(1, cnt):>9.3f}" for s in sig)
+        log_fn(f"  signals  [{b*25:>3}-{b*25+24:>3}]  {cnt:>4}   {row}")
+    log_fn("rollout (per 25-step window) | step-window  n    inval     emit  "
+           "inval%   fired/s  fleets/s  myfleets/s")
+    for b in sorted(buckets):
+        _sig, cnt, inv, emit, fired, fl, myfl = buckets[b]
+        rate = inv / max(1, inv + emit)
+        log_fn(f"  rollout  [{b*25:>3}-{b*25+24:>3}]  {cnt:>4}  {inv:>7,d}  "
+               f"{emit:>7,d}  {rate:>6.1%}  {fired/max(1,cnt):>8.2f}  "
+               f"{fl/max(1,cnt):>8.1f}  {myfl/max(1,cnt):>10.1f}")
+
+
+def _analyze_iter_games(episodes, specs, *, log_fn, out_path=None,
+                        sample_every: int = 8):
+    """Per-iter WIN/LOSS analysis from the in-memory rollout episodes.
+
+    For every game: seed / players / seat / length / winner, mean of the 5 P1
+    signals over the early/mid/late thirds (subsampled every ``sample_every``
+    steps), and launch behavior (emitted, fired, noop-step fraction). Logs a
+    compact WIN-vs-LOSS contrast block (the per-iter "why did we win/lose")
+    and optionally writes the per-game rows as JSON for offline digging.
+    """
+    import json as _json
+    from agents.transformer_v2.pretrain.value_signals import compute_p1_signals
+
+    rows = []
+    with torch.no_grad():
+        for ep, spec in zip(episodes, specs):
+            if ep is None or not ep.steps:
+                continue
+            seed, npl, seat = spec
+            n = len(ep.steps)
+            thirds: list[list] = [[], [], []]
+            for t_i in range(0, n, max(1, sample_every)):
+                s = ep.steps[t_i]
+                batch = {}
+                for k in _P1_KEYS:
+                    v = getattr(s, k, None)
+                    if v is None:
+                        break
+                    batch[k] = v.unsqueeze(0)
+                else:
+                    sig = compute_p1_signals(batch)[0, 0].tolist()
+                    thirds[min(2, (3 * t_i) // n)].append(sig)
+
+            def _mean(group):
+                if not group:
+                    return [float("nan")] * 5
+                return [sum(c) / len(c) for c in zip(*group)]
+
+            emit = sum(s.emitted_launch for s in ep.steps)
+            fired = sum(s.n_selected_targets for s in ep.steps)
+            noop_frac = sum(
+                1 for s in ep.steps if s.n_selected_targets == 0) / n
+            rows.append({
+                "seed": int(seed), "players": int(npl), "seat": int(seat),
+                "won": int(ep.winner == ep.learner_seat)
+                       if ep.winner is not None else 0,
+                "winner": (None if ep.winner is None else int(ep.winner)),
+                "n_steps": int(n),
+                "sig_early": _mean(thirds[0]), "sig_mid": _mean(thirds[1]),
+                "sig_late": _mean(thirds[2]),
+                "emit": int(emit), "fired": int(fired),
+                "emit_per_step": round(emit / n, 2),
+                "noop_step_frac": round(noop_frac, 3),
+            })
+
+    if not rows:
+        return rows
+    wins = [r for r in rows if r["won"]]
+    losses = [r for r in rows if not r["won"]]
+
+    def _agg(group, key, idx=None):
+        vals = [(r[key][idx] if idx is not None else r[key]) for r in group]
+        vals = [v for v in vals if v == v]  # drop NaN
+        return (sum(vals) / len(vals)) if vals else float("nan")
+
+    names = _P1_SIGNAL_NAMES
+    log_fn(f"win/loss analysis: {len(wins)}W / {len(losses)}L "
+           f"(2P {sum(r['won'] for r in rows if r['players']==2)}/"
+           f"{sum(1 for r in rows if r['players']==2)}, "
+           f"4P {sum(r['won'] for r in rows if r['players']==4)}/"
+           f"{sum(1 for r in rows if r['players']==4)})")
+    for label, grp in (("WIN ", wins), ("LOSS", losses)):
+        if not grp:
+            continue
+        mid = "  ".join(
+            f"{names[i][:5]}={_agg(grp, 'sig_mid', i):.3f}" for i in range(5))
+        log_fn(f"  {label} n={len(grp):>2}  len={_agg(grp, 'n_steps'):>5.0f}  "
+               f"emit/s={_agg(grp, 'emit_per_step'):>5.2f}  "
+               f"noop%={100*_agg(grp, 'noop_step_frac'):>4.1f}  mid: {mid}")
+    # The tell: which signals separate wins from losses by MID-game (earlier =
+    # more causal than late-game, which is mostly the outcome itself).
+    if wins and losses:
+        gaps = [(_agg(wins, 'sig_mid', i) - _agg(losses, 'sig_mid', i), i)
+                for i in range(5)]
+        gaps = [(g, i) for g, i in gaps if g == g]
+        gaps.sort(key=lambda t: -abs(t[0]))
+        log_fn("  mid-game W-L signal gaps: " + "  ".join(
+            f"{names[i]}={g:+.3f}" for g, i in gaps))
+        for npl in (2, 4):
+            seg = [r for r in losses if r["players"] == npl]
+            if seg:
+                seats: dict[int, int] = {}
+                for r in seg:
+                    seats[r["seat"]] = seats.get(r["seat"], 0) + 1
+                log_fn(f"  {npl}P losses by seat: "
+                       + " ".join(f"s{k}:{v}" for k, v in sorted(seats.items()))
+                       + "  seeds: "
+                       + ",".join(str(r["seed"]) for r in seg[:12]))
+    if out_path is not None:
+        try:
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(out_path).write_text(_json.dumps(rows, indent=1))
+        except Exception as exc:  # noqa: BLE001 — analysis must never kill a run
+            log_fn(f"win/loss analysis: JSON write failed ({exc!r})")
+    return rows
 
 
 def _shape_and_pack_episode_job(
@@ -458,7 +622,7 @@ def _shape_and_pack_episode_job(
     *,
     reward_decomp: bool,
     win_weight: float,
-    signal_weight: float,
+    signal_weights,
     gamma: float,
     inval_coef: float = 0.0,
 ):
@@ -467,15 +631,20 @@ def _shape_and_pack_episode_job(
     If reward decomposition is active, this overwrites the episode rewards with
     calculated PBRS Φ shaping inside the post worker, then stacks the trajectory
     tensors for PPO. This is safe to run as soon as a game finishes because Φ and
-    terminal win labels are per-episode.
+    terminal win labels are per-episode. ``signal_weights`` is the FULL
+    5-vector — a previous version took a scalar and shaped with
+    ``[scalar]*5``, silently ignoring --signal-weights under POST_PROCS>1.
+    Returns the window buckets so the parent can merge + print the per-iter
+    tables (signals + rollout) that the in-process path logs directly.
     """
     mphi = 0.0
     msh = 0.0
+    buckets: dict = {}
     if reward_decomp:
-        mphi, msh = apply_phi_shaping(
+        mphi, msh, buckets = apply_phi_shaping(
             [ep],
             win_weight=win_weight,
-            signal_weights=[signal_weight] * 5,
+            signal_weights=list(signal_weights),
             gamma=gamma,
             inval_coef=inval_coef,
         )
@@ -484,6 +653,7 @@ def _shape_and_pack_episode_job(
         "mean_phi": float(mphi),
         "mean_abs_shape": float(msh),
         "n_steps": int(len(ep.steps)),
+        "buckets": buckets,
     }
 
 
@@ -492,7 +662,7 @@ def _shape_and_pack_episode_path_job(
     *,
     reward_decomp: bool,
     win_weight: float,
-    signal_weight: float,
+    signal_weights,
     gamma: float,
     delete_after: bool = False,
     inval_coef: float = 0.0,
@@ -504,7 +674,7 @@ def _shape_and_pack_episode_path_job(
             ep,
             reward_decomp=reward_decomp,
             win_weight=win_weight,
-            signal_weight=signal_weight,
+            signal_weights=signal_weights,
             gamma=gamma,
             inval_coef=inval_coef,
         )
@@ -828,6 +998,23 @@ def main() -> int:
                         "runner's pair_logits>2.0 threshold. Applied IDENTICALLY in the "
                         "rollout sampler and the PPO update loss (the same value, else "
                         "the ratio desyncs). Default 0.0 = unchanged behaviour.")
+    p.add_argument("--action-contract", choices=("v2", "v3"), default="v2",
+                   help="LEARNER action contract: v2 = bernoulli_select_"
+                        "multinomial_alloc_v2 (per-cell Bernoulli select + full-N "
+                        "multinomial); v3 = bounded_k_select_multinomial_alloc_v3 "
+                        "(ONE k-draw select multinomial incl. a self token, "
+                        "min_launch floor pre-distributed to fired targets, "
+                        "extras multinomial over the remainder — floor-feasible "
+                        "by construction). The FIXED OPPONENT always plays v2. "
+                        "Under v3, --select-logit-bias is the SELF-token bias.")
+    p.add_argument("--select-k-max", type=int, default=4,
+                   help="v3 only: max select draws per source "
+                        "(k = min(this, ships//min_launch))")
+    p.add_argument("--reinit-frac-head", action="store_true",
+                   help="re-initialize the pair_frac_head (alloc head) fresh "
+                        "before PPO — zero final layer => uniform extras "
+                        "softmax at start. Use when changing the alloc "
+                        "semantics (e.g. first v3 run from a v2 pretrain).")
     # design A reward-decomposition critic + calculated Φ shaping
     p.add_argument("--reward-decomp", action="store_true",
                    help="design A: scalar-winrate critic warm-started from the pretrained "
@@ -849,6 +1036,11 @@ def main() -> int:
                         "over-firing multi-target policy to stop firing illegal cells. "
                         "Default 0.0 = off. ~PBRS per-step |r| is ~0.006, so 0.02 ≈ 3× that.")
     args = p.parse_args()
+    if args.action_contract == "v3" and args.rollout in ("pool", "shm"):
+        raise SystemExit(
+            "--action-contract v3 is wired for the batched and infserver "
+            "rollouts only; use --rollout batched or infserver."
+        )
     if args.rollout == "pool" and not args.allow_cpu_forward_rollout:
         raise SystemExit(
             "--rollout pool is CPU-forward only. Use --rollout infserver --device cuda "
@@ -959,6 +1151,26 @@ def main() -> int:
         if len(_miss) > 20 or len(_unexp) > 20:
             _log(f"WARNING: large state_dict mismatch on --init-policy "
                  f"(missing={len(_miss)} unexpected={len(_unexp)}) — architecture may differ")
+    if args.reinit_frac_head:
+        # Fresh alloc head: re-init the pair_frac_head MLP and ZERO its final
+        # layer, so the v3 extras softmax starts uniform over [fired..., self]
+        # (a neutral start — not v1's miscalibrated random HOLD). Applied
+        # AFTER --init-policy so a resume doesn't get silently wiped... unless
+        # the operator explicitly passes both, which re-freshens the head.
+        import torch.nn as _nn
+        _fh = policy.entity_model.pair_head.pair_frac_head
+        for _mod in _fh.modules():
+            if isinstance(_mod, _nn.Linear):
+                _nn.init.kaiming_uniform_(_mod.weight, a=5 ** 0.5)
+                if _mod.bias is not None:
+                    _nn.init.zeros_(_mod.bias)
+        _last = [m for m in _fh.modules() if isinstance(m, _nn.Linear)][-1]
+        _nn.init.zeros_(_last.weight)
+        if _last.bias is not None:
+            _nn.init.zeros_(_last.bias)
+        _n_fresh = sum(p.numel() for p in _fh.parameters())
+        _log(f"reinit-frac-head: pair_frac_head re-initialized fresh "
+             f"({_n_fresh:,} params; final layer zeroed -> uniform alloc softmax)")
     breakdown = _apply_unfreeze(policy, args.unfreeze)
     n_train = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     _log(f"unfreeze={args.unfreeze}: trainable={n_train:,} groups={breakdown}")
@@ -975,7 +1187,17 @@ def main() -> int:
             win_weight=args.win_weight,
         ).to(args.device)
         _ost = torch.load(args.opponent_ckpt, map_location=args.device, weights_only=False)
-        _osd = _ost.get("policy", _ost)
+        if "policy" in _ost:
+            _osd = _ost["policy"]
+        elif "model" in _ost:
+            # Supervised/runner-format ckpt (e.g. a joint_best.pt baseline):
+            # wrap the EntityPretrainModel weights under the PPOActorCritic
+            # prefix so they actually overlay the deepcopy — a bare
+            # load_state_dict(strict=False) on the raw dict would silently
+            # load ZERO tensors and leave the opponent == the --ckpt base.
+            _osd = {f"entity_model.{k}": v for k, v in _ost["model"].items()}
+        else:
+            _osd = _ost
         _omiss, _ounexp = fixed_opponent.load_state_dict(_osd, strict=False)
         fixed_opponent.eval()
         for _p in fixed_opponent.parameters():
@@ -1082,6 +1304,7 @@ def main() -> int:
                 max_planets=args.max_planets, max_fleets=args.max_fleets,
                 sigma=args.sigma, select_logit_bias=args.select_logit_bias,
                 history_window=args.history_window, on_step=_on_step,
+                contract=args.action_contract, select_k_max=args.select_k_max,
             )
         elif args.rollout == "infserver":
             if args.post_procs > 1:
@@ -1104,7 +1327,7 @@ def main() -> int:
                         str(ep_path),
                         reward_decomp=args.reward_decomp,
                         win_weight=args.win_weight,
-                        signal_weight=args.signal_weight,
+                        signal_weights=_sigw,
                         gamma=args.value_gamma,
                         delete_after=args.delete_infserver_spool_after_post,
                         inval_coef=args.inval_coef,
@@ -1148,6 +1371,8 @@ def main() -> int:
                 sigma=args.sigma,
                 noop_logit_bias=0.0,
                 select_logit_bias=args.select_logit_bias,
+                contract=args.action_contract,
+                select_k_max=args.select_k_max,
                 history_window=args.history_window,
                 max_batch=args.infserver_max_batch,
                 batch_window_s=args.infserver_batch_window_ms / 1000.0,
@@ -1260,7 +1485,7 @@ def main() -> int:
                         buf,
                         reward_decomp=args.reward_decomp,
                         win_weight=args.win_weight,
-                        signal_weight=args.signal_weight,
+                        signal_weights=_sigw,
                         gamma=args.value_gamma,
                         inval_coef=args.inval_coef,
                     )
@@ -1313,12 +1538,29 @@ def main() -> int:
             "emit": int(emit),
             "invalid": int(inval),
         })
+        n_games_ok = len(ok)
+        wins_2p_ct = sum(int(e.winner == e.learner_seat)
+                         for e, s in zip(episodes, specs)
+                         if e is not None and s[1] == 2)
+        wins_4p_ct = sum(int(e.winner == e.learner_seat)
+                         for e, s in zip(episodes, specs)
+                         if e is not None and s[1] == 4)
         if not ok:
             _log("no episodes — aborting")
             _stream_progress({"stage": "error", "message": "no episodes"})
             if _STREAM is not None:
                 _STREAM.close(phase="error")
             return 1
+
+        # Per-iter WIN/LOSS replay analysis (signals by game phase, launches,
+        # seat/seed pockets). Wrapped: diagnostics must never kill a run.
+        try:
+            _analyze_iter_games(
+                episodes, specs, log_fn=_log,
+                out_path=args.out_dir / "analysis" / f"games_v{policy_version}.json",
+            )
+        except Exception as _exc:  # noqa: BLE001
+            _log(f"win/loss analysis failed (non-fatal): {_exc!r}")
 
         # run_pool_rollout's _to_inference() froze the policy (eval +
         # requires_grad_(False) on EVERY param) so the fork pool could share
@@ -1349,7 +1591,7 @@ def main() -> int:
         if args.reward_decomp and live_post_packed is None:
             # design A: OVERWRITE rewards with calculated PBRS Φ shaping + terminal
             # win, set per-step Φ (critic reads −Φ), adjust stored value by −Φ.
-            mphi, msh = apply_phi_shaping(
+            mphi, msh, _ = apply_phi_shaping(
                 ok, win_weight=args.win_weight,
                 signal_weights=_sigw, gamma=args.value_gamma,
                 inval_coef=args.inval_coef, log_fn=_log)
@@ -1367,7 +1609,12 @@ def main() -> int:
                 / max(1, n_steps_phi)
             )
             _log(f"Φ-shaping[post]: mean Φ={mphi:.3f} mean|r_shape|={msh:.4f} "
-                 f"(w_win={args.win_weight}, w_sig={args.signal_weight}×5, γ={args.value_gamma})")
+                 f"(w_win={args.win_weight}, w_sig={_sigw}, γ={args.value_gamma}, "
+                 f"inval_coef={args.inval_coef})")
+            _log_window_tables(
+                _merge_window_buckets([st.get("buckets") for st in live_post_stats]),
+                _log,
+            )
 
         if live_post_packed is not None:
             ep_objs, mbs = _packed_episodes_to_ppo(
@@ -1463,6 +1710,16 @@ def main() -> int:
                      "+ infserver_spool/{_vtag(policy_version)}")
 
         # ---- update ----
+        # Free the rollout-sized objects BEFORE the update allocates: episodes/
+        # ok hold full T-stacked StepRecords and live_post_packed holds the
+        # per-episode packed copies; the update only needs mbs (cat'd slices)
+        # + ep_objs (scalar trajectories). Without this, 2-3 rollout-sized
+        # copies coexist during the update and the 125 GB pod cgroup OOMs
+        # (observed twice: max_usage == cgroup limit, killed mid-update).
+        del episodes, ok
+        live_post_packed = None
+        live_post_stats = []
+        gc.collect()
         t_upd = time.time()
         _stream_progress({
             "stage": "update_start",
@@ -1533,11 +1790,9 @@ def main() -> int:
             "iter": K, "unfreeze": args.unfreeze,
             "policy_version_rollout": policy_version,
             "policy_version_next": policy_version + 1,
-            "games": len(ok), "failed": n_fail,
-            "wins_2p": sum(int(e.winner == e.learner_seat)
-                           for e, s in zip(episodes, specs) if e is not None and s[1] == 2),
-            "wins_4p": sum(int(e.winner == e.learner_seat)
-                           for e, s in zip(episodes, specs) if e is not None and s[1] == 4),
+            "games": n_games_ok, "failed": n_fail,
+            "wins_2p": wins_2p_ct,
+            "wins_4p": wins_4p_ct,
             "total_steps": total_steps, "noop": noop, "emit": emit, "inval": inval,
             "rollout_s": round(roll_s, 1),
             "kl": last.get("approx_kl"), "policy_loss": last.get("policy_loss"),
@@ -1581,7 +1836,7 @@ def main() -> int:
         # the next iter's ~80 GB pack is materialized), so iter N and iter N+1 coexist
         # and OOM the 125 GB pod cgroup at f512. del + gc.collect keeps each iter's
         # peak independent. (Observed: iter 0 fit at 79 GB, iter 1 OOM'd rc=137.)
-        del episodes, ok, ep_objs, mbs
+        del ep_objs, mbs
         gc.collect()
 
     _log(f"=== RUN DONE in {time.time()-t_start:.1f}s → {args.out_dir} ===")

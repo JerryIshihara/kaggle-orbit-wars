@@ -311,3 +311,67 @@ win-weight 1.0 (optimize winning, not signals), **ent-coef +0.01** (real explora
 phase 2), no invalid penalty, controlled lr 1.25e-4 / target-kl 0.03 / clip 0.30. Since A
 is frozen + deterministic, this is an *exploitation* problem; the under-supervised HOLD
 diagonal (above) is the least-constrained spot where B can diverge from A.
+
+## 2026-06-11 — contract v2: HOLD logit moved to the frac head's diagonal
+
+`bernoulli_select_multinomial_alloc_v1` → `_v2`: the allocation softmax's
+self/HOLD category now reads `frac_loc[s, s]` instead of `pair_logits[s, s]`.
+One head owns the whole alloc softmax (one output scale), and select
+(pair_head) / alloc (pair_frac_head) gradients decouple at the head level.
+v1's slot only existed to inherit the single-target NOOP diagonal; current
+warm-starts are multi-target pretrains with unsupervised diagonals, so nothing
+is lost. No new params; prior ckpts load 0/0. `shards.POLICY_ACTION_CONTRACT`
+bumped — v1 rollout shards are rejected by the version gate (intended).
+Changed: sampler.py, loss.py (logprob recompute + entropy), alloc_labels.py
+(pretrain CE), notebook. Parity suite re-passed (ratio=1, float64 exact).
+`pair_logits`' diagonal is now fully dead. NOTE: A's PPO ckpts carry their
+learned hold behavior in the OLD slot — warm-chaining B from A under v2 loses
+that calibration (acceptable: this track re-pretrains from the merged base).
+
+## 2026-06-11 — beat-the-baseline run launched (v2 contract end-to-end)
+
+```
+run_id:     beatbase_v2alloc_p28_f512_lr3e5_20260611-035912
+pod:        RunPod COMMUNITY 4090 (r79mlvidz9n9aa, 256 vCPU host, >=100GB cgroup, $0.34/hr)
+base/init:  joint_mt_alloc_d256_T10_head3_20260610-164152/joint_best.pt
+            (v2 alloc-CE pretrain: 75.0% vs physical_v4, 20.3% vs A, hold_mae 0.029)
+opponent:   SAME ckpt, FROZEN (--opponent-ckpt; loader fixed to overlay supervised-format
+            'model' ckpts under the entity_model. prefix — was a silent no-op)
+goal:       beat the frozen baseline 20/20 (deploy gate: scripts/gate_beat_baseline.sh,
+            10 stratified seeds x both seats, alloc_softmax decode both sides)
+rollout:    infserver, PROCS=48, games=64/iter (2P/4P mix), T=10, f512, spool /dev/shm
+reward:     --reward-decomp, win 0.5 + signals [0.1,0.2,0.1,0,0.35], gamma 0.997, inval_coef 0
+update:     lr 3e-5/4e-6/4e-7 (heads/trunk/perception), clip 0.20, target-kl 0.03,
+            ent +0.01 (BONUS — phase-2 explore), epochs 3, mb 64, unfreeze L2
+new guards: in-epoch KL brake (running-avg >= 1.5x target after 4 mb, or single-mb > 4x
+            -> stop update); per-iter 25-step-window tables now include the ROLLOUT table
+            (inval/emit/inval%/fired/fleet sizes) alongside the 5 PBRS signals.
+pre-launch: zero-lr parity EXACT through the real trial path (kl=0.0000 ratio=1.0000);
+            lr calibrated from KL ~ lr^2 (1.25e-4 gave 0.50/epoch -> 3e-5 ~ on-target).
+```
+
+## 2026-06-11 — v3 lineage: first gate + the deploy-decode lesson
+
+Run lineage beatbase_v3topk (joint_best + reinit frac head, frozen v2 baseline
+opponent, equal signal weights [.15,.15,.15,0,.15], ent 0, lr 3e-5): sampled
+winrate climbed to ~58-61% by 5-7 updates, inval=0 throughout, analyzer shows a
+persistent bimodal loss mode (passive: ~1.5 emit/s, ~50% noop steps vs ~10/s,
+~11% in wins; seat-1-heavy in 2P).
+
+GATE at 5 updates (10 panel seeds x both seats vs frozen baseline):
+  topk_self decode (fire iff logit > pair_logits[s,s], k-cap):   3/20 = 15%
+  same + surplus lifted:                                          3/20 = 15%
+  EXPECTATION-MATCHED decode (fire iff 1-(1-p)^k >= 0.5 from the
+  training softmax [legal, self]; k-cap; capped surplus):       11/20 = 55%
+
+Lesson: pair_logits[s,s] was DEAD in the v2 pretrain (v2 HOLD = frac diag), so
+thresholding deploy on it collapses to noise-gating; matching the SAMPLER'S
+MARGINALS deploys the trained distribution. OW_V3_DECODE=expmatch is now the
+v3 default (selfthresh kept as A/B arm); OW_V3_TRUST_GARRISON toggles the
+surplus lift (A/B pending under the good decode). Infra en route: /workspace
+MooseFS silently dropped data writes (rc=0, 0 bytes) -> run relocated to
+container disk + tmux; cross-iter OOM fixed by pre-update free (episodes/ok/
+live_post_packed); in-epoch KL brake first fired at update 7 (kept 0.055).
+Surplus A/B under expmatch decode (5-update ckpt, same 20 games): capped
+11/20 = 55% vs lifted 8/20 = 40% -> guard stays the deploy default
+(OW_V3_TRUST_GARRISON=0); re-test the lift at later gates.

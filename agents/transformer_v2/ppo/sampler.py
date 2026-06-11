@@ -250,7 +250,7 @@ def project_to_env(
 
 
 # =========================================================================== #
-# bernoulli_select_multinomial_alloc_v1                                       #
+# bernoulli_select_multinomial_alloc_v2                                       #
 # =========================================================================== #
 # Per OWNED source row ``s`` (``source_mask[s]``), with ``pair_mask[s]`` = legal
 # off-diagonal targets:
@@ -268,8 +268,8 @@ def project_to_env(
 #     then ``self`` last):
 #         target t ∈ F_s : ``frac_loc[s, t]``    (REUSE the existing pair_frac raw
 #                                                  logit — no new head)
-#         self           : ``pair_logits[s, s]``  (the diagonal HOLD logit)
-#     ``probs = softmax([frac_loc[s, F_s], pair_logits[s, s]])`` and ``counts ~
+#         self           : ``frac_loc[s, s]``    (the frac head's diagonal = HOLD)
+#     ``probs = softmax([frac_loc[s, F_s], frac_loc[s, s]])`` and ``counts ~
 #     Multinomial(S, probs)`` with ``S = source_ships[s]``. ``ships[s,t] =
 #     counts[t]`` for ``t ∈ F_s``; ``held[s] = counts[self]``. So each of the S
 #     ships is routed individually and the counts ARE the launch sizes. The
@@ -277,12 +277,17 @@ def project_to_env(
 #     multinomial coefficient is dropped — it depends only on the stored counts
 #     and cancels in the PPO ratio; the recompute uses the SAME Σ c·log p form).
 #
-# Reusing ``frac_loc`` and ``pair_logits[s, s]`` means NO new parameters, so a
-# single-target-pretrained checkpoint loads via ``load_state_dict(strict=False)``
-# with 0 missing / 0 unexpected keys (the architecture is unchanged).
+# v2 (2026-06-11): the HOLD logit moved from ``pair_logits[s, s]`` (v1) to
+# ``frac_loc[s, s]`` — the whole allocation softmax now lives in ONE head at
+# one output scale, and select (pair_head) / alloc (pair_frac_head) gradients
+# decouple at the head level. v1's slot existed to inherit the single-target
+# NOOP diagonal; current warm-starts are multi-target pretrains whose
+# diagonals were never supervised, so nothing is lost. ``pair_logits``'
+# diagonal is now fully unused. Still NO new parameters: any prior checkpoint
+# loads via ``load_state_dict(strict=False)`` with 0 missing / 0 unexpected.
 @dataclass
 class MultiTargetAction:
-    """One snapshot's ``bernoulli_select_multinomial_alloc_v1`` action.
+    """One snapshot's ``bernoulli_select_multinomial_alloc_v2`` action.
 
     ``select_mask (P, P) bool``: per owned source row, the fired off-diagonal
         targets ``F_s`` (a subset of ``pair_mask[s]``). Rows for non-owned /
@@ -322,7 +327,7 @@ def sample_multi_target(
     temperature: float = 1.0,
     select_logit_bias: float = 0.0,
 ) -> MultiTargetAction:
-    """Draw one ``bernoulli_select_multinomial_alloc_v1`` action.
+    """Draw one ``bernoulli_select_multinomial_alloc_v2`` action.
 
     A per-owned-source Python loop (mirrors :func:`sample_single_target`). The
     stored logprobs are recomputed EXACTLY by
@@ -391,7 +396,7 @@ def sample_multi_target(
         ship_n = int(source_ships[s].item())
         alloc_logits = torch.cat([
             frac_loc[s, fired_cols],                                  # (n_fired,)
-            pair_logits[s, s].reshape(1),                             # self (diagonal)
+            frac_loc[s, s].reshape(1),                                # self (frac diagonal)
         ]) / tau                                                      # (n_fired + 1,)
         log_probs2 = torch.log_softmax(alloc_logits, dim=-1)          # (n_fired + 1,)
         if ship_n > 0:
@@ -462,6 +467,215 @@ def project_multi_target_to_env(
                 n_invalid += 1
                 invalid_reasons.append("min_launch")
                 continue
+            src_pid = source_planet_ids[s]
+            tgt_pid = target_planet_ids[t]
+            if src_pid is None or src_pid < 0 or tgt_pid is None or tgt_pid < 0:
+                n_invalid += 1
+                invalid_reasons.append("pad_slot")
+                continue
+            launch = plan_launch_fn(int(src_pid), int(tgt_pid), int(ships))
+            if not getattr(launch, "ok", False):
+                n_invalid += 1
+                invalid_reasons.append(str(getattr(launch, "reason", "unknown")))
+                continue
+            env_actions.append([int(src_pid), float(launch.angle), int(ships)])
+            n_emitted += 1
+
+    return ProjectionResult(
+        env_actions=env_actions,
+        ok=(n_invalid == 0),
+        n_emitted=n_emitted,
+        n_invalid=n_invalid,
+        invalid_reasons=invalid_reasons,
+    )
+
+
+# =========================================================================== #
+# bounded_k_select_multinomial_alloc_v3                                       #
+# =========================================================================== #
+# Per OWNED source row ``s``:
+#
+#   Stage 1 — Selection (ONE multinomial of k draws): tokens = the legal
+#     off-diagonal targets PLUS a ``self`` null token (logit = the select
+#     head's diagonal ``pair_logits[s, s]`` + ``self_logit_bias``; positive
+#     bias -> more self draws -> fires less, same direction as v2's
+#     select_logit_bias).  ``k = min(k_max, N_s // min_launch)`` is a
+#     DETERMINISTIC function of state (no logprob term).  ``draws ~
+#     Multinomial(k, softmax(logits/tau))``.  Fired set F_s = target tokens
+#     with >= 1 draw; duplicates merge (stronger preference); all-self = hold.
+#     By construction |F_s| <= k <= N_s/min_launch: the floor is ALWAYS
+#     feasible — projection-level min_launch drops are retired.
+#
+#   Stage 2 — Floor + allocation of the REMAINDER: each fired target is
+#     pre-assigned ``min_launch`` (deterministic given F_s — no logprob term);
+#     ``extras ~ Multinomial(N_s - min_launch*|F_s|, softmax([frac_loc[s, F_s],
+#     frac_loc[s, s]]/tau))``.  Launch size = min_launch + extras_t; the self
+#     slot's extras stay home.  All-hold rows have no alloc multinomial.
+#
+# The action stores DRAW COUNTS and EXTRAS (not final sizes), so the logprob
+# recompute needs no phase-dependent min_launch; projection adds the floor.
+# Both stages' logprobs use the coefficient-free ``sum counts*log p`` form
+# (stored counts are constants -> coefficients cancel in the PPO ratio).
+@dataclass
+class BoundedKAction:
+    """One snapshot's ``bounded_k_select_multinomial_alloc_v3`` action.
+
+    ``select_counts (P, P+1) long``: per owned row, draws per token —
+        columns 0..P-1 = target columns, column P = the ``self`` token.
+        Row sum = k for owned rows, 0 elsewhere.
+    ``alloc_extras (P, P) long``: extra ships (beyond the min_launch floor)
+        per fired target; 0 on non-fired cells.
+    ``self_extras (P,) long``: extra ships allocated to the self slot on
+        rows with >= 1 fired target (held ships beyond any floor); 0 on
+        all-hold rows (those keep everything home implicitly).
+    ``logprob / logprob_select / logprob_alloc / n_terms``: as in
+        :class:`MultiTargetAction`; n_terms = one select multinomial per
+        owned row + one alloc multinomial per row with >= 1 fired target.
+    """
+
+    select_counts: torch.Tensor     # (P, P+1) long
+    alloc_extras: torch.Tensor      # (P, P) long
+    self_extras: torch.Tensor       # (P,) long
+    logprob: torch.Tensor           # scalar
+    logprob_select: torch.Tensor    # scalar
+    logprob_alloc: torch.Tensor     # scalar
+    n_terms: int
+    diagnostics: dict[str, float] = field(default_factory=dict)
+
+
+def sample_bounded_k(
+    pair_logits: torch.Tensor,        # (P, P) — select head (diag = self token)
+    frac_loc: torch.Tensor,            # (P, P) — alloc head (diag = HOLD extras)
+    source_ships: torch.Tensor,        # (P,) long — current ship count per source
+    *,
+    pair_mask: torch.Tensor,           # (P, P) bool — legal off-diagonal targets
+    source_mask: torch.Tensor,         # (P,) bool — owned/legal source rows
+    min_launch: int,
+    k_max: int = 4,
+    temperature: float = 1.0,
+    self_logit_bias: float = 0.0,
+) -> BoundedKAction:
+    """Draw one ``bounded_k_select_multinomial_alloc_v3`` action.
+
+    Recomputed EXACTLY by ``loss.action_logprob_bounded_k`` (same tau /
+    self_logit_bias MUST be passed there or the PPO ratio desyncs).
+    """
+    if pair_logits.dim() != 2:
+        raise ValueError("sample is per-snapshot; expected pair_logits (P, P)")
+    p = pair_logits.shape[0]
+    device = pair_logits.device
+    tau = float(temperature)
+    m = int(min_launch)
+
+    select_counts = torch.zeros((p, p + 1), dtype=torch.long, device=device)
+    alloc_extras = torch.zeros((p, p), dtype=torch.long, device=device)
+    self_extras = torch.zeros(p, dtype=torch.long, device=device)
+    logp_select = torch.zeros((), device=device)
+    logp_alloc = torch.zeros((), device=device)
+    n_terms = 0
+    n_launch_sources = 0
+    n_fired_total = 0
+    n_ships_launched = 0
+    k_sum = 0
+
+    src_rows = source_mask.nonzero(as_tuple=False).flatten().tolist()
+    for s in src_rows:
+        legal_cols = pair_mask[s].nonzero(as_tuple=False).flatten()
+        n_legal = int(legal_cols.numel())
+        if n_legal == 0:
+            continue
+        ship_n = int(source_ships[s].item())
+        k = min(int(k_max), ship_n // max(1, m))
+        if k <= 0:
+            continue  # cannot floor even one launch; legality should preclude
+        k_sum += k
+
+        # --- Stage 1: one multinomial of k draws over [legal targets, self] ---
+        sel_logits = torch.cat([
+            pair_logits[s, legal_cols],
+            (pair_logits[s, s] + self_logit_bias).reshape(1),
+        ]) / tau                                                   # (n_legal+1,)
+        log_probs1 = torch.log_softmax(sel_logits, dim=-1)
+        draws = Multinomial(total_count=k, logits=sel_logits).sample()
+        logp_select = logp_select + (draws * log_probs1).sum()
+        n_terms += 1
+        draws_long = draws.round().long()
+        select_counts[s, legal_cols] = draws_long[:n_legal]
+        select_counts[s, p] = draws_long[n_legal]
+
+        fired_local = draws_long[:n_legal] >= 1
+        fired_cols = legal_cols[fired_local]                       # ascending
+        n_fired = int(fired_cols.numel())
+        n_fired_total += n_fired
+        if n_fired == 0:
+            continue  # all-self: full hold, no alloc multinomial
+
+        # --- Stage 2: floor min_launch per fired target, multinomial extras ---
+        rem = ship_n - m * n_fired                                 # >= 0 by k-cap
+        alloc_logits = torch.cat([
+            frac_loc[s, fired_cols],
+            frac_loc[s, s].reshape(1),
+        ]) / tau                                                   # (n_fired+1,)
+        log_probs2 = torch.log_softmax(alloc_logits, dim=-1)
+        if rem > 0:
+            extras = Multinomial(total_count=rem, logits=alloc_logits).sample()
+        else:
+            extras = torch.zeros_like(alloc_logits)
+        logp_alloc = logp_alloc + (extras * log_probs2).sum()
+        n_terms += 1
+        extras_long = extras.round().long()
+        alloc_extras[s, fired_cols] = extras_long[:n_fired]
+        self_extras[s] = extras_long[n_fired]
+        n_launch_sources += 1
+        n_ships_launched += m * n_fired + int(extras_long[:n_fired].sum().item())
+
+    diagnostics = {
+        "n_valid_sources": int(source_mask.sum().item()),
+        "n_launch_sources": int(n_launch_sources),
+        "n_fired_total": int(n_fired_total),
+        "n_ships_launched": int(n_ships_launched),
+        "k_mean": (k_sum / max(1, len(src_rows))),
+    }
+    return BoundedKAction(
+        select_counts=select_counts,
+        alloc_extras=alloc_extras,
+        self_extras=self_extras,
+        logprob=logp_select + logp_alloc,
+        logprob_select=logp_select,
+        logprob_alloc=logp_alloc,
+        n_terms=int(n_terms),
+        diagnostics=diagnostics,
+    )
+
+
+def project_bounded_k_to_env(
+    action: BoundedKAction,
+    *,
+    source_mask: torch.Tensor,        # (P,) bool
+    source_planet_ids: list[int],
+    target_planet_ids: list[int],
+    min_launch: int,
+    plan_launch_fn,
+) -> ProjectionResult:
+    """Project a :class:`BoundedKAction` into env launches.
+
+    Launch size = ``min_launch + alloc_extras[s, t]`` for every fired cell —
+    every launch clears the floor BY CONSTRUCTION, so the only remaining
+    invalids are trajectory-level (``plan_launch`` rejections: sun/wrong-
+    planet/boundary) and pad slots.
+    """
+    env_actions: list[list[int]] = []
+    n_invalid = 0
+    n_emitted = 0
+    invalid_reasons: list[str] = []
+    p = action.alloc_extras.shape[0]
+
+    src_rows = source_mask.nonzero(as_tuple=False).flatten().tolist()
+    for s in src_rows:
+        fired_cols = (action.select_counts[s, :p] >= 1).nonzero(
+            as_tuple=False).flatten().tolist()
+        for t in fired_cols:
+            ships = int(min_launch) + int(action.alloc_extras[s, t].item())
             src_pid = source_planet_ids[s]
             tgt_pid = target_planet_ids[t]
             if src_pid is None or src_pid < 0 or tgt_pid is None or tgt_pid < 0:

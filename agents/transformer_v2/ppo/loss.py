@@ -47,12 +47,12 @@ class PPOMinibatch:
 
     Action fields — ONE contract's tensors are populated, the other left None.
     The loss detects which by field presence (``select_mask is not None`` ->
-    ``bernoulli_select_multinomial_alloc_v1``; else ``single_target_per_source_v1``).
+    ``bernoulli_select_multinomial_alloc_v2``; else ``single_target_per_source_v1``).
 
       single_target_per_source_v1:
         tgt_idx       (B, P) long — chosen target col per source; s == hold/NOOP
         frac_raw      (B, P) float — clamped sigmoid launch fraction per launching source
-      bernoulli_select_multinomial_alloc_v1:
+      bernoulli_select_multinomial_alloc_v2:
         select_mask   (B, P, P) bool — fired off-diagonal targets per owned source
         alloc_counts  (B, P, P) long — ships routed to each fired target
         self_counts   (B, P) long — ships held on each owned source (self category)
@@ -67,11 +67,19 @@ class PPOMinibatch:
     # single_target_per_source_v1 action fields (None under the multi-target contract)
     tgt_idx: torch.Tensor | None = None
     frac_raw: torch.Tensor | None = None
-    # bernoulli_select_multinomial_alloc_v1 action fields (None under single-target)
+    # bernoulli_select_multinomial_alloc_v2 action fields (None under single-target)
     select_mask: torch.Tensor | None = None
     alloc_counts: torch.Tensor | None = None
     self_counts: torch.Tensor | None = None
+    # bounded_k_select_multinomial_alloc_v3 action fields (None otherwise)
+    select_counts: torch.Tensor | None = None   # (B, P, P+1) long — draws incl. self token
+    alloc_extras: torch.Tensor | None = None    # (B, P, P) long — extras beyond the floor
+    self_extras: torch.Tensor | None = None     # (B, P) long — extras held on acting rows
     noop_logit_bias: float = 0.0
+
+    @property
+    def is_bounded_k(self) -> bool:
+        return self.select_counts is not None
 
     @property
     def is_multi_target(self) -> bool:
@@ -79,6 +87,8 @@ class PPOMinibatch:
 
     @property
     def size(self) -> int:
+        if self.select_counts is not None:
+            return int(self.select_counts.shape[0])
         if self.select_mask is not None:
             return int(self.select_mask.shape[0])
         return int(self.tgt_idx.shape[0])
@@ -228,7 +238,7 @@ def source_target_entropy(
 
 
 # =========================================================================== #
-# bernoulli_select_multinomial_alloc_v1 logprob + entropy                     #
+# bernoulli_select_multinomial_alloc_v2 logprob + entropy                     #
 # =========================================================================== #
 def action_logprob_multi(
     pair_logits: torch.Tensor,        # (B, P, P)
@@ -240,7 +250,7 @@ def action_logprob_multi(
     temperature: float = 1.0,
     select_logit_bias: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Recompute the ``bernoulli_select_multinomial_alloc_v1`` logprob under the
+    """Recompute the ``bernoulli_select_multinomial_alloc_v2`` logprob under the
     CURRENT policy. Recomputes the SAME quantity the sampler stored, so the PPO
     ratio is 1 for an unchanged policy.
 
@@ -254,8 +264,9 @@ def action_logprob_multi(
         :func:`agents.transformer_v2.ppo.sampler.sample_multi_target` sampled
         with (it shifts only the selection Bernoulli logit) or the PPO ratio
         desyncs.
-    allocation = ``Σ counts · log_softmax([frac_loc[s, F_s], pair_logits[s, s]])``
-        over ``F_s ∪ self`` per owned source (UNCHANGED by the bias).
+    allocation = ``Σ counts · log_softmax([frac_loc[s, F_s], frac_loc[s, s]])``
+        over ``F_s ∪ self`` per owned source (UNCHANGED by the bias; v2 — the
+        self/HOLD logit is the frac head's diagonal, not ``pair_logits[s, s]``).
 
     Returns ``(logp, n_terms)`` where ``n_terms`` counts the legal Bernoulli
     cells across owned rows plus one per acting source (its multinomial),
@@ -291,16 +302,12 @@ def action_logprob_multi(
     # log-softmax. The not-fired legal targets carry count 0, so including them
     # in the softmax support is WRONG — the sampler's softmax is over F_s ∪ self
     # only. So we mask the alloc logits to the FIRED targets + the diagonal self.
-    alloc_logit_mat = frac_loc / tau                                # (B,P,P) target logits
+    # v2: the self/HOLD logit IS the frac head's diagonal, so ``frac_loc / tau``
+    # already carries every category — fired targets off-diagonal, self on the
+    # diagonal. Support per (b, s) row: fired targets (select_mask) OR the
+    # diagonal self; one masked log-softmax covers F_s ∪ self in one shot.
+    alloc_logit_mat = frac_loc / tau                                # (B,P,P)
     eye = torch.eye(P, dtype=torch.bool, device=device).unsqueeze(0)  # (1,P,P)
-    # self logit lives on the diagonal: pair_logits[b, s, s] / tau.
-    self_logit = (pair_logits.diagonal(dim1=1, dim2=2) / tau)       # (B,P)
-    # Support per (b, s) row: fired targets (select_mask) OR the diagonal self.
-    # Place the self logit on the diagonal of the alloc logit matrix so a single
-    # masked log-softmax over the column dim covers F_s ∪ self in one shot.
-    alloc_logit_mat = torch.where(
-        eye, self_logit.unsqueeze(2).expand(B, P, P), alloc_logit_mat,
-    )
     support = select_mask | (eye & source_mask.unsqueeze(2))        # (B,P,P)
     masked_logits = torch.where(
         support, alloc_logit_mat, torch.full_like(alloc_logit_mat, float("-inf")),
@@ -342,7 +349,7 @@ def multi_target_entropy(
     temperature: float = 1.0,
     select_logit_bias: float = 0.0,
 ) -> torch.Tensor:
-    """Entropy bonus for ``bernoulli_select_multinomial_alloc_v1``.
+    """Entropy bonus for ``bernoulli_select_multinomial_alloc_v2``.
 
     ``Σ_{legal cells} Bernoulli-entropy(pair_logits)`` (selection) ``+ Σ_{owned
     sources} categorical-entropy(softmax(alloc over F_s ∪ self))`` (allocation).
@@ -372,10 +379,8 @@ def multi_target_entropy(
     # ---- allocation: categorical entropy over sampled F_s ∪ self per owned row ----
     select_mask = act.select_mask.bool()
     eye = torch.eye(P, dtype=torch.bool, device=device).unsqueeze(0)
-    self_logit = pair_logits.diagonal(dim1=1, dim2=2) / tau        # (B,P)
-    alloc_logit_mat = torch.where(
-        eye, self_logit.unsqueeze(2).expand(B, P, P), frac_loc / tau,
-    )
+    # v2: self/HOLD logit = frac head's diagonal; frac_loc already carries it.
+    alloc_logit_mat = frac_loc / tau                               # (B,P,P)
     support = select_mask | (eye & source_mask.unsqueeze(2))       # (B,P,P)
     masked_logits = torch.where(
         support, alloc_logit_mat, torch.full_like(alloc_logit_mat, float("-inf")),
@@ -393,6 +398,120 @@ def multi_target_entropy(
     ent_alloc = cat_ent.sum(dim=1)                                 # (B,)
 
     return ent_select + ent_alloc
+
+
+# --------------------------------------------------------------------------- #
+# bounded_k_select_multinomial_alloc_v3 logprob + entropy                      #
+# --------------------------------------------------------------------------- #
+def _bounded_k_log_softmaxes(
+    pair_logits: torch.Tensor,        # (B, P, P)
+    frac_loc: torch.Tensor,            # (B, P, P)
+    pair_mask: torch.Tensor,           # (B, P, P) bool
+    source_mask: torch.Tensor,         # (B, P) bool
+    select_counts: torch.Tensor,       # (B, P, P+1) long
+    tau: float,
+    self_bias: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shared select/alloc masked log-softmaxes for the v3 contract.
+
+    Returns ``(logp_sel (B,P,P+1), logp_al (B,P,P+1), drew (B,P), has_fired
+    (B,P))``. Non-finite entries are zeroed — counts are 0 there, so they
+    contribute nothing to ``sum counts*logp`` and nothing to entropy terms
+    that multiply by the (zero) probability.
+    """
+    B, P, _ = pair_logits.shape
+    legal = pair_mask & source_mask.unsqueeze(2)                    # (B,P,P)
+    drew = select_counts.sum(dim=-1) > 0                            # (B,P) rows that sampled
+    neg_inf = float("-inf")
+
+    sel_self = pair_logits.diagonal(dim1=1, dim2=2) + self_bias     # (B,P)
+    sel = torch.cat([pair_logits, sel_self.unsqueeze(-1)], dim=-1) / tau
+    sel_support = torch.cat([legal, drew.unsqueeze(-1)], dim=-1)    # self on drawing rows
+    sel_m = torch.where(sel_support, sel, torch.full_like(sel, neg_inf))
+    row_ok = sel_support.any(dim=-1, keepdim=True)
+    sel_m = torch.where(row_ok, sel_m, torch.zeros_like(sel_m))
+    logp_sel = torch.log_softmax(sel_m, dim=-1)
+    logp_sel = torch.where(torch.isfinite(logp_sel), logp_sel,
+                           torch.zeros_like(logp_sel))
+
+    fired = select_counts[..., :P] >= 1                             # (B,P,P)
+    has_fired = fired.any(dim=-1)                                   # (B,P)
+    al_self = frac_loc.diagonal(dim1=1, dim2=2)                     # (B,P)
+    al = torch.cat([frac_loc, al_self.unsqueeze(-1)], dim=-1) / tau
+    al_support = torch.cat([fired, has_fired.unsqueeze(-1)], dim=-1)
+    al_m = torch.where(al_support, al, torch.full_like(al, neg_inf))
+    row_ok2 = al_support.any(dim=-1, keepdim=True)
+    al_m = torch.where(row_ok2, al_m, torch.zeros_like(al_m))
+    logp_al = torch.log_softmax(al_m, dim=-1)
+    logp_al = torch.where(torch.isfinite(logp_al), logp_al,
+                          torch.zeros_like(logp_al))
+    return logp_sel, logp_al, drew, has_fired
+
+
+def action_logprob_bounded_k(
+    pair_logits: torch.Tensor,        # (B, P, P)
+    frac_loc: torch.Tensor,            # (B, P, P)
+    *,
+    pair_mask: torch.Tensor,           # (B, P, P) bool
+    source_mask: torch.Tensor,         # (B, P) bool
+    act,                               # carries select_counts / alloc_extras / self_extras
+    temperature: float = 1.0,
+    self_logit_bias: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recompute the ``bounded_k_select_multinomial_alloc_v3`` logprob.
+
+    selection = ``sum draws*log_softmax([pair_logits[s, legal],
+        pair_logits[s, s]+bias])`` per drawing row;
+    allocation = ``sum extras*log_softmax([frac_loc[s, F_s], frac_loc[s, s]])``
+        per row with >= 1 fired target.
+    Both coefficient-free, matching :func:`sampler.sample_bounded_k` exactly.
+    Returns ``(logp (B,), n_terms (B,))`` — n_terms = drawing rows + acting
+    rows, matching the sampler's count.
+    """
+    if pair_logits.dim() != 3:
+        raise ValueError("expected pair_logits (B, P, P)")
+    tau = float(temperature)
+    select_counts = act.select_counts.to(pair_logits.dtype)
+    logp_sel, logp_al, drew, has_fired = _bounded_k_log_softmaxes(
+        pair_logits, frac_loc, pair_mask, source_mask,
+        act.select_counts, tau, float(self_logit_bias),
+    )
+    logp_select = (select_counts * logp_sel).sum(dim=(1, 2))
+
+    extras_full = torch.cat([
+        act.alloc_extras.to(pair_logits.dtype),
+        act.self_extras.to(pair_logits.dtype).unsqueeze(-1),
+    ], dim=-1)                                                      # (B,P,P+1)
+    logp_alloc = (extras_full * logp_al).sum(dim=(1, 2))
+
+    n_terms = (drew.float().sum(dim=1)
+               + has_fired.float().sum(dim=1)).clamp_min(1.0)
+    return logp_select + logp_alloc, n_terms
+
+
+def bounded_k_entropy(
+    pair_logits: torch.Tensor,
+    frac_loc: torch.Tensor,
+    *,
+    pair_mask: torch.Tensor,
+    source_mask: torch.Tensor,
+    act,
+    temperature: float = 1.0,
+    self_logit_bias: float = 0.0,
+) -> torch.Tensor:
+    """Entropy bonus for v3: categorical entropy of the select softmax per
+    drawing row + categorical entropy of the alloc softmax per acting row
+    (underlying distributions, not count-scaled — same convention as v2)."""
+    tau = float(temperature)
+    logp_sel, logp_al, drew, has_fired = _bounded_k_log_softmaxes(
+        pair_logits, frac_loc, pair_mask, source_mask,
+        act.select_counts, tau, float(self_logit_bias),
+    )
+    ent_sel = -(logp_sel.exp() * logp_sel).sum(dim=-1)              # (B,P)
+    ent_sel = torch.where(drew, ent_sel, torch.zeros_like(ent_sel))
+    ent_al = -(logp_al.exp() * logp_al).sum(dim=-1)                 # (B,P)
+    ent_al = torch.where(has_fired, ent_al, torch.zeros_like(ent_al))
+    return ent_sel.sum(dim=1) + ent_al.sum(dim=1)
 
 
 # --------------------------------------------------------------------------- #
@@ -595,8 +714,20 @@ def ppo_minibatch_loss(
             out[_k] = torch.nan_to_num(_v, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Contract switch: detect by action-field presence on the minibatch.
-    # ``select_mask is not None`` -> bernoulli_select_multinomial_alloc_v1.
-    if getattr(mb, "select_mask", None) is not None:
+    # ``select_counts is not None`` -> bounded_k_select_multinomial_alloc_v3;
+    # ``select_mask is not None`` -> bernoulli_select_multinomial_alloc_v2.
+    if getattr(mb, "select_counts", None) is not None:
+        # v3 reuses the select_logit_bias knob as the SELF-token bias (same
+        # sign convention: positive -> fires less).
+        new_logp, n_terms = action_logprob_bounded_k(
+            pair_logits=out["pair_logits"],
+            frac_loc=out["frac_loc"],
+            pair_mask=mb.pair_mask,
+            source_mask=mb.source_mask,
+            act=mb,
+            self_logit_bias=select_logit_bias,
+        )
+    elif getattr(mb, "select_mask", None) is not None:
         new_logp, n_terms = action_logprob_multi(
             pair_logits=out["pair_logits"],
             frac_loc=out["frac_loc"],
@@ -624,7 +755,13 @@ def ppo_minibatch_loss(
 
     value_loss = F.mse_loss(out["value"], mb.returns)
 
-    if getattr(mb, "select_mask", None) is not None:
+    if getattr(mb, "select_counts", None) is not None:
+        entropy = (bounded_k_entropy(
+            out["pair_logits"], out["frac_loc"],
+            pair_mask=mb.pair_mask, source_mask=mb.source_mask, act=mb,
+            self_logit_bias=select_logit_bias,
+        ) / n_terms).mean()
+    elif getattr(mb, "select_mask", None) is not None:
         # Per-component normalization (÷ n_terms), matching the KL normalization,
         # so ent_coef has a comparable effect to the single-target contract. The
         # raw multi-target entropy is a sum over ~all legal Bernoulli cells (~40),

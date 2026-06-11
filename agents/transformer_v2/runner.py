@@ -157,10 +157,15 @@ class TransformerAgent:
     """Inference wrapper around the v2 entity-pretrain PairHead policy."""
 
     #: Valid values for ``inference_mode`` — controls how ``_predict`` turns
-    #: ``pair_logits`` into a launch list. Use ``threshold`` for the
-    #: production multi-target rule; the other two are diagnostic
-    #: alternatives wired up as separate dashboard agent ids.
-    INFERENCE_MODES = ("threshold", "row_argmax", "flat_argmax", "single_target")
+    #: ``pair_logits`` into a launch list. ``threshold`` is the production
+    #: rule for sigmoid-frac checkpoints; ``alloc_softmax`` is the production
+    #: rule for ``bernoulli_select_multinomial_alloc_v2`` checkpoints (same
+    #: fired set, sizes from the contract's share softmax incl. the HOLD
+    #: diagonal); the others are diagnostic alternatives.
+    INFERENCE_MODES = (
+        "threshold", "alloc_softmax", "topk_self", "row_argmax", "flat_argmax",
+        "single_target",
+    )
 
     def __init__(
         self,
@@ -176,6 +181,7 @@ class TransformerAgent:
         num_players: int = 4,
         inference_mode: str = "threshold",
         logit_threshold: float = 2.0,
+        select_k_max: int = 4,
     ):
         if inference_mode not in self.INFERENCE_MODES:
             raise ValueError(
@@ -192,6 +198,7 @@ class TransformerAgent:
         self.num_players = num_players
         self.inference_mode = inference_mode
         self.logit_threshold = float(logit_threshold)
+        self.select_k_max = int(select_k_max)
         # Per-episode launch-tick state. Reset on step=0 detection.
         self._tracker = FleetTracker()
         self._last_step: int | None = None
@@ -240,11 +247,17 @@ class TransformerAgent:
         # ``action_contract`` and fall back to ``threshold`` exactly as before.
         if inference_mode is None:
             contract = cfg.get("action_contract")
-            inference_mode = (
-                "single_target"
-                if contract == "single_target_per_source_v1"
-                else "threshold"
-            )
+            if contract == "single_target_per_source_v1":
+                inference_mode = "single_target"
+            elif contract == "bernoulli_select_multinomial_alloc_v2":
+                # v2 pretrains train frac_loc as softmax-SHARE logits (incl.
+                # the HOLD diagonal); sigmoid sizing would mis-read them.
+                inference_mode = "alloc_softmax"
+            elif contract == "bounded_k_select_multinomial_alloc_v3":
+                # v3: self logit = learned firing threshold; floor + extras.
+                inference_mode = "topk_self"
+            else:
+                inference_mode = "threshold"
             print(f"[runner] inference_mode auto-selected: {inference_mode!r} "
                   f"(action_contract={contract!r})", flush=True)
         d_model = int(cfg.get("d_model", 256))
@@ -344,6 +357,7 @@ class TransformerAgent:
             max_fleets=cfg.get("max_fleets", 1024),
             inference_mode=inference_mode,
             logit_threshold=logit_threshold,
+            select_k_max=int(cfg.get("select_k_max", 4)),
         )
 
     @torch.no_grad()
@@ -465,6 +479,7 @@ class TransformerAgent:
         )
         owner_by_idx: dict[int, int] = {}
         launchable_by_idx: dict[int, bool] = {}
+        ships_by_idx: dict[int, int] = {}
         if raw_planets:
             from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
             planets = [Planet(*p) for p in raw_planets]
@@ -476,6 +491,7 @@ class TransformerAgent:
                     idx = pid_to_idx[pid]
                     owner = int(planet.owner)
                     owner_by_idx[idx] = owner
+                    ships_by_idx[idx] = int(planet.ships)
                     surplus = compute_surplus(planet, enemy_fleets, defense_buffer)
                     launchable_by_idx[idx] = (
                         owner == learner_slot and surplus >= min_launch
@@ -560,12 +576,179 @@ class TransformerAgent:
                 dbg["src_legal"] += nsl
                 dbg["launched"] += nl
                 dbg["held"] += nsl - nl
+        elif inference_mode == "topk_self":
+            # bounded_k v3 deploy decode. Per launchable row, the SELF logit
+            # ``pair_logits[s, s]`` is the LEARNED firing threshold: fire every
+            # legal target whose select logit beats it, capped at
+            # ``k = min(select_k_max, ships // min_launch)`` by descending
+            # logit. Sizes follow the v3 allocation exactly: ``min_launch +
+            # softmax([frac_loc[s, F], frac_loc[s, s]]) · remainder``. No
+            # constant threshold anywhere; act()'s surplus budget still caps.
+            picked: list[tuple[float, int, int, float]] = []
+            for s in range(P):
+                if not bool(src_legal[s]):
+                    continue
+                n_ships = int(ships_by_idx.get(s, 0))
+                k_cap = min(int(self.select_k_max),
+                            n_ships // max(1, int(min_launch)))
+                if k_cap <= 0:
+                    continue
+                row = masked_logits[s]                       # -inf on illegal
+                self_logit = float(pair_logits[s, s])
+                # Default expmatch@0.5: the 9-update matrix measured guard@0.5
+                # 21.9% / lifted@0.5 25.0% / threshold-free 6.2% — deterministic
+                # per-step decoding needs the marginal bar as a CADENCE damper
+                # (sampling fires a p-target every ~1/p steps; threshold-free
+                # fires it EVERY step).
+                decode = os.environ.get("OW_V3_DECODE", "sample")
+                if decode == "sample":
+                    # SAMPLED deploy (production default): draw the action
+                    # from the v3 contract EXACTLY as training does — no bar,
+                    # no decode rule, no train/deploy gap. The deployed agent
+                    # IS the optimized policy; deploy strength tracks sampled
+                    # strength 1:1 as the model learns. (Determinism was an
+                    # assumption inherited from the threshold era, not a
+                    # competition requirement.)
+                    from .ppo.sampler import sample_bounded_k
+                    n_legal_t = int((row > -1e30).sum())
+                    if n_legal_t == 0:
+                        continue
+                    pm_row = torch.zeros(P, P, dtype=torch.bool,
+                                         device=row.device)
+                    pm_row[s] = row > -1e30
+                    sm_row = torch.zeros(P, dtype=torch.bool,
+                                         device=row.device)
+                    sm_row[s] = True
+                    ships_vec = torch.zeros(P, dtype=torch.long,
+                                            device=row.device)
+                    ships_vec[s] = n_ships
+                    act_s = sample_bounded_k(
+                        pair_logits, pair_frac_raw, ships_vec,
+                        pair_mask=pm_row, source_mask=sm_row,
+                        min_launch=int(min_launch),
+                        k_max=int(self.select_k_max),
+                    )
+                    fired_cols = (act_s.select_counts[s, :P] >= 1).nonzero(
+                        as_tuple=False).flatten().tolist()
+                    for t in fired_cols:
+                        ships_t = int(min_launch) + int(
+                            act_s.alloc_extras[s, t].item())
+                        picked.append((float(row[t]), s, int(t),
+                                       ships_t / max(1, n_ships)))
+                    continue
+                if decode == "expcount":
+                    # THRESHOLD-FREE decode (production default): the select
+                    # distribution's own structure sets firing breadth. The
+                    # sampler draws k tokens from softmax([legal, self]); in
+                    # expectation k*(1-p_self) of them land on targets, so
+                    # fire the top round(k*(1-p_self)) targets by probability.
+                    # Hedged rows fire (mass on targets even when no single
+                    # target dominates); holdy rows hold (self mass -> 0).
+                    # No tunable constant anywhere.
+                    cat_logits = torch.cat([
+                        row, torch.tensor([self_logit], device=row.device),
+                    ])
+                    probs = torch.softmax(cat_logits, dim=0)
+                    n_fire = min(k_cap, int(round(
+                        k_cap * float(1.0 - probs[-1]))))
+                    if n_fire <= 0:
+                        continue                             # hold
+                    tp = probs[:P]
+                    order_t = torch.argsort(tp, descending=True)[:n_fire]
+                    order_t = order_t[tp[order_t] > 0]       # drop illegal (p=0)
+                    if int(order_t.numel()) == 0:
+                        continue
+                elif decode == "expmatch":
+                    # Expectation-matched firing: reproduce the SAMPLER's
+                    # marginals instead of thresholding on the raw self
+                    # logit. Sampling fires t when >=1 of k draws from
+                    # softmax([legal, self]) lands on t — P(fire t) =
+                    # 1-(1-p_t)^k. Fire the cells where that marginal >= 0.5.
+                    # Robust to a noisy self logit (it is one normalizer term
+                    # among ~30, exactly as in training, rather than the sole
+                    # gatekeeper — the diagonal was DEAD in the v2 pretrain
+                    # and is only partially calibrated early in v3 PPO).
+                    cat_logits = torch.cat([
+                        row, torch.tensor([self_logit], device=row.device),
+                    ])
+                    probs = torch.softmax(cat_logits, dim=0)[:P]
+                    p_fire = 1.0 - (1.0 - probs) ** k_cap
+                    fire_th = float(os.environ.get("OW_V3_FIRE_TH", "0.5"))
+                    above = (p_fire >= fire_th).nonzero(as_tuple=False).flatten()
+                    if int(above.numel()) == 0:
+                        continue                             # hold
+                    order_t = above[torch.argsort(p_fire[above],
+                                                  descending=True)]
+                else:  # "selfthresh" — the original hard-threshold decode
+                    above = (row > self_logit).nonzero(as_tuple=False).flatten()
+                    if int(above.numel()) == 0:
+                        continue                             # self wins: hold
+                    order_t = above[torch.argsort(row[above], descending=True)]
+                fired = order_t[:k_cap].tolist()
+                rem = n_ships - int(min_launch) * len(fired)
+                alloc_logits = torch.cat([
+                    pair_frac_raw[s, fired],
+                    pair_frac_raw[s, s].reshape(1),
+                ])
+                share = torch.softmax(alloc_logits, dim=-1)
+                if getattr(self, "_shape_debug", False):
+                    cat_l = torch.cat([
+                        row, torch.tensor([self_logit], device=row.device)])
+                    p_all = torch.softmax(cat_l, dim=0)
+                    srt = torch.sort(share[:-1], descending=True).values
+                    self.__dict__.setdefault("_shape_rows", []).append({
+                        "step": step, "n_legal": int((row > -1e30).sum()),
+                        "p_self_sel": float(p_all[-1]),
+                        "sel_top1": float(p_all[:P].max()),
+                        "n_fired": len(fired),
+                        "hold_share": float(share[-1]),
+                        "alloc_top1": float(srt[0]) if len(srt) else float("nan"),
+                        "alloc_ppl": float(torch.exp(-(share * (share + 1e-9).log()).sum())),
+                    })
+                for j, t in enumerate(fired):
+                    ships_t = int(min_launch) + float(share[j]) * max(0, rem)
+                    picked.append((float(row[t]), s, int(t),
+                                   ships_t / max(1, n_ships)))
+            if not picked:
+                return []
+            picked.sort(key=lambda x: -x[0])                 # logit-descending
+            actions = []
+            for _logit, s, t, frac in picked:
+                source_pid = idx_to_pid.get(s)
+                target_pid = idx_to_pid.get(t)
+                if source_pid is None or target_pid is None:
+                    continue
+                actions.append((source_pid, target_pid, float(frac)))
+            return actions
+        elif inference_mode == "alloc_softmax":
+            # bernoulli_select_multinomial_alloc_v2 deploy rule. Fired set =
+            # the threshold rule's (every legal cell whose SELECT logit clears
+            # ``logit_threshold``); sizes = the contract's allocation softmax
+            # ``share = softmax([frac_loc[s, fired], frac_loc[s, s]])`` so the
+            # HOLD share (frac diagonal) keeps ships home. Each cell's share is
+            # later scaled by source.ships in ``act()`` — same pipeline as
+            # threshold mode, whose surplus budget still caps total spend.
+            firing = (pair_logits > logit_threshold) & cell_legal
+            if not firing.any():
+                return []
+            src_indices, tgt_indices = firing.nonzero(as_tuple=True)
         else:  # threshold
             # Per-cell: every legal cell whose logit clears the threshold.
             firing = (pair_logits > logit_threshold) & cell_legal
             if not firing.any():
                 return []
             src_indices, tgt_indices = firing.nonzero(as_tuple=True)
+
+        alloc_share = None
+        if inference_mode == "alloc_softmax":
+            # Row-wise masked softmax over [fired cells ... , HOLD diagonal].
+            # Launchable rows always carry their HOLD slot, so no row in
+            # ``src_indices`` can be all--inf (no NaNs reach the lookup).
+            diag = torch.arange(P, device=device)
+            alloc_mask = firing.clone()
+            alloc_mask[diag, diag] |= src_legal
+            alloc_logits = pair_frac_raw.masked_fill(~alloc_mask, neg_inf)
+            alloc_share = torch.softmax(alloc_logits, dim=-1)
 
         # Convert to a list of (src, tgt, frac). To keep the per-source
         # launches well-ordered when surplus is tight, emit cells in
@@ -581,7 +764,10 @@ class TransformerAgent:
             target_pid = idx_to_pid.get(tgt_idx)
             if source_pid is None or target_pid is None:
                 continue
-            frac = float(torch.sigmoid(pair_frac_raw[src_idx, tgt_idx]).item())
+            if alloc_share is not None:
+                frac = float(alloc_share[src_idx, tgt_idx].item())
+            else:
+                frac = float(torch.sigmoid(pair_frac_raw[src_idx, tgt_idx]).item())
             actions.append((source_pid, target_pid, frac))
         return actions
 
@@ -626,9 +812,27 @@ class TransformerAgent:
             src = by_id.get(int(source_pid))
             if src is None:
                 continue
-            per_source_budget[source_pid] = int(compute_surplus(
-                src, enemy_fleets, defense_buffer,
-            ))
+            # Default = LIFTED (user call: model freedom over heuristics) —
+            # the learned HOLD share alone decides what stays home for v3
+            # decodes. The 5-update A/B had measured guard 11/20 vs lift 8/20,
+            # but that was with a barely-calibrated alloc head; as it sharpens
+            # the lift's premise strengthens. OW_V3_TRUST_GARRISON=0 restores
+            # the compute_surplus guard for comparison runs.
+            if self.inference_mode == "topk_self" and os.environ.get(
+                    "OW_V3_TRUST_GARRISON", "1") == "1":
+                # v3 garrison-trust deploy: the surplus reserve is LIFTED —
+                # the learned HOLD share (frac diagonal) decides what stays
+                # home; the env allows full evacuation and sampled training
+                # never had a reserve. OW_V3_TRUST_GARRISON=0 restores the
+                # compute_surplus guard (A/B arm — the greedy decode re-fires
+                # EVERY step, so an uncapped budget can evacuate continuously
+                # in a way the sampled contract never does). Legacy decodes
+                # always keep the guard.
+                per_source_budget[source_pid] = int(src.ships)
+            else:
+                per_source_budget[source_pid] = int(compute_surplus(
+                    src, enemy_fleets, defense_buffer,
+                ))
             per_source_total_ships[source_pid] = int(src.ships)
 
         moves: list[list] = []
@@ -637,7 +841,16 @@ class TransformerAgent:
             if budget < min_launch:
                 continue
             base_ships = per_source_total_ships.get(source_pid, 0)
-            desired = max(min_launch, int(round(frac * base_ships)))
+            if self.inference_mode in ("alloc_softmax", "topk_self"):
+                # Contract-faithful sizing: counts ARE share·ships (v2) or
+                # floor+extras (v3); cells whose allocation lands below
+                # min_launch are DROPPED, not floored up (tiny spillover
+                # should not be inflated into launches).
+                desired = int(round(frac * base_ships))
+                if desired < min_launch:
+                    continue
+            else:
+                desired = max(min_launch, int(round(frac * base_ships)))
             ships = min(budget, desired)
             if ships < min_launch:
                 continue

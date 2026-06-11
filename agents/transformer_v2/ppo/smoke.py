@@ -71,6 +71,7 @@ from .sampler import (
     MultiTargetAction,
     legality_masks,
     project_multi_target_to_env,
+    sample_bounded_k,
     sample_multi_target,
 )
 
@@ -367,7 +368,7 @@ def _forward_with_history(policy, planet_enc, fleet_enc, comet_enc, history, ste
 def _project_multi_target(
     action, *, source_mask, slot_to_pid, planets, min_launch,
 ):
-    """Per-cell projection of a bernoulli_select_multinomial_alloc_v1 action into
+    """Per-cell projection of a bernoulli_select_multinomial_alloc_v2 action into
     env moves. Each FIRED cell ``(s, t)`` (``action.select_mask[s, t]``) with
     ``alloc_counts[s, t] >= min_launch`` emits one launch of ``ships =
     alloc_counts[s, t]`` (the multinomial already routed N = source ships, so the
@@ -402,9 +403,45 @@ def _project_multi_target(
     return env_moves, n_invalid, n_emitted, invalid_reasons
 
 
+def _project_bounded_k(
+    action, *, source_mask, slot_to_pid, planets, min_launch,
+):
+    """Projection for ``bounded_k_select_multinomial_alloc_v3``: every fired
+    cell (``select_counts[s, t] >= 1``) emits ``min_launch + alloc_extras[s,
+    t]`` ships — the floor is guaranteed by the k-cap, so the only invalids
+    left are pad/no-planet slots."""
+    env_moves: list[list[float]] = []
+    n_invalid = 0
+    n_emitted = 0
+    invalid_reasons: list[str] = []
+    if not planets:
+        return env_moves, n_invalid, n_emitted, invalid_reasons
+    by_id = {int(p.id): p for p in planets}
+    P = action.alloc_extras.shape[0]
+    src_rows = source_mask.nonzero(as_tuple=False).flatten().tolist()
+    for s in src_rows:
+        fired_cols = (action.select_counts[s, :P] >= 1).nonzero(
+            as_tuple=False).flatten().tolist()
+        for t in fired_cols:
+            ships = int(min_launch) + int(action.alloc_extras[s, t].item())
+            src_pid = slot_to_pid[s]
+            tgt_pid = slot_to_pid[t]
+            if src_pid < 0 or tgt_pid < 0:
+                n_invalid += 1; invalid_reasons.append("pad_slot"); continue
+            src_planet = by_id.get(int(src_pid))
+            tgt_planet = by_id.get(int(tgt_pid))
+            if src_planet is None or tgt_planet is None:
+                n_invalid += 1; invalid_reasons.append("no_planet"); continue
+            angle = math.atan2(tgt_planet.y - src_planet.y, tgt_planet.x - src_planet.x)
+            env_moves.append([int(src_pid), float(angle), int(ships)])
+            n_emitted += 1
+    return env_moves, n_invalid, n_emitted, invalid_reasons
+
+
 def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
                    store, learner_slot, num_players, noop_logit_bias,
-                   select_logit_bias: float = 0.0):
+                   select_logit_bias: float = 0.0,
+                   contract: str = "v2", k_max: int = 4):
     """Legality masks -> sample -> project to env moves -> StepRecord. This is the
     post-forward logic shared by the single-env closure (see agent_fn) and the
     batched rollout (batched_rollout.py) so both produce IDENTICAL records.
@@ -444,16 +481,30 @@ def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
         planet_owner=planet_owner_rel, surplus=planet_surplus,
         planet_exists=planet_exists, min_launch=int(min_launch),
     )
-    action = sample_multi_target(
-        pair_logits, frac_loc, source_ships,
-        pair_mask=pair_mask, source_mask=source_mask,
-        select_logit_bias=select_logit_bias,
-    )
+    if contract == "v3":
+        # bounded_k v3: select_logit_bias doubles as the SELF-token bias
+        # (same sign convention — positive fires less).
+        action = sample_bounded_k(
+            pair_logits, frac_loc, source_ships,
+            pair_mask=pair_mask, source_mask=source_mask,
+            min_launch=int(min_launch), k_max=int(k_max),
+            self_logit_bias=select_logit_bias,
+        )
+        env_moves, n_invalid, n_emitted, invalid_reasons = _project_bounded_k(
+            action, source_mask=source_mask,
+            slot_to_pid=slot_to_pid, planets=planets, min_launch=int(min_launch),
+        )
+    else:
+        action = sample_multi_target(
+            pair_logits, frac_loc, source_ships,
+            pair_mask=pair_mask, source_mask=source_mask,
+            select_logit_bias=select_logit_bias,
+        )
 
-    env_moves, n_invalid, n_emitted, invalid_reasons = _project_multi_target(
-        action, source_mask=source_mask,
-        slot_to_pid=slot_to_pid, planets=planets, min_launch=int(min_launch),
-    )
+        env_moves, n_invalid, n_emitted, invalid_reasons = _project_multi_target(
+            action, source_mask=source_mask,
+            slot_to_pid=slot_to_pid, planets=planets, min_launch=int(min_launch),
+        )
 
     score_my = sum(p.ships for p in planets if int(p.owner) == learner_slot) if raw_planets else 0
     score_my += sum(f.ships for f in fleets if int(f.owner) == learner_slot) if raw_fleets else 0
@@ -703,7 +754,7 @@ def _make_learner_closure(
             min_launch=int(min_launch),
         )
 
-        # 5. Sample action (bernoulli_select_multinomial_alloc_v1).
+        # 5. Sample action (bernoulli_select_multinomial_alloc_v2).
         action = sample_multi_target(
             pair_logits, frac_loc, source_ships,
             pair_mask=pair_mask,
@@ -969,22 +1020,35 @@ def _pack_episode_for_ppo(ep: EpisodeBuffer) -> dict | None:
         ),
     }
 
-    return {
+    out = {
         "values": torch.tensor([s.value for s in steps], dtype=torch.float32),
         "rewards": torch.tensor([s.reward for s in steps], dtype=torch.float32),
         "dones": torch.tensor([s.done for s in steps], dtype=torch.float32),
         "feats": feats,
         "pair_mask": _stack("pair_mask"),
         "source_mask": _stack("source_mask"),
-        # bernoulli_select_multinomial_alloc_v1 action fields.
-        "select_mask": torch.stack([s.action.select_mask for s in steps]).cpu().bool(),
-        "alloc_counts": torch.stack([s.action.alloc_counts for s in steps]).cpu().long(),
-        "self_counts": torch.stack([s.action.self_counts for s in steps]).cpu().long(),
         "old_logp": torch.tensor(
             [float(s.action.logprob.item()) for s in steps],
             dtype=torch.float32,
         ),
     }
+    if hasattr(steps[0].action, "select_counts"):
+        # bounded_k_select_multinomial_alloc_v3 action fields.
+        out["select_counts"] = torch.stack(
+            [s.action.select_counts for s in steps]).cpu().long()
+        out["alloc_extras"] = torch.stack(
+            [s.action.alloc_extras for s in steps]).cpu().long()
+        out["self_extras"] = torch.stack(
+            [s.action.self_extras for s in steps]).cpu().long()
+    else:
+        # bernoulli_select_multinomial_alloc_v2 action fields.
+        out["select_mask"] = torch.stack(
+            [s.action.select_mask for s in steps]).cpu().bool()
+        out["alloc_counts"] = torch.stack(
+            [s.action.alloc_counts for s in steps]).cpu().long()
+        out["self_counts"] = torch.stack(
+            [s.action.self_counts for s in steps]).cpu().long()
+    return out
 
 
 def _cat_tensors(xs: list[torch.Tensor], *, device: str) -> torch.Tensor:
@@ -1031,9 +1095,15 @@ def _packed_episodes_to_ppo(
     }
     pair_mask = _cat_tensors([p["pair_mask"] for p in packed], device=device)
     source_mask = _cat_tensors([p["source_mask"] for p in packed], device=device)
-    select_mask = _cat_tensors([p["select_mask"] for p in packed], device=device)
-    alloc_counts = _cat_tensors([p["alloc_counts"] for p in packed], device=device)
-    self_counts = _cat_tensors([p["self_counts"] for p in packed], device=device)
+    is_v3 = "select_counts" in packed[0]
+    if is_v3:
+        select_counts = _cat_tensors([p["select_counts"] for p in packed], device=device)
+        alloc_extras = _cat_tensors([p["alloc_extras"] for p in packed], device=device)
+        self_extras = _cat_tensors([p["self_extras"] for p in packed], device=device)
+    else:
+        select_mask = _cat_tensors([p["select_mask"] for p in packed], device=device)
+        alloc_counts = _cat_tensors([p["alloc_counts"] for p in packed], device=device)
+        self_counts = _cat_tensors([p["self_counts"] for p in packed], device=device)
     old_logp = _cat_tensors([p["old_logp"] for p in packed], device=device)
 
     minibatches: list[PPOMinibatch] = []
@@ -1045,18 +1115,25 @@ def _packed_episodes_to_ppo(
                 else {kk: vv[idx] for kk, vv in v.items()})
             for k, v in feats.items()
         }
+        action_kw = (
+            dict(select_counts=select_counts[idx],
+                 alloc_extras=alloc_extras[idx],
+                 self_extras=self_extras[idx])
+            if is_v3 else
+            dict(select_mask=select_mask[idx],
+                 alloc_counts=alloc_counts[idx],
+                 self_counts=self_counts[idx])
+        )
         # The minibatch carries raw features; train-time _PPOWithL0 runs frozen L0.
         minibatches.append(PPOMinibatch(
             feats=feats_slice,
             pair_mask=pair_mask[idx],
             source_mask=source_mask[idx],
-            select_mask=select_mask[idx],
-            alloc_counts=alloc_counts[idx],
-            self_counts=self_counts[idx],
             old_logp=old_logp[idx],
             adv=adv[idx],
             returns=ret[idx],
             noop_logit_bias=0.0,
+            **action_kw,
         ))
     return ep_objs, minibatches
 

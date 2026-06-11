@@ -165,6 +165,11 @@ def _worker_play_one(
                 num_players=num_players,
                 noop_logit_bias=float(cfg.get("noop_logit_bias", 0.0)),
                 select_logit_bias=float(cfg.get("select_logit_bias", 0.0)),
+                # Per-seat contract: only the LEARNER samples the configured
+                # contract; opponent seats stay on the frozen baseline's v2.
+                contract=(str(cfg.get("contract", "v2"))
+                          if seat == learner_seat else "v2"),
+                k_max=int(cfg.get("select_k_max", 4)),
             )
             moves[seat] = env_moves
             if seat == learner_seat:
@@ -218,13 +223,33 @@ def _worker_play_one(
     return idx, buffer, stats
 
 
+def _iter_specs(specs):
+    """Yield indexed specs from a static list OR a shared work queue.
+
+    Work-stealing: when ``specs`` is a multiprocessing queue (pre-filled
+    before workers spawn), each worker pulls the next unstarted game as soon
+    as it finishes one — no static partition, so the rollout tail shrinks
+    from "last games at dwindling parallelism" to "longest single game".
+    """
+    if hasattr(specs, "get_nowait"):
+        while True:
+            try:
+                # Short timeout (not get_nowait): absorbs the mp feeder-thread
+                # latency right after spawn; a 1s wait at exhaustion is noise.
+                yield specs.get(timeout=1.0)
+            except queue.Empty:
+                return
+    else:
+        yield from specs
+
+
 def _cpu_worker(wid: int, specs, req_q, res_q, result_q, cfg):
     from kaggle_environments import make
 
     torch.set_num_threads(1)
     spool_dir = Path(cfg["spool_dir"])
     spool_dir.mkdir(parents=True, exist_ok=True)
-    for idx, (seed, num_players, learner_seat) in specs:
+    for idx, (seed, num_players, learner_seat) in _iter_specs(specs):
         try:
             idx, buffer, stats = _worker_play_one(
                 wid=wid,
@@ -326,6 +351,8 @@ def run_infserver_rollout(
     stall_timeout_s: float = 180.0,
     target_cap_k_max: int = 4,
     target_cap_lambda: float = 0.0,
+    contract: str = "v2",
+    select_k_max: int = 4,
     spool_dir: str | Path | None = None,
     on_progress: Callable[[dict], None] | None = None,
     on_episode_done: Callable[[int, Any], None] | None = None,
@@ -348,9 +375,13 @@ def run_infserver_rollout(
     spool_root.mkdir(parents=True, exist_ok=True)
 
     indexed_specs = list(enumerate(specs))
-    wspecs = [[] for _ in range(n_workers)]
-    for i, item in enumerate(indexed_specs):
-        wspecs[i % n_workers].append(item)
+    # Work-stealing queue: every worker pulls the next unstarted game when it
+    # frees up (vs the old static round-robin partition whose long tail ran
+    # the last games at dwindling parallelism). Filled BEFORE workers spawn,
+    # so get_nowait-empty unambiguously means "no work left".
+    task_q = ctx.Queue()
+    for item in indexed_specs:
+        task_q.put(item)
 
     cfg = {
         "max_planets": int(max_planets),
@@ -358,6 +389,10 @@ def run_infserver_rollout(
         "history_window": int(history_window),
         "noop_logit_bias": float(noop_logit_bias),
         "select_logit_bias": float(select_logit_bias),
+        # Learner's action contract; OPPONENT seats always decode v2 (the
+        # frozen baseline's native contract) regardless of this value.
+        "contract": str(contract),
+        "select_k_max": int(select_k_max),
         "progress_every": int(progress_every),
         "target_cap_k_max": int(target_cap_k_max),
         "target_cap_lambda": float(target_cap_lambda),
@@ -387,7 +422,7 @@ def run_infserver_rollout(
     for wid in range(n_workers):
         p = ctx.Process(
             target=_cpu_worker,
-            args=(wid, wspecs[wid], req_q, res_qs[wid], result_q, cfg),
+            args=(wid, task_q, req_q, res_qs[wid], result_q, cfg),
         )
         p.start()
         workers.append(p)

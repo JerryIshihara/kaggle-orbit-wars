@@ -1687,6 +1687,8 @@ def compute_multi_loss(
     ppo_frac_logit_weight: float = 0.0,
     single_target: bool = False,
     single_target_launch_weight: float = 1.0,
+    multinomial_alloc: bool = False,
+    alloc_weight: float = 1.0,
     enabled_heads: tuple[str, ...] | None = None,
     # Accepted-but-ignored knobs from the legacy aux-head API. Kept so the
     # train CLI + Colab notebook can still pass them as no-ops while older
@@ -1714,6 +1716,17 @@ def compute_multi_loss(
         This reduces the pretrain→PPO distribution shift while preserving
         the original whole-grid BCE used by greedy threshold inference.
 
+    ``multinomial_alloc=True`` selects the
+    ``bernoulli_select_multinomial_alloc_v2`` contract instead: stage 1
+    keeps the whole-grid select BCE unchanged, but the ``pair_frac``
+    objective becomes the stage-2 allocation-multinomial CE
+    (``alloc_labels.alloc_multinomial_ce``), which supervises ``frac_loc``
+    and its diagonal HOLD logit ``frac_loc[s, s]`` jointly in the exact
+    softmax PPO samples from (weighted by ``alloc_weight``). The legacy
+    source-categorical PPO-alignment terms (3/4 below) are SKIPPED — they
+    align a contract PPO no longer uses, and the absolute-fraction MSE they
+    preserve is superseded by the share-softmax objective.
+
     Returns ``(total_loss, per_head_dict)`` where ``per_head_dict``
     maps head name → unweighted scalar loss (for logging). The total
     sums both head losses (with ``pair_pos_weight`` applied to the
@@ -1722,6 +1735,11 @@ def compute_multi_loss(
     """
     if enabled_heads is None:
         enabled_heads = _HEAD_NAMES
+    if single_target and multinomial_alloc:
+        raise ValueError(
+            "single_target and multinomial_alloc are mutually exclusive "
+            "action contracts",
+        )
 
     per_head: dict[str, float] = {}
     total = torch.zeros((), device=preds["pair_logits"].device,
@@ -1770,9 +1788,25 @@ def compute_multi_loss(
         per_head["pair_logits"] = float(loss_pair.detach())
         total = total + loss_pair
 
-    # 2) pair_frac — masked MSE-on-sigmoid vs fraction-of-source ships.
+    # 2) pair_frac — contract-dependent.
+    #    multinomial_alloc: stage-2 allocation CE over
+    #    softmax([frac_loc[s, F_s], frac_loc[s, s]]) — the only loss term
+    #    that reaches the never-otherwise-supervised HOLD diagonal (v2: the
+    #    frac head's own diagonal; the select head is untouched by it).
+    #    default: masked MSE-on-sigmoid vs fraction-of-source ships.
     # Skip gracefully when pair_ships is missing (older caches).
-    if "pair_frac" in enabled_heads and "pair_ships" in batch:
+    if multinomial_alloc and "pair_frac" in enabled_heads and "pair_ships" in batch:
+        from .alloc_labels import alloc_multinomial_ce
+
+        loss_alloc, alloc_diag = alloc_multinomial_ce(
+            preds["pair_frac"], batch,
+        )
+        per_head["pair_frac"] = alloc_diag["alloc_ce"]
+        per_head["hold_share_pred"] = alloc_diag["hold_share_pred"]
+        per_head["hold_share_label"] = alloc_diag["hold_share_label"]
+        per_head["hold_mae"] = alloc_diag["hold_mae"]
+        total = total + float(alloc_weight) * loss_alloc
+    elif "pair_frac" in enabled_heads and "pair_ships" in batch:
         ships = batch["pair_ships"].float()              # (B, P, P)
         target_frac = _pair_frac_targets_from_batch(batch, ships)
         pos_mask = (pair_labels & pair_valid).to(pair_logits.dtype)
@@ -1789,7 +1823,11 @@ def compute_multi_loss(
     # threshold inference but not for PPO's source-categorical action
     # contract. Add a source CE + chosen-row target BCE over learner-owned
     # source rows so a pretrained actor has calibrated PPO logits on step 1.
-    if (ppo_source_weight > 0.0 or ppo_target_weight > 0.0) and "pair_logits" in enabled_heads:
+    if (
+        not multinomial_alloc
+        and (ppo_source_weight > 0.0 or ppo_target_weight > 0.0)
+        and "pair_logits" in enabled_heads
+    ):
         from agents.transformer_v2.ppo.loss import factorized_bc
 
         source_mask = _ppo_source_mask_from_batch(batch, pair_valid)
@@ -1811,7 +1849,8 @@ def compute_multi_loss(
     # greedy inference still consumes pair_frac as an absolute fraction of
     # source ships, while PPO consumes it as a normalized allocation weight.
     if (
-        ppo_frac_logit_weight > 0.0
+        not multinomial_alloc
+        and ppo_frac_logit_weight > 0.0
         and "pair_frac" in enabled_heads
         and "pair_ships" in batch
     ):

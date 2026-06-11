@@ -9,11 +9,12 @@ Phase 0 minimal-actor implementation matching the design captured in
     0 to valid opponent slots, using post-L2 ``PlayerConsolidator`` state plus
     L2 ``glob``. If the actor ckpt has no consolidator, the old L2 ``glob``
     value_head is an explicit debug fallback.
-  * action contract = ``bernoulli_select_multinomial_alloc_v1`` (per owned
+  * action contract = ``bernoulli_select_multinomial_alloc_v2`` (per owned
     source row: a per-cell Bernoulli selection over legal targets, then ONE
     Multinomial over the fired targets + a ``self`` HOLD category that routes
-    the source's ships; reuses ``frac_loc`` + the diagonal ``pair_logits[s,s]``
-    so NO new params — a single-target ckpt loads via ``strict=False`` at 0/0).
+    the source's ships; v2 — every alloc logit incl. the HOLD diagonal lives in
+    ``frac_loc`` (v1 borrowed ``pair_logits[s,s]``), still NO new params — any
+    prior ckpt loads via ``strict=False`` at 0/0).
     The ``single_target_per_source_v1`` sampler/loss helpers are retained for
     reference + the (currently-off) BC anchor.
   * BC anchor = single-target CE (matches the supervised pretrain labeling;

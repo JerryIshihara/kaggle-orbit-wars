@@ -87,6 +87,10 @@ done
 touch "$STAGE_CODE/scripts/__init__.py"
 cp "$REPO_ROOT/scripts/build_pair_dataset_orbital_occle.py" \
    "$STAGE_CODE/scripts/build_pair_dataset_orbital_occle.py"
+# Pretrain-label inspector (the multitarget-alloc notebook's review cell does
+# ``!python -u scripts/show_multi_target_labels.py``).
+cp "$REPO_ROOT/scripts/show_multi_target_labels.py" \
+   "$STAGE_CODE/scripts/show_multi_target_labels.py"
 
 tar -C "$STAGE_CODE" -czf "$OUT_DIR/code.tgz" .
 echo "  code.tgz: $(du -h "$OUT_DIR/code.tgz" | cut -f1)"

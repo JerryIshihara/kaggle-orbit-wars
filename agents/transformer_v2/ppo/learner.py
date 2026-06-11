@@ -118,6 +118,9 @@ def _move_ppo_minibatch(mb: PPOMinibatch, device: torch.device) -> PPOMinibatch:
         select_mask=_mv(mb.select_mask),
         alloc_counts=_mv(mb.alloc_counts),
         self_counts=_mv(mb.self_counts),
+        select_counts=_mv(mb.select_counts),
+        alloc_extras=_mv(mb.alloc_extras),
+        self_extras=_mv(mb.self_extras),
         noop_logit_bias=mb.noop_logit_bias,
     )
 
@@ -172,6 +175,7 @@ def ppo_update_local(
     for epoch in range(cfg.epochs):
         running_kl = 0.0
         n_mb = 0
+        in_epoch_stop = False
         epoch_logs: dict[str, list[float]] = {}
         for mb_cpu in ppo_minibatches:
             mb = _move_ppo_minibatch(mb_cpu, device)
@@ -203,6 +207,17 @@ def ppo_update_local(
                 epoch_logs.setdefault(k, []).append(v)
             running_kl += diag["approx_kl"]
             n_mb += 1
+            # IN-EPOCH KL brake. With games=64 an epoch is 100+ minibatches;
+            # the between-epoch check below would let the policy run
+            # arbitrarily far past target inside epoch 0 (each minibatch takes
+            # a gradient step). Brake once the running average clears the same
+            # early-stop threshold (short warmup so one noisy minibatch can't
+            # kill the epoch), or immediately on a detonating minibatch.
+            _kl_thresh = cfg.early_stop_kl_factor * cfg.target_kl
+            if ((n_mb >= 4 and running_kl / n_mb > _kl_thresh)
+                    or diag["approx_kl"] > 4.0 * _kl_thresh):
+                in_epoch_stop = True
+                break
 
         avg_kl = running_kl / max(1, n_mb)
         epoch_metrics.append({
@@ -211,6 +226,10 @@ def ppo_update_local(
             "avg_kl": avg_kl,
             **{k: sum(v) / len(v) for k, v in epoch_logs.items() if v},
         })
+        if in_epoch_stop:
+            epoch_metrics[-1]["early_stopped"] = True
+            epoch_metrics[-1]["in_epoch_stopped_at_mb"] = float(n_mb)
+            break
         if avg_kl > cfg.early_stop_kl_factor * cfg.target_kl:
             epoch_metrics[-1]["early_stopped"] = True
             break

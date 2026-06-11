@@ -92,7 +92,7 @@ class _Seat:
 
 def _batched_act(seats, envs, active, policy, planet_enc, fleet_enc, comet_enc,
                  *, max_planets, max_fleets, noop_logit_bias, device,
-                 select_logit_bias=0.0):
+                 select_logit_bias=0.0, contract="v2", k_max=4):
     """Featurize every ACTIVE seat, run ONE batched forward, then per-seat
     sample/project/record. Writes ``seat.moves`` for each acting seat."""
     items = []   # (seat, obs, pid_to_idx, store)
@@ -132,6 +132,7 @@ def _batched_act(seats, envs, active, policy, planet_enc, fleet_enc, comet_enc,
             learner_slot=seat.seat, num_players=seat.num_players,
             noop_logit_bias=noop_logit_bias,
             select_logit_bias=select_logit_bias,
+            contract=contract, k_max=k_max,
         )
         seat.moves = moves
         if seat.records and seat.buffer is not None:
@@ -176,6 +177,8 @@ def run_batched_episodes(
     target_cap_lambda: float = 0.0,
     history_window: int = 1,
     max_steps: int = 1200,
+    contract: str = "v2",        # learner's contract; opponent seats stay v2
+    select_k_max: int = 4,
     on_step=None,                # optional callback(step, n_active) for progress
 ) -> list[EpisodeBuffer]:
     """Run ``len(specs)`` orbit_wars games in lockstep, batching the forward.
@@ -212,13 +215,22 @@ def run_batched_episodes(
         if not any(active):
             break
         if opponent_policy is policy:
+            # True self-play: one policy, all seats — both sides sample the
+            # learner's contract (consistent v3-vs-v3 when contract="v3").
             _batched_act(
                 learner_seats + opp_seats,
                 envs, active, policy, planet_enc, fleet_enc, comet_enc, **kw,
+                contract=contract, k_max=select_k_max,
             )
         else:
-            _batched_act(learner_seats, envs, active, policy, planet_enc, fleet_enc, comet_enc, **kw)
-            _batched_act(opp_seats, envs, active, opponent_policy, planet_enc, fleet_enc, comet_enc, **kw)
+            # Fixed opponent: learner samples its contract; the opponent stays
+            # on v2 (the frozen baseline's native contract).
+            _batched_act(learner_seats, envs, active, policy, planet_enc,
+                         fleet_enc, comet_enc, **kw,
+                         contract=contract, k_max=select_k_max)
+            _batched_act(opp_seats, envs, active, opponent_policy, planet_enc,
+                         fleet_enc, comet_enc, **kw,
+                         contract="v2", k_max=select_k_max)
         for ei, env in enumerate(envs):
             if not active[ei]:
                 continue

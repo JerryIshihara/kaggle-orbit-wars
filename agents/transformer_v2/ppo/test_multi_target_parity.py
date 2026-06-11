@@ -1,4 +1,4 @@
-"""Logprob PARITY TEST for ``bernoulli_select_multinomial_alloc_v1``.
+"""Logprob PARITY TEST for ``bernoulli_select_multinomial_alloc_v2``.
 
 This is the correctness gate for the PPO action-contract migration: a prior
 contract mismatch caused PPO divergence, so the stored-vs-recomputed logprob
@@ -361,9 +361,56 @@ def test_ppo_minibatch_loss_smoke() -> None:
         _run_minibatch_smoke(select_logit_bias)
 
 
+def test_bounded_k_v3_parity() -> None:
+    """bounded_k_select_multinomial_alloc_v3: stored logprob == recomputed
+    (coefficient-free sum counts*log p both sides), n_terms matched,
+    floor feasibility + exact ship-budget conservation on acting rows."""
+    import torch as _t
+    from .sampler import sample_bounded_k, legality_masks as _lm
+    from .loss import action_logprob_bounded_k
+
+    P, m = 8, 5
+    worst = 0.0
+    for case in range(40):
+        g = _t.Generator().manual_seed(case)
+        pair_logits = _t.randn(P, P, generator=g)
+        frac_loc = _t.randn(P, P, generator=g)
+        owner = _t.randint(0, 3, (P,), generator=g)
+        surplus = _t.randint(0, 60, (P,)).float()
+        exists = _t.rand(P, generator=g) > 0.15
+        pm, sm = _lm(owner, surplus, exists, min_launch=m)
+        ships = (surplus + _t.randint(0, 40, (P,)).float()).long()
+        for bias in (0.0, 1.0):
+            act = sample_bounded_k(
+                pair_logits, frac_loc, ships, pair_mask=pm, source_mask=sm,
+                min_launch=m, k_max=4, self_logit_bias=bias)
+
+            class _MB:  # minimal act-carrier
+                pass
+            mb = _MB()
+            mb.select_counts = act.select_counts.unsqueeze(0)
+            mb.alloc_extras = act.alloc_extras.unsqueeze(0)
+            mb.self_extras = act.self_extras.unsqueeze(0)
+            logp, n_terms = action_logprob_bounded_k(
+                pair_logits.unsqueeze(0), frac_loc.unsqueeze(0),
+                pair_mask=pm.unsqueeze(0), source_mask=sm.unsqueeze(0),
+                act=mb, self_logit_bias=bias)
+            worst = max(worst, abs(float(logp[0]) - float(act.logprob)))
+            assert abs(float(n_terms[0]) - max(1, act.n_terms)) == 0
+            fired = act.select_counts[:, :P] >= 1
+            assert (m + act.alloc_extras[fired] >= m).all()
+            spent = m * fired.sum(1) + act.alloc_extras.sum(1) + act.self_extras
+            has_f = fired.any(1)
+            assert (spent[has_f] == ships[has_f]).all()
+    assert worst < 1e-4, worst
+    print(f"  [ok] bounded_k v3 parity over 80 cases — max |dlogp| = {worst:.3e}")
+
+
+
 if __name__ == "__main__":
     test_parity_and_feasibility()
     test_ppo_minibatch_loss_smoke()
+    test_bounded_k_v3_parity()
     print("MULTI-TARGET PARITY PASSED — "
           "stored logprob == recomputed logprob (< 1e-4); "
-          "feasibility holds; ppo_minibatch_loss finite")
+          "feasibility holds; ppo_minibatch_loss finite; v3 bounded-k exact")
