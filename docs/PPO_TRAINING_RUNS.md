@@ -375,3 +375,33 @@ live_post_packed); in-epoch KL brake first fired at update 7 (kept 0.055).
 Surplus A/B under expmatch decode (5-update ckpt, same 20 games): capped
 11/20 = 55% vs lifted 8/20 = 40% -> guard stays the deploy default
 (OW_V3_TRUST_GARRISON=0); re-test the lift at later gates.
+
+## 2026-06-12 — graft + env 1.30.1 break the deploy plateau (62.5%)
+
+Deploy policy pivoted to SAMPLED decode + surplus lifted (OW_V3_DECODE=sample,
+OW_V3_TRUST_GARRISON=1) as the production default — "the bar shouldn't be
+picked manually": deploy draws from the trained contract exactly as training
+does, no threshold, no guard. Lineage gates under that arm (16 seeds x both
+seats vs frozen deployed baseline): 25.0% (5up) -> 31.2 (12up) -> 34.4 (19up)
+-> 25.0 (24up) -> 25.0 (31up) — a hard plateau, seat-0 collapsing to 1-3/16
+while SAMPLED-form winrate vs the same ckpt sat at 60-93% (opponent-form
+mismatch, the diagnosed binding constraint).
+
+Two interventions, then the break:
+1. ALLOC GRAFT (user-approved): copied pair_frac_head tensors from
+   joint_mt_alloc joint_best into the PPO ckpt. hold 0.46-0.48 -> 0.02-0.06,
+   alloc top1 0.86-0.95, emits -25% (fewer, bigger fleets).
+2. kaggle_environments 1.28.1 -> 1.30.1 (swept_pair_hit continuous collisions,
+   new map gen, native seeding). Run restarted from the grafted ckpt as
+   ppo_beatbase_v3topk_p48_f512_lr75env130_20260611-181540. First update ate
+   one detonating minibatch (kl 0.264, in-epoch brake at mb=1); KL settled to
+   0.024-0.035 by iters 1-4. ALLOC hold oscillates 0.02-0.14 (no monotone
+   re-softening of the graft). inval=0 throughout.
+
+GATE at v0005 (5 updates post-graft under 1.30.1, sampled+lifted, 16 seeds x
+both seats): seat0 8/16 = 50.0%, seat1 12/16 = 75.0%, OVERALL 20/32 = 62.5%
+— first above-baseline deploy gate of the lineage, and the seat-0 collapse is
+gone. Attribution is graft-dominant (decisive allocation survives the deploy
+form); env shift affects both seats symmetrically. Next reads: gate again at
+~v0010-v0012 to separate PPO progress from graft step-change; 20/20 still the
+target.
