@@ -256,6 +256,12 @@ class TransformerAgent:
             elif contract == "bounded_k_select_multinomial_alloc_v3":
                 # v3: self logit = learned firing threshold; floor + extras.
                 inference_mode = "topk_self"
+            elif contract == "bounded_k_select_dirichlet_alloc_v4":
+                # v4: same bounded-k select; alloc mean = the SAME frac
+                # softmax (Dirichlet only changes the sampled spread), so
+                # every topk_self decode arm applies unchanged. Deterministic
+                # deploy = OW_V3_DECODE=expmatch (mean-share sizing).
+                inference_mode = "topk_self"
             else:
                 inference_mode = "threshold"
             print(f"[runner] inference_mode auto-selected: {inference_mode!r} "
@@ -322,17 +328,38 @@ class TransformerAgent:
             device=device,
         )
 
-        model = EntityPretrainModel(
-            d_model=d_model, n_steps=n_steps, d_pair=d_pair,
-            entity_n_heads=entity_n_heads,
-            cross_n_heads=cross_n_heads,
-            cross_n_layers=cross_n_layers,
-            dual_n_heads=dual_n_heads,
-            conditioner_n_layers=conditioner_n_layers,
-            head_n_layers=head_n_layers,
-            skip_l34=skip_l34,
-            with_consolidator=with_consolidator,
-        )
+        arch = str(cfg.get("arch", "v2"))
+        if arch == "dual_rate_l2_v3":
+            # transformer_v3 dual-rate L2 (v3.1 player tokens, no
+            # consolidator). Single-frame inference works natively: both
+            # branches see the frame as T=1 and the zero-/trained fusion
+            # applies — smoke-proven parity in transformer_v3.
+            from ..transformer_v3.model import EntityPretrainModelV3
+            model = EntityPretrainModelV3(
+                d_model=d_model, d_pair=d_pair,
+                entity_n_heads=entity_n_heads,
+                cross_n_heads=cross_n_heads,
+                cross_n_layers=cross_n_layers,
+                dual_n_heads=dual_n_heads,
+                conditioner_n_layers=conditioner_n_layers,
+                head_n_layers=head_n_layers,
+                skip_l34=skip_l34,
+                with_consolidator=False, with_value_heads=False,
+                with_short_aux=bool(cfg.get("with_short_aux", False)),
+                with_alloc_conc=bool(cfg.get("with_alloc_conc", False)),
+            )
+        else:
+            model = EntityPretrainModel(
+                d_model=d_model, n_steps=n_steps, d_pair=d_pair,
+                entity_n_heads=entity_n_heads,
+                cross_n_heads=cross_n_heads,
+                cross_n_layers=cross_n_layers,
+                dual_n_heads=dual_n_heads,
+                conditioner_n_layers=conditioner_n_layers,
+                head_n_layers=head_n_layers,
+                skip_l34=skip_l34,
+                with_consolidator=with_consolidator,
+            )
         # ``strict=False`` so legacy 5-head ckpts (with ``source_act_head`` /
         # ``target_aim_head`` / ``glob_act_head`` keys and no ``film_proj`` /
         # ``film_alpha`` keys) still load. The unexpected legacy aux-head
@@ -458,13 +485,33 @@ class TransformerAgent:
             "fleet_eta_norm": batch["fleet_eta_norm"],
             "fleet_mask": batch["fleet_mask"],
         }
-        preds = self.model(
-            entity_self, fleet_tok, routing, batch["planet_mask"],
-            is_comet=is_comet,
-            pair_type_ids=build_pair_type_ids(
-                batch["planet_features"], batch["planet_mask"],
-            ),
-        )
+        if getattr(self.model, "ARCH", "") == "dual_rate_l2_v3":
+            # v3.1: the trained owner projection must participate at
+            # inference (it's zero-init only at the START of training) —
+            # route through forward_with_context, which threads the
+            # learner-relative owner one-hot into the dual L2. Returns the
+            # same pair_logits / pair_frac keys.
+            from .pretrain.entity_encoder import (
+                ENTITY_N_OWNER_CLASSES as _N_OWN,
+                _PLANET_OWNER_START_IDX as _OWN0,
+            )
+            preds = self.model.forward_with_context(
+                entity_self, fleet_tok, routing, batch["planet_mask"],
+                is_comet=is_comet,
+                pair_type_ids=build_pair_type_ids(
+                    batch["planet_features"], batch["planet_mask"],
+                ),
+                planet_owner_oh=batch["planet_features"][
+                    ..., _OWN0:_OWN0 + _N_OWN],
+            )
+        else:
+            preds = self.model(
+                entity_self, fleet_tok, routing, batch["planet_mask"],
+                is_comet=is_comet,
+                pair_type_ids=build_pair_type_ids(
+                    batch["planet_features"], batch["planet_mask"],
+                ),
+            )
 
         pair_logits = preds["pair_logits"].squeeze(0)               # (P, P)
         pair_frac_raw = preds["pair_frac"].squeeze(0)               # (P, P) raw logit
