@@ -1015,6 +1015,13 @@ def main() -> int:
                         "v2-arch frozen baselines; v4 when the opponent is a v4 "
                         "ckpt (mirror training) - a T18 learner shares per-seat "
                         "histories, so the opponent must be T18-compatible.")
+    p.add_argument("--ent-target", type=float, default=None,
+                   help="adaptive entropy: per-component entropy floor target "
+                        "(e.g. -2.0). Each iter ent-coef <- ent-coef * "
+                        "exp(rate*tanh((target-H)/2)) clamped to "
+                        "[1e-4, 0.05]. None = fixed ent-coef.")
+    p.add_argument("--ent-adapt-rate", type=float, default=0.3,
+                   help="adaptive entropy controller step (multiplicative).")
     p.add_argument("--lr-conc", type=float, default=5e-6,
                help="v4 alpha0 conc-head lr (own AdamW group; the slow group "
                     "IS the saturation guard - sharing lr_heads detonated in "
@@ -1770,6 +1777,21 @@ def main() -> int:
             bc_minibatch_source=(lambda _n: None), cfg=cfg_ppo)
         ems = metrics.get("epoch_metrics", [])
         last = ems[-1] if ems else {}
+        if args.ent_target is not None and ems:
+            # Adaptive entropy controller (SAC-flavored, multiplicative):
+            # below-target entropy (over-concentrated) RAISES the bonus,
+            # above-target lowers it. tanh bounds one step; clamps bound the
+            # coefficient. Fixed 0.005 measurably only DELAYED the v4
+            # concentration spiral (run2 dove by iter 6, run3 by iter ~12).
+            import math as _m
+            h_meas = float(last.get("entropy", float("nan")))
+            if _m.isfinite(h_meas):
+                step = _m.exp(args.ent_adapt_rate
+                              * _m.tanh((args.ent_target - h_meas) / 2.0))
+                cfg_ppo.ent_coef = float(
+                    min(0.05, max(1e-4, cfg_ppo.ent_coef * step)))
+                _log(f"ent-adapt: H={h_meas:.2f} target={args.ent_target:.2f} "
+                     f"-> ent_coef={cfg_ppo.ent_coef:.5f}")
         early = any(em.get("early_stopped") for em in ems)
         for em in ems:
             _log(
