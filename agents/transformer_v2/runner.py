@@ -344,7 +344,11 @@ class TransformerAgent:
                 conditioner_n_layers=conditioner_n_layers,
                 head_n_layers=head_n_layers,
                 skip_l34=skip_l34,
-                with_consolidator=False, with_value_heads=False,
+                # with_consolidator=True only satisfies the base ctor's
+                # value-heads check — EntityPretrainModelV3 nulls the
+                # consolidator immediately after (v3.1 removed it).
+                with_consolidator=True,
+                with_value_heads=bool(cfg.get("with_value_heads", False)),
                 with_short_aux=bool(cfg.get("with_short_aux", False)),
                 with_alloc_conc=bool(cfg.get("with_alloc_conc", False)),
             )
