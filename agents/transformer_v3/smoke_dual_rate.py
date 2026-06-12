@@ -84,11 +84,18 @@ def main() -> None:
     # ---- 1. warm-start mapping --------------------------------------
     adapted = adapt_v2_state_dict(v2.state_dict())
     res = v3.load_state_dict(adapted, strict=False)
-    missing = sorted(res.missing_keys)
-    assert missing == [
+    fuse_missing = sorted(
+        k for k in res.missing_keys if k.startswith("cross.fuse_")
+    )
+    other_missing = sorted(
+        k for k in res.missing_keys
+        if not k.startswith(("cross.fuse_", "short_heads."))
+    )
+    assert fuse_missing == [
         "cross.fuse_glob.bias", "cross.fuse_glob.weight",
         "cross.fuse_tokens.bias", "cross.fuse_tokens.weight",
-    ], f"unexpected missing set: {missing}"
+    ], f"unexpected fusion missing set: {fuse_missing}"
+    assert not other_missing, f"non-fusion/non-aux missing: {other_missing}"
     assert not res.unexpected_keys, res.unexpected_keys
     se_v2 = v2.cross.step_embed
     se_s = v3.cross.short.step_embed
@@ -173,6 +180,37 @@ def main() -> None:
     assert g_short_params2 > 0, "short branch must receive grad after 1 fusion step"
     print(f"[3] grad gate OK after one fusion step (short branch |g|="
           f"{g_short_params2:.4f} > 0 — branch fades in)")
+
+    # ---- 3b. short-horizon aux: trains the branch THROUGH the gate ---
+    from .short_horizon import N_OWNER, N_PLAYER_SLOTS, short_horizon_loss
+
+    g = torch.Generator().manual_seed(7)
+    aux_batch = {
+        "planet_mask": pm,
+        "owner_t_plus_5": torch.randint(0, N_OWNER, (B, P), generator=g),
+        "log_ships_t_plus_5": torch.rand(B, P, generator=g),
+        "valid_t_plus_5": torch.ones(B, P),
+        "ships_arriving_within_5": torch.rand(B, P, N_PLAYER_SLOTS, generator=g),
+        "earliest_arrival_owner_slot": torch.randint(0, N_OWNER, (B, P), generator=g),
+    }
+    v3.zero_grad()
+    _ = _fwd(v3, pt, ft, routing, pm, ic, pti, oh)        # populate stash
+    aux_loss, aux_terms = v3.short_aux_loss(aux_batch)
+    aux_loss.backward()
+    g_short_aux = sum(
+        p.grad.abs().sum().item()
+        for p in v3.cross.short.parameters() if p.grad is not None
+    )
+    g_long_aux = sum(
+        p.grad.abs().sum().item()
+        for p in v3.cross.long.parameters() if p.grad is not None
+    )
+    assert g_short_aux > 0, "aux loss must reach the short branch at init"
+    assert g_long_aux == 0.0, "aux loss must NOT touch the long branch"
+    assert {"owner_t5", "ships_t5", "arrivals5", "earliest"} <= set(aux_terms)
+    print(f"[3b] short-horizon aux OK (|g| short={g_short_aux:.4f} > 0 at "
+          f"zero-init fusion — gate bypassed; long untouched; terms: "
+          f"{ {k: round(v, 3) for k, v in aux_terms.items()} })")
 
     # ---- 4. freeze semantics ----------------------------------------
     report = v3.freeze_below_l2()

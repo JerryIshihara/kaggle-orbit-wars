@@ -93,6 +93,7 @@ def joint_train_step(
     multinomial_alloc: bool = False,
     pair_pos_weight: float = 600.0,
     alloc_weight: float = 1.0,
+    short_aux_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Combined action + value loss over the shared L2.
 
@@ -135,6 +136,18 @@ def joint_train_step(
         total = act_loss if total is None else total + act_loss
         for k, v in act_terms.items():
             per_head[f"act/{k}"] = v
+        # Short-branch aux (transformer_v3): MUST run before the value
+        # forward below — it reads the dual-L2's pre-fusion stash from
+        # the action forward, which the next forward overwrites.
+        if (
+            short_aux_weight > 0
+            and getattr(model, "short_heads", None) is not None
+            and "owner_t_plus_5" in action_batch
+        ):
+            aux_loss, aux_terms = model.short_aux_loss(action_batch)
+            total = total + short_aux_weight * aux_loss
+            for k, v in aux_terms.items():
+                per_head[f"sh5/{k}"] = v
 
     if value_batch is not None:
         val_out = _forward_context_from_batch(
@@ -306,6 +319,10 @@ def train_joint(
     model_cls: type | None = None,
     history_offsets: tuple[int, ...] | None = None,
     warm_start_adapter=None,
+    # weight on the v3 short-branch aux tasks (t+5 owner/ships/arrivals/
+    # earliest-arrival CE+Huber off the pre-fusion SHORT tokens). Inert
+    # unless the model exposes ``short_heads`` (i.e. --arch v3).
+    short_aux_weight: float = 0.0,
 ) -> Path:
     """Joint action+value pretrain loop with L2+ unfreeze + verbose per-head logs.
 
@@ -507,6 +524,8 @@ def train_joint(
     # stamps arch + union/long/short offset tuples) — lets the runner and
     # PPO loaders reconstruct non-default architectures from the ckpt.
     config.update(getattr(model, "config_extra", {}) or {})
+    if short_aux_weight:
+        config["short_aux_weight"] = short_aux_weight
     print(f"[joint] action_contract={config['action_contract']}  "
           f"max_planets={config['max_planets']} max_fleets={config['max_fleets']} "
           f"(from pair cache)", flush=True)
@@ -529,6 +548,7 @@ def train_joint(
                 multinomial_alloc=multinomial_alloc,
                 pair_pos_weight=pair_pos_weight,
                 alloc_weight=alloc_weight,
+                short_aux_weight=short_aux_weight,
             )
             opt.zero_grad()
             total_loss.backward()
@@ -649,6 +669,12 @@ def main() -> None:
                         "short T=10@2 branches, zero-init fusion); both "
                         "caches are restacked to the 18-frame union and a "
                         "v2 --warm-start is key-mapped onto both branches")
+    p.add_argument("--short-aux-weight", type=float, default=0.5,
+                   help="weight on the v3 short-branch t+5 forecast aux "
+                        "tasks (owner/ships/arrivals/earliest CE+Huber on "
+                        "the pre-fusion SHORT tokens — trains the branch "
+                        "past the zero-init fusion gate). Only active with "
+                        "--arch v3; ignored for v2.")
     args = p.parse_args()
 
     arch_kwargs: dict[str, Any] = {}
@@ -662,6 +688,7 @@ def main() -> None:
             model_cls=EntityPretrainModelV3,
             history_offsets=UNION_HISTORY_OFFSETS,
             warm_start_adapter=adapt_v2_state_dict,
+            short_aux_weight=args.short_aux_weight,
         )
 
     train_joint(

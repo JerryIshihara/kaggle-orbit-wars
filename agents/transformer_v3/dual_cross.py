@@ -78,6 +78,13 @@ class DualRateCrossEntity(nn.Module):
         # trips trivially and index_select accepts lists).
         self._long_idx = list(LONG_SLOT_IDX)
         self._short_idx = list(SHORT_SLOT_IDX)
+        # PRE-FUSION current-step branch tokens, stashed each forward
+        # (graph-attached). The short-horizon aux heads read these to
+        # supervise the short branch past the zero-init fusion gate.
+        # Consumers must read them between THEIR forward and the next
+        # one (each forward overwrites).
+        self.last_ctx_long_now: torch.Tensor | None = None
+        self.last_ctx_short_now: torch.Tensor | None = None
 
     def forward(
         self,
@@ -89,6 +96,7 @@ class DualRateCrossEntity(nn.Module):
             # (step_embed[-1:]), fusion picks long-at-init.
             ctx_l, glob_l = self.long(entity_tokens, entity_mask)
             ctx_s, glob_s = self.short(entity_tokens, entity_mask)
+            self.last_ctx_long_now, self.last_ctx_short_now = ctx_l, ctx_s
             ctx = self.fuse_tokens(torch.cat([ctx_l, ctx_s], dim=-1))
             glob = self.fuse_glob(torch.cat([glob_l, glob_s], dim=-1))
             return ctx, glob
@@ -108,6 +116,8 @@ class DualRateCrossEntity(nn.Module):
             entity_tokens[:, self._short_idx], entity_mask[:, self._short_idx],
         )
         # Current step of each branch (both branch windows end at offset 0).
+        self.last_ctx_long_now = ctx_l_full[:, -1]
+        self.last_ctx_short_now = ctx_s_full[:, -1]
         ctx = self.fuse_tokens(
             torch.cat([ctx_l_full[:, -1], ctx_s_full[:, -1]], dim=-1)
         )

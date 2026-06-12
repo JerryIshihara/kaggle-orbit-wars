@@ -39,7 +39,14 @@ from .history import (
 class EntityPretrainModelV3(EntityPretrainModel):
     ARCH = "dual_rate_l2_v3"
 
-    def __init__(self, d_model: int = 256, *, n_steps: int | None = None, **kw):
+    def __init__(
+        self,
+        d_model: int = 256,
+        *,
+        n_steps: int | None = None,
+        with_short_aux: bool = True,
+        **kw,
+    ):
         if n_steps is not None and int(n_steps) != N_UNION:
             print(
                 f"[v3] n_steps={n_steps} ignored — dual-rate L2 fixes the "
@@ -57,6 +64,36 @@ class EntityPretrainModelV3(EntityPretrainModel):
             ff_mult=kw.get("cross_ff_mult", 2),
             dropout=kw.get("dropout", 0.0),
         )
+        # Short-horizon aux heads: direct supervision for the SHORT
+        # branch (bypasses the zero-init fusion gate, which blocks main-
+        # loss gradient to the branch until fusion weights move). Train-
+        # time only; deploy/PPO never call them (small dead params).
+        self.with_short_aux = bool(with_short_aux)
+        if self.with_short_aux:
+            from .short_horizon import ShortHorizonHeads
+            self.short_heads = ShortHorizonHeads(
+                d_model, dropout=kw.get("dropout", 0.0),
+            )
+        else:
+            self.short_heads = None
+
+    def short_aux_loss(
+        self, batch: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Short-branch aux loss for the batch JUST forwarded.
+
+        Must be called between this model's forward on ``batch`` and any
+        other forward — it reads the pre-fusion branch stash, which every
+        forward overwrites.
+        """
+        from .short_horizon import short_horizon_loss
+        assert self.short_heads is not None, "built with with_short_aux=False"
+        ctx_s = self.cross.last_ctx_short_now
+        assert ctx_s is not None, "forward must run before short_aux_loss"
+        pm = batch["planet_mask"]
+        pm_now = pm[:, -1] if pm.dim() == 3 else pm
+        assert ctx_s.shape[0] == pm_now.shape[0], "stash/batch size mismatch"
+        return short_horizon_loss(self.short_heads(ctx_s), batch, pm_now)
 
     #: Stamped into the run config by the pretrain driver so checkpoints
     #: are self-describing for the (later) runner/PPO adaptation.
@@ -68,6 +105,7 @@ class EntityPretrainModelV3(EntityPretrainModel):
             "history_offsets": list(UNION_HISTORY_OFFSETS),
             "long_history_offsets": list(LONG_HISTORY_OFFSETS),
             "short_history_offsets": list(SHORT_HISTORY_OFFSETS),
+            "with_short_aux": self.with_short_aux,
         }
 
 
