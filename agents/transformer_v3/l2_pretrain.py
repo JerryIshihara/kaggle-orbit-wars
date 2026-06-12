@@ -117,21 +117,37 @@ def train_l2(args) -> Path:
             p.requires_grad_(False)
         enc.eval()
 
+    # Mirror the warm ckpt's head/conditioner depth so PairHead keys map
+    # 1:1 even though stage A never runs it (a depth mismatch shows up as
+    # confusing 'missing' film keys).
+    warm_ck = None
+    cond_n, head_n = 1, 1
+    if args.warm_start:
+        warm_ck = torch.load(args.warm_start, map_location=device,
+                             weights_only=False)
+        wcfg = warm_ck.get("config", {})
+        cond_n = int(wcfg.get("conditioner_n_layers", 1))
+        head_n = int(wcfg.get("head_n_layers", 1))
     model = EntityPretrainModelV3(
         d_model=args.d_model, skip_l34=True,
+        conditioner_n_layers=cond_n, head_n_layers=head_n,
         with_consolidator=True, with_value_heads=False,
         with_short_aux=False,
     ).to(device)
     aux = DualL2AuxHeads(args.d_model).to(device)
 
-    if args.warm_start:
-        ck = torch.load(args.warm_start, map_location=device, weights_only=False)
-        sd = {k: v for k, v in ck.get("model", ck).items()
+    if warm_ck is not None:
+        sd = {k: v for k, v in warm_ck.get("model", warm_ck).items()
               if not k.startswith(("value_heads.", "short_heads."))}
         res = model.load_state_dict(adapt_v2_state_dict(sd), strict=False)
+        fresh_ok = ("cross.fuse_player", "cross.owner_proj",
+                    "cross.long.player_tokens", "cross.short.player_tokens")
+        bad = [k for k in res.missing_keys if not k.startswith(fresh_ok)]
         _log(f"warm-start {args.warm_start}: loaded {len(sd)} tensors "
-             f"(missing={len(res.missing_keys)} unexpected="
-             f"{len(res.unexpected_keys)})")
+             f"(cond{cond_n}/head{head_n}; missing={len(res.missing_keys)} "
+             f"bad={bad[:4]} unexpected={len(res.unexpected_keys)})")
+        assert not bad, f"backbone skew vs warm ckpt: {bad[:6]}"
+        del warm_ck, sd
 
     # Freeze EVERYTHING except the dual L2; aux heads train alongside.
     for p in model.parameters():

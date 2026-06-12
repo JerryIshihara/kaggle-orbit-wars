@@ -169,7 +169,11 @@ ck = torch.load('/content/orbit-wars/warm_start.pt', map_location='cpu',
                 weights_only=False)
 cfg = ck['config']
 assert cfg.get('arch') == 'dual_rate_l2_v3' and cfg.get('n_steps') == N_UNION, cfg
+# Mirror the ckpt's head/conditioner depth (head3/cond3) — otherwise the
+# (unused-in-stage-A) PairHead's FiLM keys mismatch and trip the skew check.
 m = EntityPretrainModelV3(d_model=256, skip_l34=True,
+                          conditioner_n_layers=int(cfg['conditioner_n_layers']),
+                          head_n_layers=int(cfg['head_n_layers']),
                           with_consolidator=True, with_value_heads=False,
                           with_short_aux=False)
 assert m.consolidator is None and m.cross.owner_proj.weight.abs().sum() == 0
