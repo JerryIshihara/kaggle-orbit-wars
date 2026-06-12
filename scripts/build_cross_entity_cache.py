@@ -82,6 +82,14 @@ def main() -> None:
     parser.add_argument("--max-planets", type=int, default=64)
     parser.add_argument("--max-fleets", type=int, default=1024)
     parser.add_argument(
+        "--player", type=str, default=None,
+        help="Comma-separated team names: build ONLY their replays "
+             "(stems from data/replays/<team>/), split by EPISODE "
+             "70/15/15 (the win head's labels are per-game constants — "
+             "snapshot-level splits leak).",
+    )
+    parser.add_argument("--split-seed", type=int, default=1729)
+    parser.add_argument(
         "--legacy-format",
         action="store_true",
         help="Write the old list-of-snapshot-dicts cache format. Slower to "
@@ -91,7 +99,33 @@ def main() -> None:
 
     stems: list[str] | None
     split_stems: dict[str, list[str]] | None = None
-    if args.tiny:
+    if args.player:
+        import random as _random
+        repo = Path(__file__).resolve().parent.parent
+        all_stems: list[str] = []
+        for team in (t.strip() for t in args.player.split(",")):
+            d = repo / "data" / "replays" / team
+            got = sorted(p.name[: -len(".json.gz")]
+                         for p in d.glob("*.json.gz"))
+            assert got, f"no replays under {d}"
+            all_stems.extend(got)
+            print(f"[player] {team}: {len(got)} stems")
+        rng = _random.Random(args.split_seed)
+        rng.shuffle(all_stems)
+        n = len(all_stems)
+        n_val = max(1, int(n * 0.15))
+        n_test = max(1, int(n * 0.15))
+        split_stems = {
+            "val": sorted(all_stems[:n_val]),
+            "test": sorted(all_stems[n_val:n_val + n_test]),
+            "train": sorted(all_stems[n_val + n_test:]),
+        }
+        stems = [s for split in ("train", "val", "test")
+                 for s in split_stems[split]]
+        print(f"[player] {n} stems -> train {len(split_stems['train'])} / "
+              f"val {n_val} / test {n_test} (by episode, seed "
+              f"{args.split_seed})")
+    elif args.tiny:
         split_stems = _split_stems_from_manifest(tiny=True)
         stems = []
         for split in ("train", "val", "test"):

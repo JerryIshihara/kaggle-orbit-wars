@@ -42,10 +42,17 @@ sys.path.insert(0, str(REPO))
 
 from agents.archive.transformer_v1.featurizer import (  # noqa: E402
     save_episode_action_csv,
-    save_episode_cross_entity_csv,
     save_episode_entity_csv,
     save_episode_fleet_csv,
     save_episode_planet_csv,
+)
+# The CROSS-ENTITY writer must be the v2 one: v1's emits the 34-col legacy
+# layout WITHOUT final_rank_*/player_valid_* (+ momentum/global tiers), and
+# the value-cache builder then defaults player_valid to all-zero — every
+# win/rank/survives loss term silently masks out (caught 2026-06-12 when
+# the topmeta300 value cache trained at loss=0).
+from agents.transformer_v2.featurizer import (  # noqa: E402
+    save_episode_cross_entity_csv,
 )
 from agents.archive.transformer_v1.paths import (  # noqa: E402
     ACTION_DATASET_DIR,
