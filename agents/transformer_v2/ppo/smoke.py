@@ -247,21 +247,52 @@ def load_supervised(
     # The pretrained value heads were built with this dropout (it changes the MLP
     # module layout: dropout!=0 inserts a Dropout layer, shifting the 2nd Linear's
     # index), so it MUST match for the 56 value tensors to load (else ~half miss).
-    value_dropout = float(cfg.get("value_dropout", 0.0))
+    value_dropout = float(cfg.get("value_dropout") or 0.0)
+    if value_dropout == 0.0 and any(
+            k.startswith("value_heads.") and k.endswith(".3.weight")
+            for k in _keys):
+        # Layout detection: dropout!=0 inserts a Dropout at idx 2, shifting
+        # the 2nd Linear to idx 3. Some ckpts (jointv4) trained with dropout
+        # but never stamped it; eval() disables it, only the LAYOUT matters.
+        value_dropout = 0.1
 
-    model = EntityPretrainModel(
-        d_model=d_model, n_steps=n_steps, d_pair=d_pair,
-        entity_n_heads=entity_n_heads,
-        cross_n_heads=cross_n_heads,
-        cross_n_layers=cross_n_layers,
-        dual_n_heads=dual_n_heads,
-        conditioner_n_layers=conditioner_n_layers,
-        head_n_layers=head_n_layers,
-        skip_l34=skip_l34,
-        with_consolidator=with_consolidator,
-        with_value_heads=with_value_heads,
-        value_dropout=value_dropout,
-    )
+    if str(cfg.get("arch", "")) == "dual_rate_l2_v3":
+        # transformer_v3 (dual-rate L2 + player CLS + optional α0 head).
+        # Mirrors TransformerAgent.load's v3 branch (runner.py, fix 49fc3e3):
+        # with_consolidator=True satisfies the base ctor; V3 nulls it after.
+        from agents.transformer_v3.model import EntityPretrainModelV3
+
+        model = EntityPretrainModelV3(
+            d_model=d_model, d_pair=d_pair,
+            entity_n_heads=entity_n_heads,
+            cross_n_heads=cross_n_heads,
+            cross_n_layers=cross_n_layers,
+            dual_n_heads=dual_n_heads,
+            conditioner_n_layers=conditioner_n_layers,
+            head_n_layers=head_n_layers,
+            skip_l34=skip_l34,
+            with_consolidator=True,
+            with_value_heads=with_value_heads,
+            value_dropout=value_dropout,
+            with_short_aux=bool(cfg.get("with_short_aux", False)) or any(
+                k.startswith("short_heads.") for k in _keys),
+            with_alloc_conc=bool(cfg.get("with_alloc_conc", False)) or any(
+                k.startswith("alloc_conc_head.") for k in _keys),
+        )
+    else:
+        model = EntityPretrainModel(
+            d_model=d_model, n_steps=n_steps, d_pair=d_pair,
+            entity_n_heads=entity_n_heads,
+            cross_n_heads=cross_n_heads,
+            cross_n_layers=cross_n_layers,
+            dual_n_heads=dual_n_heads,
+            conditioner_n_layers=conditioner_n_layers,
+            head_n_layers=head_n_layers,
+            skip_l34=skip_l34,
+            with_consolidator=with_consolidator,
+            with_value_heads=with_value_heads,
+            value_dropout=value_dropout,
+        )
     res = model.load_state_dict(model_state, strict=False)
     if with_value_heads:
         _vh_missing = [k for k in res.missing_keys if k.startswith("value_heads.")]
@@ -301,13 +332,22 @@ class _RolloutHistory:
     slot). ``window <= 1`` disables stacking (single-frame rollout).
     """
 
-    def __init__(self, window: int):
+    def __init__(self, window: int, offsets: tuple[int, ...] | list[int] | None = None):
         self.window = int(window)
+        # v3 dual-rate models walk the UNION offsets (45..0@5 ∪ 18..0@2);
+        # pass them via ``offsets`` (cfg["history_offsets"] crosses spawn
+        # boundaries as a plain list). Default = the v2 HISTORY_OFFSETS.
+        self.offsets = tuple(int(o) for o in offsets) if offsets else HISTORY_OFFSETS
+        if self.window > 1 and len(self.offsets) != self.window:
+            raise ValueError(
+                f"history window {self.window} != len(offsets) "
+                f"{len(self.offsets)} — the model's n_steps must equal the "
+                f"offsets walk length.")
         self.frames: dict[int, dict[str, torch.Tensor]] = {}
 
     def push(self, step: int, frame: dict[str, torch.Tensor]) -> None:
         self.frames[step] = frame
-        cutoff = step - (HISTORY_OFFSETS[0] + 5)
+        cutoff = step - (self.offsets[0] + 5)
         for s in [s for s in self.frames if s < cutoff]:
             del self.frames[s]
 
@@ -316,7 +356,7 @@ class _RolloutHistory:
         out: dict[str, torch.Tensor] = {}
         for k in _TEMPORAL_KEYS:
             ref = cur[k]
-            seq = [self.frames.get(step - off) for off in HISTORY_OFFSETS]
+            seq = [self.frames.get(step - off) for off in self.offsets]
             out[k] = torch.stack(
                 [(f[k] if f is not None else torch.zeros_like(ref)) for f in seq],
                 dim=0,

@@ -79,12 +79,13 @@ class _Seat:
     __slots__ = ("env_idx", "seat", "num_players", "tracker", "history",
                  "buffer", "records", "moves")
 
-    def __init__(self, env_idx, seat, num_players, window, records):
+    def __init__(self, env_idx, seat, num_players, window, records,
+                 history_offsets=None):
         self.env_idx = env_idx
         self.seat = seat
         self.num_players = num_players
         self.tracker = FleetTracker()
-        self.history = _RolloutHistory(window)
+        self.history = _RolloutHistory(window, offsets=history_offsets)
         self.buffer = None          # set for learner seats
         self.records = records
         self.moves: list = []        # last action's env moves
@@ -125,6 +126,9 @@ def _batched_act(seats, envs, active, policy, planet_enc, fleet_enc, comet_enc,
         fls = out["frac_loc"].detach().cpu()          # (n, P, P)
         vals = out["value"].detach().cpu()            # (n,)
         sigma_val = float(out["sigma"].item())
+        # v4 contract: α0 head output (None on models without the head).
+        concs = (out["alloc_conc"].detach().cpu()
+                 if out.get("alloc_conc") is not None else None)
     for j, (seat, obs, pid_to_idx, store) in enumerate(items):
         moves, record = _finalize_step(
             obs, pid_to_idx, pair_logits=pls[j], frac_loc=fls[j],
@@ -133,6 +137,7 @@ def _batched_act(seats, envs, active, policy, planet_enc, fleet_enc, comet_enc,
             noop_logit_bias=noop_logit_bias,
             select_logit_bias=select_logit_bias,
             contract=contract, k_max=k_max,
+            alloc_conc=(concs[j] if concs is not None else None),
         )
         seat.moves = moves
         if seat.records and seat.buffer is not None:
@@ -176,6 +181,7 @@ def run_batched_episodes(
     target_cap_k_max: int = 3,
     target_cap_lambda: float = 0.0,
     history_window: int = 1,
+    history_offsets: list[int] | None = None,
     max_steps: int = 1200,
     contract: str = "v2",        # learner's contract; opponent seats stay v2
     select_k_max: int = 3,
@@ -199,12 +205,14 @@ def run_batched_episodes(
         envs.append(env)
         buf = EpisodeBuffer(seed=seed, learner_seat=lseat)
         buffers.append(buf)
-        ls = _Seat(ei, lseat, n_players, history_window, records=True)
+        ls = _Seat(ei, lseat, n_players, history_window, records=True,
+                   history_offsets=history_offsets)
         ls.buffer = buf
         learner_seats.append(ls)
         for s in range(n_players):
             if s != lseat:
-                opp_seats.append(_Seat(ei, s, n_players, history_window, records=False))
+                opp_seats.append(_Seat(ei, s, n_players, history_window,
+                                       records=False, history_offsets=history_offsets))
 
     active = [not envs[i].done for i in range(B)]
     env_steps = [0] * B          # learner-turns taken per env (frozen when done)

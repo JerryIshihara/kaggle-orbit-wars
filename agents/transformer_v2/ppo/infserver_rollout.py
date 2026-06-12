@@ -93,7 +93,9 @@ def _worker_play_one(
 
     buffer = smoke.EpisodeBuffer(seed=seed, learner_seat=learner_seat)
     trackers = [FleetTracker() for _ in range(num_players)]
-    histories = [_RolloutHistory(int(cfg["history_window"])) for _ in range(num_players)]
+    histories = [_RolloutHistory(int(cfg["history_window"]),
+                             offsets=cfg.get("history_offsets"))
+             for _ in range(num_players)]
 
     t_feat = 0.0
     t_wait = 0.0
@@ -145,14 +147,14 @@ def _worker_play_one(
         results = {}
         active_seats = [s for s in range(num_players) if stores[s] is not None]
         for _ in active_seats:
-            req_id, seat, pair_logits, frac_loc, value, sigma_val = res_q.get()
-            results[seat] = (req_id, pair_logits, frac_loc, value, sigma_val)
+            req_id, seat, pair_logits, frac_loc, value, sigma_val, conc = res_q.get()
+            results[seat] = (req_id, pair_logits, frac_loc, value, sigma_val, conc)
         t_wait += time.perf_counter() - b
 
         c = time.perf_counter()
         moves = [[] for _ in range(num_players)]
         for seat in active_seats:
-            _req_id, pair_logits, frac_loc, value, sigma_val = results[seat]
+            _req_id, pair_logits, frac_loc, value, sigma_val, conc = results[seat]
             env_moves, record = smoke._finalize_step(
                 obss[seat],
                 pid_maps[seat],
@@ -170,6 +172,7 @@ def _worker_play_one(
                 contract=(str(cfg.get("contract", "v2"))
                           if seat == learner_seat else "v2"),
                 k_max=int(cfg.get("select_k_max", 3)),
+                alloc_conc=conc,
             )
             moves[seat] = env_moves
             if seat == learner_seat:
@@ -352,6 +355,7 @@ def run_infserver_rollout(
     target_cap_k_max: int = 3,
     target_cap_lambda: float = 0.0,
     contract: str = "v2",
+    history_offsets: list[int] | None = None,
     select_k_max: int = 3,
     spool_dir: str | Path | None = None,
     on_progress: Callable[[dict], None] | None = None,
@@ -392,6 +396,8 @@ def run_infserver_rollout(
         # Learner's action contract; OPPONENT seats always decode v2 (the
         # frozen baseline's native contract) regardless of this value.
         "contract": str(contract),
+        # v3-arch models walk the UNION offsets; plain list crosses spawn.
+        "history_offsets": (list(history_offsets) if history_offsets else None),
         "select_k_max": int(select_k_max),
         "progress_every": int(progress_every),
         "target_cap_k_max": int(target_cap_k_max),
@@ -408,7 +414,8 @@ def run_infserver_rollout(
 
     def _fwd_items(pol, items):
         """One batched forward of `pol` over a list of batch request tuples;
-        returns CPU (pair_logits, frac_loc, values, sigma_scalar)."""
+        returns CPU (pair_logits, frac_loc, values, sigma_scalar, alloc_conc).
+        ``alloc_conc`` is None on policies without the v4 α0 head."""
         stores = [_store_from_ipc(it[3]) for it in items]
         with torch.inference_mode():
             out = _batched_forward(pol, planet_enc, fleet_enc, comet_enc, stores, device)
@@ -416,7 +423,9 @@ def run_infserver_rollout(
             fl = torch.nan_to_num(out["frac_loc"], nan=0.0, posinf=0.0, neginf=0.0).detach().cpu()
             vv = torch.nan_to_num(out["value"], nan=0.0, posinf=0.0, neginf=0.0).detach().cpu()
             sv = float(out["sigma"].detach().cpu().item())
-        return pl, fl, vv, sv
+            cc = (torch.nan_to_num(out["alloc_conc"], nan=0.0).detach().cpu()
+                  if out.get("alloc_conc") is not None else None)
+        return pl, fl, vv, sv, cc
 
     workers = []
     for wid in range(n_workers):
@@ -525,12 +534,13 @@ def run_infserver_rollout(
 
         if batch:
             tf = time.perf_counter()
-            # res[batch_index] = (pair_logits_k, frac_loc_k, value_k_float, sigma)
+            # res[batch_index] = (pair_logits_k, frac_loc_k, value_k_float, sigma, conc_k)
             res: dict[int, tuple] = {}
             if opponent_policy is None:
-                pl, fl, vv, sv = _fwd_items(policy, batch)            # self-play: one forward
+                pl, fl, vv, sv, cc = _fwd_items(policy, batch)        # self-play: one forward
                 for k in range(len(batch)):
-                    res[k] = (pl[k], fl[k], float(vv[k].item()), sv)
+                    res[k] = (pl[k], fl[k], float(vv[k].item()), sv,
+                              (cc[k] if cc is not None else None))
             else:
                 # two-policy: route learner seats → B (policy), others → A.
                 learner_idx = [k for k, it in enumerate(batch) if it[4]]
@@ -538,15 +548,16 @@ def run_infserver_rollout(
                 for pol, idxs in ((policy, learner_idx), (opponent_policy, opp_idx)):
                     if not idxs:
                         continue
-                    pl, fl, vv, sv = _fwd_items(pol, [batch[k] for k in idxs])
+                    pl, fl, vv, sv, cc = _fwd_items(pol, [batch[k] for k in idxs])
                     for j, k in enumerate(idxs):
-                        res[k] = (pl[j], fl[j], float(vv[j].item()), sv)
+                        res[k] = (pl[j], fl[j], float(vv[j].item()), sv,
+                                  (cc[j] if cc is not None else None))
             fwd_ms.append((time.perf_counter() - tf) * 1e3)
             batch_sizes.append(len(batch))
             mark_progress()
             for k, it in enumerate(batch):
-                pl_k, fl_k, v_k, sv_k = res[k]
-                res_qs[int(it[0])].put((it[1], int(it[2]), pl_k, fl_k, v_k, sv_k))
+                pl_k, fl_k, v_k, sv_k, cc_k = res[k]
+                res_qs[int(it[0])].put((it[1], int(it[2]), pl_k, fl_k, v_k, sv_k, cc_k))
 
         if (
             stall_timeout_s

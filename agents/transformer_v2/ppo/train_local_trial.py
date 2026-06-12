@@ -248,6 +248,12 @@ def _gcs_upload_tree(local_dir: Path, gcs_out: str, rel_prefix: str) -> bool:
         return False
 
 
+_CONTRACT_NAMES = {
+    "v4": "bounded_k_select_dirichlet_alloc_v4",
+    "v3": "bounded_k_select_multinomial_alloc_v3",
+}
+
+
 def _vtag(policy_version: int) -> str:
     return f"v{int(policy_version):04d}"
 
@@ -279,11 +285,8 @@ def _save_policy_checkpoint(
             "max_planets": args.max_planets,
             "max_fleets": args.max_fleets,
             "reward_decomp": bool(args.reward_decomp),
-            "action_contract": (
-                "bounded_k_select_multinomial_alloc_v3"
-                if args.action_contract == "v3"
-                else "bernoulli_select_multinomial_alloc_v2"
-            ),
+            "action_contract": _CONTRACT_NAMES.get(
+                args.action_contract, "bernoulli_select_multinomial_alloc_v2"),
             "select_k_max": int(args.select_k_max),
             "created_ts": shards.utcnow_iso(),
             "metrics": dict(metrics or {}),
@@ -344,7 +347,7 @@ def _save_rollout_artifacts(
                 "format": "ppo_packed_v1",
                 "policy_version": int(policy_version),
                 "history_window": int(args.history_window),
-                "policy_action_contract": ("bounded_k_select_multinomial_alloc_v3" if args.action_contract == "v3" else shards.POLICY_ACTION_CONTRACT),
+                "policy_action_contract": _CONTRACT_NAMES.get(args.action_contract, shards.POLICY_ACTION_CONTRACT),
                 "created_ts": shards.utcnow_iso(),
                 "packed": p,
             }
@@ -361,7 +364,7 @@ def _save_rollout_artifacts(
         "format": "ppo_rollout_manifest_v2",
         "policy_version": int(policy_version),
         "policy_tag": tag,
-        "policy_action_contract": ("bounded_k_select_multinomial_alloc_v3" if args.action_contract == "v3" else shards.POLICY_ACTION_CONTRACT),
+        "policy_action_contract": _CONTRACT_NAMES.get(args.action_contract, shards.POLICY_ACTION_CONTRACT),
         "history_window": int(args.history_window),
         "machine_id": machine_id,
         "created_ts": shards.utcnow_iso(),
@@ -998,7 +1001,7 @@ def main() -> int:
                         "runner's pair_logits>2.0 threshold. Applied IDENTICALLY in the "
                         "rollout sampler and the PPO update loss (the same value, else "
                         "the ratio desyncs). Default 0.0 = unchanged behaviour.")
-    p.add_argument("--action-contract", choices=("v2", "v3"), default="v2",
+    p.add_argument("--action-contract", choices=("v2", "v3", "v4"), default="v2",
                    help="LEARNER action contract: v2 = bernoulli_select_"
                         "multinomial_alloc_v2 (per-cell Bernoulli select + full-N "
                         "multinomial); v3 = bounded_k_select_multinomial_alloc_v3 "
@@ -1006,7 +1009,11 @@ def main() -> int:
                         "min_launch floor pre-distributed to fired targets, "
                         "extras multinomial over the remainder — floor-feasible "
                         "by construction). The FIXED OPPONENT always plays v2. "
-                        "Under v3, --select-logit-bias is the SELF-token bias.")
+                        "Under v3, --select-logit-bias is the SELF-token bias. v4 = bounded_k_select_dirichlet_alloc_v4 (v3 select + Dirichlet share draw; needs a ckpt with the alloc_conc head; sizes = min_launch floor + share*remainder).")
+    p.add_argument("--lr-conc", type=float, default=5e-6,
+               help="v4 alpha0 conc-head lr (own AdamW group; the slow group "
+                    "IS the saturation guard - sharing lr_heads detonated in "
+                    "stage-B pretrain).")
     p.add_argument("--select-k-max", type=int, default=3,
                    help="v3 only: max select draws per source "
                         "(k = min(this, ships//min_launch))")
@@ -1036,9 +1043,9 @@ def main() -> int:
                         "over-firing multi-target policy to stop firing illegal cells. "
                         "Default 0.0 = off. ~PBRS per-step |r| is ~0.006, so 0.02 ≈ 3× that.")
     args = p.parse_args()
-    if args.action_contract == "v3" and args.rollout in ("pool", "shm"):
+    if args.action_contract in ("v3", "v4") and args.rollout in ("pool", "shm"):
         raise SystemExit(
-            "--action-contract v3 is wired for the batched and infserver "
+            f"--action-contract {args.action_contract} is wired for the batched and infserver "
             "rollouts only; use --rollout batched or infserver."
         )
     if args.rollout == "pool" and not args.allow_cpu_forward_rollout:
@@ -1110,6 +1117,23 @@ def main() -> int:
     if int(cfg.get("n_steps", 0)) != args.history_window:
         _log(f"WARNING: ckpt n_steps={cfg.get('n_steps')} != --history-window "
              f"{args.history_window}; T mismatch would feed the model the wrong window.")
+
+    # v3-arch ckpts walk the UNION offsets (45..0@5 + 18..0@2), not the v2
+    # HISTORY_OFFSETS — thread them to every rollout history.
+    _history_offsets = None
+    if str(cfg.get("arch", "")) == "dual_rate_l2_v3":
+        from agents.transformer_v3.history import UNION_HISTORY_OFFSETS
+        _history_offsets = [int(o) for o in UNION_HISTORY_OFFSETS]
+        if args.history_window != len(_history_offsets):
+            raise SystemExit(
+                f"v3-arch ckpt needs --history-window {len(_history_offsets)} "
+                f"(union offsets walk), got {args.history_window}")
+        _log(f"v3 arch: union history offsets {_history_offsets}")
+    if args.action_contract == "v4" and \
+            getattr(entity_model, "alloc_conc_head", None) is None:
+        raise SystemExit(
+            "--action-contract v4 needs a ckpt with the alloc_conc head "
+            "(with_alloc_conc=True, e.g. jointv4_best.pt)")
 
     critic_model = None
     if args.critic_ckpt is not None:
@@ -1214,6 +1238,7 @@ def main() -> int:
         clip=args.clip, target_kl=args.target_kl, epochs=args.epochs,
         minibatch_size=args.minibatch_size, lr_heads=args.lr_heads, lr_trunk=args.lr_trunk,
         lr_perception=args.lr_perception,
+        lr_conc=args.lr_conc,
         value_coef=args.value_coef, ent_coef=args.ent_coef, bc_coef=0.0,
         bc_target_weight=1.0,
         select_logit_bias=args.select_logit_bias,
@@ -1305,6 +1330,7 @@ def main() -> int:
                 sigma=args.sigma, select_logit_bias=args.select_logit_bias,
                 history_window=args.history_window, on_step=_on_step,
                 contract=args.action_contract, select_k_max=args.select_k_max,
+                history_offsets=_history_offsets,
             )
         elif args.rollout == "infserver":
             if args.post_procs > 1:
@@ -1374,6 +1400,7 @@ def main() -> int:
                 contract=args.action_contract,
                 select_k_max=args.select_k_max,
                 history_window=args.history_window,
+                history_offsets=_history_offsets,
                 max_batch=args.infserver_max_batch,
                 batch_window_s=args.infserver_batch_window_ms / 1000.0,
                 progress_every=args.progress_step_every,

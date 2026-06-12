@@ -31,6 +31,7 @@ class PPOConfig:
     bc_coef: float = 0.05
     bc_target_weight: float = 1.0
     max_grad_norm: float = 0.5
+    lr_conc: float = 5e-6                 # v4 α0 conc head — ALWAYS its own slow group (pretrain detonated when it shared the head lr; the cap is calibration, the slow lr is the guard)
     early_stop_kl_factor: float = 1.5     # break the epoch if running avg KL > this * target_kl
     select_logit_bias: float = 0.0        # multi-target selection-Bernoulli logit shift; MUST match the rollout sampler's value (else the PPO ratio desyncs)
 
@@ -73,10 +74,23 @@ def build_optimizer(policy: nn.Module, cfg: PPOConfig) -> torch.optim.Optimizer:
                     perception_param_ids.add(id(p))
                     perception_params.append(p)
 
+    # v4 α0 concentration head: its own SLOW group, never folded into heads
+    # or trunk (where it would train at 20×: the stage-B detonation mode).
+    conc_param_ids: set[int] = set()
+    conc_params: list[torch.nn.Parameter] = []
+    conc_mod = getattr(policy.entity_model, "alloc_conc_head", None)
+    if conc_mod is not None:
+        for p in conc_mod.parameters():
+            if p.requires_grad and id(p) not in head_param_ids \
+                    and id(p) not in perception_param_ids:
+                conc_param_ids.add(id(p))
+                conc_params.append(p)
+
     trunk_params: list[torch.nn.Parameter] = []
     for p in policy.parameters():
         if p.requires_grad and id(p) not in head_param_ids \
-                and id(p) not in perception_param_ids:
+                and id(p) not in perception_param_ids \
+                and id(p) not in conc_param_ids:
             trunk_params.append(p)
 
     groups = [{"params": head_params, "lr": cfg.lr_heads}]
@@ -85,6 +99,8 @@ def build_optimizer(policy: nn.Module, cfg: PPOConfig) -> torch.optim.Optimizer:
         groups.append({"params": trunk_params, "lr": lr_trunk})
     if perception_params:
         groups.append({"params": perception_params, "lr": cfg.lr_perception})
+    if conc_params:
+        groups.append({"params": conc_params, "lr": cfg.lr_conc})
     return torch.optim.AdamW(groups, weight_decay=0.0)
 
 

@@ -351,6 +351,14 @@ class TransformerAgent:
                 with_value_heads=bool(cfg.get("with_value_heads", False)),
                 with_short_aux=bool(cfg.get("with_short_aux", False)),
                 with_alloc_conc=bool(cfg.get("with_alloc_conc", False)),
+                # Dropout shifts the value-MLP 2nd Linear from idx 2 to 3;
+                # ckpts that trained with dropout but didn't stamp it (e.g.
+                # jointv4) would otherwise load FRESH value heads silently
+                # (28 missing/28 unexpected) and break value_forward/K-rank.
+                value_dropout=(float(cfg.get("value_dropout") or 0.0) or (
+                    0.1 if any(k.startswith("value_heads.") and
+                               k.endswith(".3.weight") for k in _sd_keys)
+                    else 0.0)),
             )
         else:
             model = EntityPretrainModel(
