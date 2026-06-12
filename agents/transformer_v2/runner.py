@@ -738,6 +738,14 @@ class TransformerAgent:
                     pair_frac_raw[s, s].reshape(1),
                 ])
                 share = torch.softmax(alloc_logits, dim=-1)
+                # v4 stochastic allocation: draw shares from the learned
+                # Dirichlet (α = α0[s] · mean) instead of using the mean.
+                # OW_V4_ALLOC=dirichlet; requires the α0 head (v4 ckpts).
+                if (os.environ.get("OW_V4_ALLOC") == "dirichlet"
+                        and "alloc_conc" in preds):
+                    a0 = preds["alloc_conc"].squeeze(0)[s].clamp(min=1e-3)
+                    share = torch.distributions.Dirichlet(
+                        (a0 * share).clamp(min=1e-4)).sample()
                 if getattr(self, "_shape_debug", False):
                     cat_l = torch.cat([
                         row, torch.tensor([self_logit], device=row.device)])
@@ -817,6 +825,55 @@ class TransformerAgent:
                 frac = float(torch.sigmoid(pair_frac_raw[src_idx, tgt_idx]).item())
             actions.append((source_pid, target_pid, frac))
         return actions
+
+    @torch.no_grad()
+    def value_forward(self, obs: dict[str, Any]) -> dict[str, torch.Tensor]:
+        """Featurize ``obs`` and return the model's full prediction dict
+        (incl. value heads when present). Used by the K-rank deploy agent
+        to score simulated post-action states; mirrors act()'s
+        featurize → L0 → forward pipeline without the decode."""
+        learner_slot = int(obs.get("player_id", 0) if isinstance(obs, dict)
+                           else getattr(obs, "player_id", 0))
+        batch, _pid_to_idx = featurize_observation(
+            obs,
+            learner_slot=learner_slot,
+            tracker=FleetTracker(),
+            num_players=self.num_players,
+            max_planets=self.max_planets,
+            max_fleets=self.max_fleets,
+            device=self.device,
+        )
+        B, P, _ = batch["planet_features"].shape
+        comet_features = torch.zeros(
+            (B, P, self.comet_enc.input_dim), device=self.device,
+            dtype=batch["planet_features"].dtype,
+        )
+        comet_features[..., :18] = batch["planet_features"][..., :18]
+        is_comet = batch["planet_features"][..., 0] > 0.5
+        planet_tok = self.planet_enc(batch["planet_features"])
+        comet_tok = self.comet_enc(comet_features)
+        fleet_tok = self.fleet_enc(batch["fleet_features"])
+        entity_self = _build_entity_self_tokens(planet_tok, comet_tok, is_comet)
+        routing = {
+            "fleet_target_idx": batch["fleet_target_idx"],
+            "fleet_source_idx": batch["fleet_source_idx"],
+            "fleet_owner_slot": batch["fleet_owner_slot"],
+            "fleet_ships_log": batch["fleet_ships_log"],
+            "fleet_eta_norm": batch["fleet_eta_norm"],
+            "fleet_mask": batch["fleet_mask"],
+        }
+        from .pretrain.entity_encoder import (
+            ENTITY_N_OWNER_CLASSES as _N_OWN,
+            _PLANET_OWNER_START_IDX as _OWN0,
+        )
+        return self.model.forward_with_context(
+            entity_self, fleet_tok, routing, batch["planet_mask"],
+            is_comet=is_comet,
+            pair_type_ids=build_pair_type_ids(
+                batch["planet_features"], batch["planet_mask"],
+            ),
+            planet_owner_oh=batch["planet_features"][..., _OWN0:_OWN0 + _N_OWN],
+        )
 
     def act(self, obs: dict[str, Any]) -> list[list]:
         """Return ``[[planet_id, angle, ships], ...]`` action triples.
