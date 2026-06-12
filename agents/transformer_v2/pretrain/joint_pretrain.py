@@ -323,6 +323,10 @@ def train_joint(
     # earliest-arrival CE+Huber off the pre-fusion SHORT tokens). Inert
     # unless the model exposes ``short_heads`` (i.e. --arch v3).
     short_aux_weight: float = 0.0,
+    # staged training (transformer_v3 stage B): keep the dual L2 FROZEN at
+    # its stage-A weights and train only the superstructure (L3/L4, pair
+    # head, value heads, aux heads).
+    freeze_l2: bool = False,
 ) -> Path:
     """Joint action+value pretrain loop with L2+ unfreeze + verbose per-head logs.
 
@@ -386,6 +390,14 @@ def train_joint(
             print(f"[joint]   WARNING non-value missing keys (backbone skew?): "
                   f"{non_value_missing[:6]}", flush=True)
     report = model.freeze_below_l2()
+    if freeze_l2:
+        n_frozen = 0
+        for p in model.cross.parameters():
+            if p.requires_grad:
+                p.requires_grad_(False)
+                n_frozen += p.numel()
+        report["L2_cross (RE-FROZEN, stage-A weights)"] = n_frozen
+        report["L2_cross (trainable)"] = 0
     print("[joint] freeze_below_l2 (L0+L1 frozen, L2+ trainable):", flush=True)
     for k, v in report.items():
         print(f"    {k:<28s} {v:,}", flush=True)
@@ -669,6 +681,9 @@ def main() -> None:
                         "short T=10@2 branches, zero-init fusion); both "
                         "caches are restacked to the 18-frame union and a "
                         "v2 --warm-start is key-mapped onto both branches")
+    p.add_argument("--freeze-l2", action="store_true",
+                   help="staged training: keep the (stage-A-pretrained) dual "
+                        "L2 frozen; train only L3/L4 + heads. --arch v3 only.")
     p.add_argument("--short-aux-weight", type=float, default=0.5,
                    help="weight on the v3 short-branch t+5 forecast aux "
                         "tasks (owner/ships/arrivals/earliest CE+Huber on "
@@ -689,6 +704,7 @@ def main() -> None:
             history_offsets=UNION_HISTORY_OFFSETS,
             warm_start_adapter=adapt_v2_state_dict,
             short_aux_weight=args.short_aux_weight,
+            freeze_l2=args.freeze_l2,
         )
 
     train_joint(
