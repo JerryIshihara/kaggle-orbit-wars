@@ -676,6 +676,12 @@ def _predict_comet_xy(
         if 0 <= idx < len(path):
             px, py = path[idx]
             return float(px), float(py)
+        if idx == len(path):
+            # Env parity: on the tick its path runs out the comet stays
+            # FROZEN at its last position, still collidable, and is only
+            # removed after that tick's combat. One extra aimable tick.
+            px, py = path[-1]
+            return float(px), float(py)
         return None
 
     start = _sample(whole)
@@ -783,6 +789,75 @@ def _find_first_collision_dynamic(
         fleet_x += speed * ch
         fleet_y += speed * sh
 
+        # Precompute every planet's end-of-tick position (env does this
+        # before fleet movement so the collision test can treat BOTH
+        # bodies as moving within the tick — 1.30.x swept_pair physics).
+        new_planet_pos: dict[int, tuple[float, float]] = {}
+        expiring_this_tick: set[int] = set()
+        for p in planets:
+            pid = int(p[P_ID])
+            if pid in dead_comets or pid not in planet_pos:
+                continue
+            old_pos = planet_pos[pid]
+            if pid in comet_ids:
+                path, _idx0 = comet_lookup[pid]
+                next_idx = comet_indices[pid] + 1
+                comet_indices[pid] = next_idx
+                if next_idx >= len(path):
+                    # Env parity: on the tick its path runs out the comet
+                    # stays FROZEN at its last position, still collidable,
+                    # and is removed after this tick's combat.
+                    new_planet_pos[pid] = old_pos
+                    expiring_this_tick.add(pid)
+                else:
+                    nx, ny = path[next_idx]
+                    new_planet_pos[pid] = (float(nx), float(ny))
+            elif _is_orbiting_xy(
+                float(p[P_X]),
+                float(p[P_Y]),
+                float(p[P_RADIUS]),
+                angular_velocity,
+            ):
+                if current_step + step - 1 <= 0:
+                    new_planet_pos[pid] = old_pos
+                else:
+                    new_planet_pos[pid] = _predict_orbital_xy(
+                        old_pos[0], old_pos[1], 1.0, av_signed,
+                    )
+            else:
+                new_planet_pos[pid] = old_pos
+
+        # 1. PLANETS FIRST, in observation list order, fleet segment vs
+        #    planet segment simultaneously (env 1.30.x: "check planets
+        #    first so fast fleets that would overshoot the bounds or sun
+        #    still get credit for hitting a planet along the way"). No
+        #    source exemption — the env has none, so a moving source CAN
+        #    recapture its own launch and the planner must see that.
+        hit_t = None
+        hit_p = None
+        for p in planets:
+            pid = int(p[P_ID])
+            if pid not in new_planet_pos:
+                continue
+            old_pos = planet_pos[pid]
+            t = _swept_disc_intersection(
+                old_fx, old_fy, fleet_x, fleet_y,
+                old_pos[0], old_pos[1],
+                new_planet_pos[pid][0], new_planet_pos[pid][1],
+                float(p[P_RADIUS]),
+            )
+            if t is not None:
+                hit_t, hit_p = t, p
+                break  # env breaks on the FIRST planet in list order
+        if hit_p is not None:
+            return {
+                "kind": "planet",
+                "planet": hit_p,
+                "step": step,
+                "eta": (step - 1) + hit_t,
+            }
+
+        # 2. Boundary (endpoint test, env order).
         if (
             fleet_x < BOARD_MIN
             or fleet_x > BOARD_MAX
@@ -791,6 +866,10 @@ def _find_first_collision_dynamic(
         ):
             return {"kind": "boundary", "step": step, "x": fleet_x, "y": fleet_y}
 
+        # 3. Sun (segment test). Env uses the bare SUN_RADIUS; the extra
+        #    SUN_MARGIN is deliberate planner-side conservatism, and now
+        #    that planets are checked first it can no longer veto a
+        #    legitimate planet hit earlier in the same tick.
         t_sun = _stationary_disc_segment_entry(
             old_fx, old_fy, fleet_x, fleet_y,
             SUN_CX, SUN_CY,
@@ -805,73 +884,11 @@ def _find_first_collision_dynamic(
                 "eta": (step - 1) + t_sun,
             }
 
-        # Fleet movement phase: after boundary/sun, current planet positions
-        # are checked in list order and the env breaks on the first hit.
-        for p in planets:
-            pid = int(p[P_ID])
-            if pid in dead_comets or pid not in planet_pos:
-                continue
-            old_pos = planet_pos[pid]
-            if pid == src_id and math.hypot(old_fx - src_x, old_fy - src_y) < src_radius + 1.0:
-                continue
-            t = _stationary_disc_segment_entry(
-                old_fx, old_fy, fleet_x, fleet_y,
-                old_pos[0], old_pos[1],
-                float(p[P_RADIUS]),
-            )
-            if t is not None:
-                return {
-                    "kind": "planet",
-                    "planet": p,
-                    "step": step,
-                    "eta": (step - 1) + t,
-                }
-
-        # Planet movement phase: surviving fleets can be swept by a moving
-        # planet/comet if the fleet endpoint lies inside that movement segment.
-        new_planet_pos: dict[int, tuple[float, float]] = {}
-        for p in planets:
-            pid = int(p[P_ID])
-            if pid in dead_comets or pid not in planet_pos:
-                continue
-            old_pos = planet_pos[pid]
-            if pid in comet_ids:
-                path, _idx0 = comet_lookup[pid]
-                next_idx = comet_indices[pid] + 1
-                if next_idx >= len(path):
-                    dead_comets.add(pid)
-                    planet_pos.pop(pid, None)
-                    comet_indices[pid] = next_idx
-                    continue
-                nx, ny = path[next_idx]
-                new_pos = (float(nx), float(ny))
-                comet_indices[pid] = next_idx
-            elif _is_orbiting_xy(
-                float(p[P_X]),
-                float(p[P_Y]),
-                float(p[P_RADIUS]),
-                angular_velocity,
-            ):
-                if current_step + step - 1 <= 0:
-                    new_pos = old_pos
-                else:
-                    new_pos = _predict_orbital_xy(old_pos[0], old_pos[1], 1.0, av_signed)
-            else:
-                new_pos = old_pos
-            new_planet_pos[pid] = new_pos
-            if old_pos == new_pos:
-                continue
-            if _point_to_segment_distance(
-                fleet_x, fleet_y,
-                old_pos[0], old_pos[1],
-                new_pos[0], new_pos[1],
-            ) < float(p[P_RADIUS]):
-                return {
-                    "kind": "planet",
-                    "planet": p,
-                    "step": step,
-                    "eta": float(step),
-                }
+        # Expired comets vanish after this tick's combat window.
+        for pid in expiring_this_tick:
+            dead_comets.add(pid)
+            planet_pos.pop(pid, None)
+            new_planet_pos.pop(pid, None)
 
         # Advance planet positions for the next step.
         planet_pos = new_planet_pos
@@ -885,9 +902,17 @@ def _lead_aim_static(
     tx0: float,
     ty0: float,
     fleet_ships: int,
+    contact_shrink: float = 0.0,
 ) -> tuple[float, float, float]:
+    """``contact_shrink`` ≈ src_radius + tgt_radius: the env spawns the
+    fleet just outside the source's rim and resolves the hit at the
+    target's rim, so contact happens ``shrink`` units short of the
+    center-to-center distance. Without it, eta runs ~(shrink/speed)
+    ≈ 1.5-2.5 ticks late — measured across the whole launch matrix —
+    which mis-leads moving targets and inflates the comet-expiry check.
+    """
     speed = fleet_speed(fleet_ships)
-    dist = math.hypot(tx0 - sx, ty0 - sy)
+    dist = max(0.0, math.hypot(tx0 - sx, ty0 - sy) - contact_shrink)
     return tx0, ty0, dist / max(speed, 1e-6)
 
 
@@ -900,19 +925,21 @@ def _lead_aim_orbital(
     av_signed: float,
     current_step: int = 1,
     iters: int = LEAD_AIM_ITERS,
+    contact_shrink: float = 0.0,
 ) -> tuple[float, float, float]:
     speed = fleet_speed(fleet_ships)
     if av_signed == 0 or speed <= 0:
-        return _lead_aim_static(sx, sy, tx0, ty0, fleet_ships)
+        return _lead_aim_static(sx, sy, tx0, ty0, fleet_ships,
+                                contact_shrink=contact_shrink)
     px, py = tx0, ty0
-    turns = math.hypot(px - sx, py - sy) / speed
+    turns = max(0.0, math.hypot(px - sx, py - sy) - contact_shrink) / speed
     for _ in range(iters):
         px, py = _predict_orbital_xy(
             tx0, ty0,
             _orbital_turns_after_eta(turns, current_step),
             av_signed,
         )
-        turns = math.hypot(px - sx, py - sy) / speed
+        turns = max(0.0, math.hypot(px - sx, py - sy) - contact_shrink) / speed
     return px, py, turns
 
 
@@ -923,19 +950,33 @@ def _lead_aim_comet(
     fleet_ships: int,
     comet_lookup: dict[int, tuple[list, int]],
     iters: int = LEAD_AIM_ITERS,
+    contact_shrink: float = 0.0,
 ) -> tuple[float, float, float] | None:
     speed = fleet_speed(fleet_ships)
     if speed <= 0:
         return None
+    entry = comet_lookup.get(int(target[P_ID]))
+    if entry is None:
+        return None
+    path, path_index = entry
+    # Latest predictable tick (idx == len(path) is the frozen tick the
+    # clamp in _predict_comet_xy models). Clamp the ITERATION's lookahead
+    # to it: the initial turns guess uses the CURRENT distance, which for
+    # an approaching comet overshoots the path end even though a real
+    # intercept exists inside it — returning None here caused blanket
+    # false "comet_expired" refusals (measured: 51/51 small-fleet comet
+    # shots refused with eta=0.0). Converge against the clamped horizon
+    # and let _finalize_launch judge expiry from the swept-collision eta.
+    horizon = float(max(0, len(path) - path_index))
     px = float(target[P_X])
     py = float(target[P_Y])
-    turns = math.hypot(px - sx, py - sy) / speed
+    turns = max(0.0, math.hypot(px - sx, py - sy) - contact_shrink) / speed
     for _ in range(iters):
-        predicted = _predict_comet_xy(target, turns, comet_lookup)
+        predicted = _predict_comet_xy(target, min(turns, horizon), comet_lookup)
         if predicted is None:
             return None
         px, py = predicted
-        turns = math.hypot(px - sx, py - sy) / speed
+        turns = max(0.0, math.hypot(px - sx, py - sy) - contact_shrink) / speed
     return px, py, turns
 
 
@@ -959,11 +1000,13 @@ def lead_aim(
     """
     speed = fleet_speed(fleet_ships)
     if not target_orbiting or av_signed == 0 or speed <= 0:
-        return _lead_aim_static(sx, sy, tx0, ty0, fleet_ships)
+        return _lead_aim_static(sx, sy, tx0, ty0, fleet_ships,
+                                contact_shrink=target_radius)
     return _lead_aim_orbital(
         sx, sy, tx0, ty0, fleet_ships, av_signed,
         current_step=current_step,
         iters=iters,
+        contact_shrink=target_radius,
     )
 
 
@@ -1031,7 +1074,16 @@ def _finalize_launch(
     if hit_pid in comet_lookup:
         path, path_index = comet_lookup[hit_pid]
         eta_steps = int(math.ceil(hit_eta))
-        if path_index + eta_steps >= len(path):
+        # At idx == len(path) the comet is frozen-collidable for one last
+        # tick but is removed after that tick's combat REGARDLESS of the
+        # outcome — a fleet arriving then is spent for nothing, and a
+        # capture on the 1-2 real ticks before that yields a planet that
+        # evaporates immediately (1 production tick at best, and our
+        # swept eta vs the env's stepping can disagree by ~1 tick at
+        # 15-25 tick ranges — measured as wasted "vanished with comet"
+        # arrivals). Require the arrival to land 2+ ticks inside the
+        # path: the obstacle sweep still models the frozen tick.
+        if path_index + eta_steps >= len(path) - 2:
             return Launch(
                 src_id, tid, angle, eta, ships,
                 ok=False, reason="comet_expired_at_arrival",
@@ -1166,6 +1218,7 @@ def _plan_launch_static(
     sy = float(from_planet[P_Y])
     tx0 = float(to_planet[P_X])
     ty0 = float(to_planet[P_Y])
+    shrink = float(from_planet[P_RADIUS]) + float(to_planet[P_RADIUS])
     return _plan_launch_for_motion(
         from_planet=from_planet,
         to_planet=to_planet,
@@ -1177,7 +1230,8 @@ def _plan_launch_static(
         safety_buffer=safety_buffer,
         convergence_iters=convergence_iters,
         motion_kind="static",
-        intercept_fn=lambda ships: _lead_aim_static(sx, sy, tx0, ty0, ships),
+        intercept_fn=lambda ships: _lead_aim_static(
+            sx, sy, tx0, ty0, ships, contact_shrink=shrink),
         angular_velocity=angular_velocity,
         av_signed=av_signed,
         comet_lookup=comet_lookup,
@@ -1224,6 +1278,8 @@ def _plan_launch_orbital(
             ships,
             av_signed,
             current_step=current_step,
+            contact_shrink=(float(from_planet[P_RADIUS])
+                            + float(to_planet[P_RADIUS])),
         ),
         angular_velocity=angular_velocity,
         av_signed=av_signed,
@@ -1267,6 +1323,8 @@ def _plan_launch_comet(
             to_planet,
             ships,
             comet_lookup,
+            contact_shrink=(float(from_planet[P_RADIUS])
+                            + float(to_planet[P_RADIUS])),
         ),
         angular_velocity=angular_velocity,
         av_signed=av_signed,
