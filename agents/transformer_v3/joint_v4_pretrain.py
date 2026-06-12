@@ -160,8 +160,10 @@ def train_joint_v4(args) -> Path:
     _grp([vh.value_trunk, vh.win_head, vh.fwd_heads, inbound_head],
          args.lr_value, "value")
     # back/rank/survives heads: NO loss, NO optimizer — dead weights.
-    _grp([model.pair_head, model.alloc_conc_head, model.short_heads],
-         args.lr_action, "action")
+    _grp([model.pair_head, model.short_heads], args.lr_action, "action")
+    # α0 concentration head gets its OWN slow group — the lgamma/digamma
+    # gradients near the cap are steep (stage-B detonation evidence).
+    _grp([model.alloc_conc_head], args.lr_conc, "conc")
     _grp([model.dual_role, model.joint_role], args.lr_l34, "l34")
     _grp([model.cross], args.lr_l2, "l2")
     opt = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
@@ -309,6 +311,8 @@ def main() -> None:
     p.add_argument("--lr-value", type=float, default=1e-4)
     p.add_argument("--lr-action", type=float, default=2e-5)
     p.add_argument("--lr-l34", type=float, default=1e-5)
+    p.add_argument("--lr-conc", type=float, default=5e-6,
+                   help="α0 concentration head — own slow group")
     p.add_argument("--lr-l2", type=float, default=5e-6)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--value-coef", type=float, default=1.0)
