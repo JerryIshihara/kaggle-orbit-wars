@@ -578,6 +578,49 @@ def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
             action, source_mask=source_mask, source_ships=source_ships,
             slot_to_pid=slot_to_pid, planets=planets, min_launch=int(min_launch),
         )
+        # DOOMED-launch pricing: validate each emitted move with the deploy
+        # planner; sun/boundary/expired intents count into invalid_launch so
+        # --inval-coef can charge them. Moves still FLY as aimed (training
+        # dynamics unchanged) — only the reward sees the verdict. ~29% of
+        # v4 intents were physically doomed with no explicit cost (replay
+        # analysis, run3); the diluted ship signal never taught avoidance.
+        if env_moves and os.environ.get("OW_PPO_PRICE_DOOMED", "1") == "1":
+            try:
+                from agents.physics_utils import plan_launch as _plan
+                by_id = {int(p_.id): p_ for p_ in planets}
+                pid_of_move_tgt = {}
+                src_rows2 = source_mask.nonzero(as_tuple=False).flatten().tolist()
+                P_ = action.select_counts.shape[0]
+                tgt_list = []
+                for s2 in src_rows2:
+                    for t2 in (action.select_counts[s2, :P_] >= 1).nonzero(
+                            as_tuple=False).flatten().tolist():
+                        tgt_list.append((slot_to_pid[s2], slot_to_pid[t2]))
+                av = float(get("angular_velocity") or 0.0)
+                comet_ids = set(int(c) for c in (get("comet_planet_ids") or []))
+                doomed = 0
+                ti = 0
+                for mv in env_moves:
+                    src_pid = int(mv[0]); ships2 = int(mv[2])
+                    # match move -> intended target pid in emission order
+                    while ti < len(tgt_list) and tgt_list[ti][0] != src_pid:
+                        ti += 1
+                    if ti >= len(tgt_list):
+                        break
+                    tgt_pid = tgt_list[ti][1]; ti += 1
+                    sp = by_id.get(src_pid); tp = by_id.get(tgt_pid)
+                    if sp is None or tp is None:
+                        continue
+                    res = _plan(
+                        tuple(sp), tuple(tp), planets=[tuple(p_) for p_ in planets],
+                        fleets=[tuple(f_) for f_ in fleets], player=int(learner_slot),
+                        angular_velocity=av, comet_planet_ids=comet_ids,
+                        comets=get("comets"), fleet_ships=ships2)
+                    if not getattr(res, "ok", True):
+                        doomed += 1
+                n_invalid += doomed
+            except Exception:
+                pass  # pricing must never kill a rollout
     elif contract == "v3":
         # bounded_k v3: select_logit_bias doubles as the SELF-token bias
         # (same sign convention — positive fires less).
