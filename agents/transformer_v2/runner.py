@@ -528,6 +528,14 @@ class TransformerAgent:
         pair_logits = preds["pair_logits"].squeeze(0)               # (P, P)
         pair_frac_raw = preds["pair_frac"].squeeze(0)               # (P, P) raw logit
         idx_to_pid = {i: pid for pid, i in pid_to_idx.items()}
+        # Stash this step's head outputs + slot map for callers that re-draw
+        # allocations WITHOUT a second forward (KRankAgent's N×M candidates).
+        self._last_act_ctx = {
+            "pair_frac_raw": pair_frac_raw,
+            "alloc_conc": (preds["alloc_conc"].squeeze(0)
+                           if preds.get("alloc_conc") is not None else None),
+            "pid_to_idx": dict(pid_to_idx),
+        }
 
         # ---- Build launchable / ownership masks from obs ----
         get = obs.get if isinstance(obs, dict) else lambda k, d=None: getattr(obs, k, d)
@@ -952,6 +960,7 @@ class TransformerAgent:
             per_source_total_ships[source_pid] = int(src.ships)
 
         moves: list[list] = []
+        move_tgt_pids: list[int] = []   # aligned with moves; for N×M realloc
         for source_pid, target_pid, frac in actions:
             budget = per_source_budget.get(source_pid, 0)
             if budget < min_launch:
@@ -980,6 +989,10 @@ class TransformerAgent:
                 actually_spent = int(emitted[0][2])
                 per_source_budget[source_pid] = max(0, budget - actually_spent)
                 moves.extend(emitted)
+                move_tgt_pids.extend([int(target_pid)] * len(emitted))
+        # Aligned target pids for the just-emitted moves — lets KRankAgent
+        # re-draw allocations (N×M) without a second forward.
+        self._last_move_tgt_pids = move_tgt_pids
         return moves
 
     @staticmethod

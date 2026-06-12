@@ -41,6 +41,11 @@ def main() -> None:
     ap.add_argument("--inference-mode", default=None,
                     help="override; default = auto from ckpt action_contract")
     ap.add_argument("--logit-threshold", type=float, default=2.0)
+    ap.add_argument("--krank", type=int, default=0,
+                    help="K>0 wraps the LEARNER in KRankAgent (simulate-then-"
+                         "score over K candidates; needs a value-headed v4 "
+                         "ckpt). N x M structure via OW_V4_N / OW_V4_M. "
+                         "Gate-A/B: K in {1,4,8} vs plain sample.")
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
@@ -52,11 +57,15 @@ def main() -> None:
 
     def _learner_fn(obs):
         if _singleton["agent"] is None:
-            _singleton["agent"] = TransformerAgent.load(
+            ag = TransformerAgent.load(
                 ckpt_path=args.ckpt, device=args.device,
                 inference_mode=args.inference_mode,
                 logit_threshold=args.logit_threshold,
             )
+            if args.krank > 0:
+                from agents.transformer_v3.krank import KRankAgent
+                ag = KRankAgent(ag, k=args.krank)
+            _singleton["agent"] = ag
         return _singleton["agent"].act(obs)
 
     if learner_id not in _registry._REGISTRY:
