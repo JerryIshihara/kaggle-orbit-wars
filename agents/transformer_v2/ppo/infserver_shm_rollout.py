@@ -85,13 +85,15 @@ def _alloc_shared(n_slots: int, T: int, shapes: dict, max_planets: int):
     act_frac = torch.zeros((n_slots, P, P), dtype=torch.float32); act_frac.share_memory_()
     act_value = torch.zeros((n_slots,), dtype=torch.float32); act_value.share_memory_()
     act_sigma = torch.zeros((n_slots,), dtype=torch.float32); act_sigma.share_memory_()
+    # v4 contract: per-source alpha0 head output (zeros for v2/v3 policies)
+    act_conc = torch.zeros((n_slots, P), dtype=torch.float32); act_conc.share_memory_()
     # control flags + per-slot meta (game_idx, step, seat, is_learner); -1 empty
     req_ready = torch.zeros((n_slots,), dtype=torch.uint8); req_ready.share_memory_()
     act_ready = torch.zeros((n_slots,), dtype=torch.uint8); act_ready.share_memory_()
     meta = torch.full((n_slots, 4), -1, dtype=torch.int64); meta.share_memory_()
     return {
         "obs": obs, "act_pair": act_pair, "act_frac": act_frac,
-        "act_value": act_value, "act_sigma": act_sigma,
+        "act_value": act_value, "act_sigma": act_sigma, "act_conc": act_conc,
         "req_ready": req_ready, "act_ready": act_ready, "meta": meta,
     }
 
@@ -115,6 +117,7 @@ def _shm_worker(wid, specs, shm, cfg):
     obs_buf = shm["obs"]; req_ready = shm["req_ready"]; act_ready = shm["act_ready"]
     meta = shm["meta"]; act_pair = shm["act_pair"]; act_frac = shm["act_frac"]
     act_value = shm["act_value"]; act_sigma = shm["act_sigma"]
+    act_conc = shm["act_conc"]
 
     for (idx, seed, num_players, learner_seat) in specs:
         try:
@@ -122,7 +125,8 @@ def _shm_worker(wid, specs, shm, cfg):
             env.reset(num_players)
             buffer = smoke.EpisodeBuffer(seed=seed, learner_seat=learner_seat)
             trackers = [FleetTracker() for _ in range(num_players)]
-            histories = [_RolloutHistory(T) for _ in range(num_players)]
+            histories = [_RolloutHistory(T, offsets=cfg.get("history_offsets"))
+                         for _ in range(num_players)]
             while not env.done:
                 states = env.state
                 step_idx = int(_oget(states[0].observation, "step", 0) or 0)
@@ -167,7 +171,12 @@ def _shm_worker(wid, specs, shm, cfg):
                         value=float(act_value[slot]), sigma_val=float(act_sigma[slot]),
                         store=stores[seat], learner_slot=seat, num_players=num_players,
                         noop_logit_bias=float(cfg.get("noop_logit_bias", 0.0)),
-                        select_logit_bias=float(cfg.get("select_logit_bias", 0.0)))
+                        select_logit_bias=float(cfg.get("select_logit_bias", 0.0)),
+                        contract=(str(cfg.get("contract", "v2"))
+                                  if seat == learner_seat
+                                  else str(cfg.get("opponent_contract", "v2"))),
+                        k_max=int(cfg.get("select_k_max", 3)),
+                        alloc_conc=act_conc[slot].clone())
                     act_ready[slot] = 0
                     moves[seat] = env_moves
                     if seat == learner_seat:
@@ -203,6 +212,7 @@ def _forwarder_proc(f, n_fwd, policy, opponent_policy, planet_enc, fleet_enc, co
     req_ready = shm["req_ready"]; act_ready = shm["act_ready"]; meta = shm["meta"]
     obs_buf = shm["obs"]; act_pair = shm["act_pair"]; act_frac = shm["act_frac"]
     act_value = shm["act_value"]; act_sigma = shm["act_sigma"]
+    act_conc = shm["act_conc"]
 
     def _fwd(pol, slots):
         stores = [{k: obs_buf[k][s] for k in _TEMPORAL_KEYS} for s in slots]
@@ -212,9 +222,16 @@ def _forwarder_proc(f, n_fwd, policy, opponent_policy, planet_enc, fleet_enc, co
             fl = torch.nan_to_num(out["frac_loc"], nan=0.0, posinf=0.0, neginf=0.0).detach().cpu()
             vv = torch.nan_to_num(out["value"], nan=0.0, posinf=0.0, neginf=0.0).detach().cpu()
             sv = float(out["sigma"].detach().cpu().item())
+            cc = out.get("alloc_conc")
+            cc = (torch.nan_to_num(cc, nan=0.0).detach().cpu()
+                  if cc is not None else None)
         for k, s in enumerate(slots):
             act_pair[s].copy_(pl[k]); act_frac[s].copy_(fl[k])
             act_value[s] = float(vv[k]); act_sigma[s] = sv
+            if cc is not None:
+                act_conc[s].copy_(cc[k])
+            else:
+                act_conc[s].zero_()
 
     while not done_flag.value:
         ready = [s for s in my_slots if int(req_ready[s]) == 1]
@@ -244,7 +261,9 @@ def run_shm_rollout(
     max_planets: int, max_fleets: int, sigma: float,
     n_forwarders: int = 4,
     noop_logit_bias: float = 0.0, select_logit_bias: float = 0.0,
-    history_window: int = 10, max_batch: int = 256,
+    contract: str = "v2", opponent_contract: str = "v2", select_k_max: int = 3,
+    history_window: int = 10, history_offsets: list[int] | None = None,
+    max_batch: int = 256,
     spool_dir: str | Path | None = None,
     on_progress: Callable[[dict], None] | None = None,
     log_every_s: float = 2.0, stall_timeout_s: float = 180.0,
@@ -280,6 +299,9 @@ def run_shm_rollout(
         "max_planets": int(max_planets), "max_fleets": int(max_fleets),
         "history_window": int(history_window), "noop_logit_bias": float(noop_logit_bias),
         "select_logit_bias": float(select_logit_bias), "max_players_slots": int(max_players),
+        "contract": str(contract), "opponent_contract": str(opponent_contract),
+        "select_k_max": int(select_k_max),
+        "history_offsets": (list(history_offsets) if history_offsets else None),
         "spool_dir": str(spool_root), "_result_q": result_q, "progress_every": int(progress_every),
         "target_cap_k_max": 4, "target_cap_lambda": 0.0,
     }

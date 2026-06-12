@@ -1048,10 +1048,10 @@ def main() -> int:
                         "over-firing multi-target policy to stop firing illegal cells. "
                         "Default 0.0 = off. ~PBRS per-step |r| is ~0.006, so 0.02 ≈ 3× that.")
     args = p.parse_args()
-    if args.action_contract in ("v3", "v4") and args.rollout in ("pool", "shm"):
+    if args.action_contract in ("v3", "v4") and args.rollout == "pool":
         raise SystemExit(
-            f"--action-contract {args.action_contract} is wired for the batched and infserver "
-            "rollouts only; use --rollout batched or infserver."
+            f"--action-contract {args.action_contract} is wired for the batched, "
+            "infserver and shm rollouts; --rollout pool stays v2-only."
         )
     if args.rollout == "pool" and not args.allow_cpu_forward_rollout:
         raise SystemExit(
@@ -1466,7 +1466,11 @@ def main() -> int:
                 n_forwarders=args.shm_forwarders,
                 noop_logit_bias=0.0,
                 select_logit_bias=args.select_logit_bias,
+                contract=args.action_contract,
+                opponent_contract=args.opponent_contract,
+                select_k_max=args.select_k_max,
                 history_window=args.history_window,
+                history_offsets=_history_offsets,
                 max_batch=args.infserver_max_batch,
                 spool_dir=(
                     (args.infserver_spool_dir / run_id / _vtag(policy_version))
