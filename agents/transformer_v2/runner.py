@@ -306,6 +306,18 @@ class TransformerAgent:
         # Without this, a skip-L3/L4 ckpt would build a full model and leave
         # L3/L4 at RANDOM INIT (the PairHead would then read garbage), making
         # the loaded agent silently broken.
+        if "model" not in ckpt and "policy" in ckpt:
+            # PPO trial payload (policy_v*.pt): PPOActorCritic state_dict with
+            # entity_model.* prefixes. Strip to the supervised layout so gate
+            # evals can load checkpoints directly — no export step. The PPO
+            # wrapper's own heads (residual value_head, pair_compare) are
+            # dropped; value_heads.* live inside entity_model.* and survive.
+            ckpt = dict(ckpt)
+            ckpt["model"] = {
+                k[len("entity_model."):]: v
+                for k, v in ckpt["policy"].items()
+                if k.startswith("entity_model.")
+            }
         _sd_keys = ckpt["model"].keys()
         if "skip_l34" in cfg:
             skip_l34 = bool(cfg["skip_l34"])
