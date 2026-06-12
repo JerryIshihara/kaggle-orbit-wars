@@ -614,18 +614,21 @@ def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
             s += sum(f.ships for f in fleets if int(f.owner) == seat)
             score_enemy_max = max(score_enemy_max, s)
 
+    # Index/enum fields stored int16 (values are slot indices < 32k): the
+    # T18 packs' int64 routing tensors were a top RAM cost at iter packing
+    # (109GB-cgroup OOMs). _PPOWithL0.forward widens back to long at use.
     record = StepRecord(
         planet_features=store["planet_features"].detach().cpu(),
         fleet_features=store["fleet_features"].detach().cpu(),
-        fleet_target_idx=store["fleet_target_idx"].detach().cpu(),
-        fleet_source_idx=store["fleet_source_idx"].detach().cpu(),
-        fleet_owner_slot=store["fleet_owner_slot"].detach().cpu(),
+        fleet_target_idx=store["fleet_target_idx"].detach().cpu().to(torch.int16),
+        fleet_source_idx=store["fleet_source_idx"].detach().cpu().to(torch.int16),
+        fleet_owner_slot=store["fleet_owner_slot"].detach().cpu().to(torch.int16),
         fleet_ships_log=store["fleet_ships_log"].detach().cpu(),
         fleet_eta_norm=store["fleet_eta_norm"].detach().cpu(),
         fleet_mask=store["fleet_mask"].detach().cpu(),
         planet_mask=store["planet_mask"].detach().cpu(),
         is_comet=store["is_comet"].detach().cpu(),
-        pair_type_ids=_current_pair_type_ids(store["pair_type_ids"]),
+        pair_type_ids=_current_pair_type_ids(store["pair_type_ids"]).to(torch.int16),
         pair_mask=pair_mask, source_mask=source_mask, action=action, value=value,
         invalid_launch=n_invalid, emitted_launch=n_emitted,
         n_selected_targets=int(action.diagnostics.get("n_fired_total", 0)),
@@ -1312,6 +1315,16 @@ class _PPOWithL0(torch.nn.Module):
 
     def forward(self, planet_features, fleet_features, planet_mask,
                  is_comet, pair_type_ids, routing, phi=None):
+        # StepRecords store index/enum fields as int16 (pack-memory shrink);
+        # embeddings and gather need int64 — widen at the single choke point.
+        # Lossless: the stored values are slot indices < 32k.
+        if pair_type_ids.dtype != torch.long:
+            pair_type_ids = pair_type_ids.long()
+        if routing.get("fleet_target_idx") is not None and \
+                routing["fleet_target_idx"].dtype != torch.long:
+            routing = dict(routing)
+            for k in ("fleet_target_idx", "fleet_source_idx", "fleet_owner_slot"):
+                routing[k] = routing[k].long()
         # L0 frozen forward. Handles both rollout-time (B, P, dim) and
         # BC-anchor (B, T, P, dim) shapes — comet_features must match
         # planet_features' leading shape exactly.
