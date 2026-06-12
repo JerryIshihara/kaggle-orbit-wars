@@ -66,12 +66,30 @@ class CrossEntityAttention(nn.Module):
         ff_mult: int = 2,
         dropout: float = 0.0,
         n_steps: int = 9,
+        n_player_tokens: int = 0,
     ):
         super().__init__()
         self.d_model = d_model
         self.n_steps = n_steps
         self.cls = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.cls, std=0.02)
+        # Optional per-player readout tokens (transformer_v3 l2_tokens
+        # player state; replaces the PlayerConsolidator). They sit in the
+        # sequence as PURE READERS: an asymmetric attention mask keeps the
+        # global CLS and every planet token blind to them, so enabling
+        # them leaves all other outputs bit-identical — a warm-started
+        # model reproduces its pre-player-token forward exactly. Slot
+        # order is learner-relative (0 = self). Read out via
+        # ``self.last_player_tokens`` after forward (stash, not return,
+        # to keep the v2 call signature).
+        self.n_player_tokens = int(n_player_tokens)
+        if self.n_player_tokens > 0:
+            self.player_tokens = nn.Parameter(
+                torch.zeros(1, self.n_player_tokens, d_model))
+            nn.init.trunc_normal_(self.player_tokens, std=0.02)
+        else:
+            self.player_tokens = None
+        self.last_player_tokens: torch.Tensor | None = None
         # Per-relative-step positional encoding. Step ``i`` of ``n_steps``
         # gets ``step_embed[i]`` added to every planet token at that step.
         # Same role as positional embeddings, but along time rather than
@@ -132,18 +150,43 @@ class CrossEntityAttention(nn.Module):
         seq = seq.reshape(B, T * P, d)
         mask_flat = entity_mask.reshape(B, T * P)                      # bool
 
-        # Prepend CLS (never masked).
+        # Prepend CLS (never masked) and, when enabled, the per-player
+        # reader tokens right after it.
+        n_pt = self.n_player_tokens
         cls_tok = self.cls.expand(B, 1, d)
-        seq = torch.cat([cls_tok, seq], dim=1)                         # (B, 1 + T*P, d)
-        cls_unmasked = torch.zeros(
-            B, 1, dtype=torch.bool, device=entity_tokens.device,
+        if n_pt > 0:
+            seq = torch.cat(
+                [cls_tok, self.player_tokens.expand(B, n_pt, d), seq], dim=1,
+            )                                                  # (B, 1+n_pt+T*P, d)
+        else:
+            seq = torch.cat([cls_tok, seq], dim=1)             # (B, 1 + T*P, d)
+        lead_unmasked = torch.zeros(
+            B, 1 + n_pt, dtype=torch.bool, device=entity_tokens.device,
         )
-        key_padding = torch.cat([cls_unmasked, ~mask_flat], dim=1)     # True = MASKED
+        key_padding = torch.cat([lead_unmasked, ~mask_flat], dim=1)    # True = MASKED
 
-        out = self.encoder(seq, src_key_padding_mask=key_padding)      # (B, 1+T*P, d)
+        attn_mask = None
+        if n_pt > 0:
+            # Asymmetric mask: queries OTHER than the player tokens must
+            # not attend to the player-token keys (cols 1..n_pt). Player
+            # rows attend everywhere. This keeps CLS + planet outputs
+            # bit-identical to the no-player-token forward.
+            L = seq.shape[1]
+            attn_mask = torch.zeros(
+                L, L, dtype=seq.dtype, device=seq.device,
+            )
+            attn_mask[:, 1:1 + n_pt] = float("-inf")
+            attn_mask[1:1 + n_pt, 1:1 + n_pt] = 0.0
+            attn_mask[1:1 + n_pt, :] = 0.0
+
+        out = self.encoder(
+            seq, mask=attn_mask, src_key_padding_mask=key_padding,
+        )                                                       # (B, 1+n_pt+T*P, d)
 
         global_token = out[:, 0]                                        # (B, d)
-        contextual = out[:, 1:].reshape(B, T, P, d)                     # (B, T, P, d)
+        if n_pt > 0:
+            self.last_player_tokens = out[:, 1:1 + n_pt]                # (B, n_pt, d)
+        contextual = out[:, 1 + n_pt:].reshape(B, T, P, d)              # (B, T, P, d)
         if squeeze_t:
             contextual = contextual.squeeze(1)
         return contextual, global_token

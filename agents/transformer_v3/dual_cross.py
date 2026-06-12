@@ -32,12 +32,15 @@ import torch
 import torch.nn as nn
 
 from ..transformer_v2.aggregator.cross_entity import CrossEntityAttention
+from ..transformer_v2.pretrain.entity_encoder import ENTITY_N_OWNER_CLASSES
 from .history import (
     LONG_SLOT_IDX,
     SHORT_SLOT_IDX,
     N_BRANCH,
     N_UNION,
 )
+
+N_PLAYER_TOKENS = 4
 
 
 def _zero_init_fusion(d_model: int) -> nn.Linear:
@@ -67,13 +70,26 @@ class DualRateCrossEntity(nn.Module):
         self.long = CrossEntityAttention(
             d_model=d_model, n_heads=n_heads, n_layers=n_layers,
             ff_mult=ff_mult, dropout=dropout, n_steps=N_BRANCH,
+            n_player_tokens=N_PLAYER_TOKENS,
         )
         self.short = CrossEntityAttention(
             d_model=d_model, n_heads=n_heads, n_layers=n_layers,
             ff_mult=ff_mult, dropout=dropout, n_steps=N_BRANCH,
+            n_player_tokens=N_PLAYER_TOKENS,
         )
         self.fuse_tokens = _zero_init_fusion(d_model)
         self.fuse_glob = _zero_init_fusion(d_model)
+        # v3.1 l2_tokens player state (replaces the PlayerConsolidator):
+        # learner-relative owner one-hots are zero-init projected onto the
+        # entity tokens BEFORE the branches (sharpens owner routing for
+        # the player readers without disturbing the warm-started planet
+        # path at init), and each branch's 4 player reader tokens are
+        # fused like the global CLS.
+        self.owner_proj = nn.Linear(ENTITY_N_OWNER_CLASSES, d_model, bias=False)
+        with torch.no_grad():
+            self.owner_proj.weight.zero_()
+        self.fuse_player = _zero_init_fusion(d_model)
+        self.last_player_state: torch.Tensor | None = None
         # Buffer-free index tuples (python ints survive state_dict round
         # trips trivially and index_select accepts lists).
         self._long_idx = list(LONG_SLOT_IDX)
@@ -90,15 +106,25 @@ class DualRateCrossEntity(nn.Module):
         self,
         entity_tokens: torch.Tensor,   # (B, N_UNION, P, d) or (B, P, d)
         entity_mask: torch.Tensor,     # (B, N_UNION, P)    or (B, P)
+        owner_oh: torch.Tensor | None = None,  # (B, N_UNION, P, 5)/(B, P, 5)
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if owner_oh is not None:
+            # Zero-init projection: identical tokens at init, owner
+            # routing fades in. None (legacy callers) == zeros.
+            entity_tokens = entity_tokens + self.owner_proj(
+                owner_oh.to(entity_tokens.dtype))
         if entity_tokens.dim() == 3:
             # Single frame: both branches see it as their current step
             # (step_embed[-1:]), fusion picks long-at-init.
             ctx_l, glob_l = self.long(entity_tokens, entity_mask)
+            pl_l = self.long.last_player_tokens
             ctx_s, glob_s = self.short(entity_tokens, entity_mask)
+            pl_s = self.short.last_player_tokens
             self.last_ctx_long_now, self.last_ctx_short_now = ctx_l, ctx_s
             ctx = self.fuse_tokens(torch.cat([ctx_l, ctx_s], dim=-1))
             glob = self.fuse_glob(torch.cat([glob_l, glob_s], dim=-1))
+            self.last_player_state = self.fuse_player(
+                torch.cat([pl_l, pl_s], dim=-1))
             return ctx, glob
 
         B, T, P, d = entity_tokens.shape
@@ -112,9 +138,11 @@ class DualRateCrossEntity(nn.Module):
         ctx_l_full, glob_l = self.long(
             entity_tokens[:, self._long_idx], entity_mask[:, self._long_idx],
         )
+        pl_l = self.long.last_player_tokens
         ctx_s_full, glob_s = self.short(
             entity_tokens[:, self._short_idx], entity_mask[:, self._short_idx],
         )
+        pl_s = self.short.last_player_tokens
         # Current step of each branch (both branch windows end at offset 0).
         self.last_ctx_long_now = ctx_l_full[:, -1]
         self.last_ctx_short_now = ctx_s_full[:, -1]
@@ -122,6 +150,8 @@ class DualRateCrossEntity(nn.Module):
             torch.cat([ctx_l_full[:, -1], ctx_s_full[:, -1]], dim=-1)
         )
         glob = self.fuse_glob(torch.cat([glob_l, glob_s], dim=-1))
+        self.last_player_state = self.fuse_player(
+            torch.cat([pl_l, pl_s], dim=-1))
         # Rank-4 out so the caller's ``ctx_full[:, -1]`` lands on the
         # fused frame.
         return ctx.unsqueeze(1), glob

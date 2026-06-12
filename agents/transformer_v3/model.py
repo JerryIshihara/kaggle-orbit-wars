@@ -64,6 +64,12 @@ class EntityPretrainModelV3(EntityPretrainModel):
             ff_mult=kw.get("cross_ff_mult", 2),
             dropout=kw.get("dropout", 0.0),
         )
+        # v3.1: player_state comes from the per-branch player CLS tokens
+        # inside L2 (asymmetric mask keeps planet/global outputs
+        # untouched) — the PlayerConsolidator is REMOVED (~-1.5M params,
+        # one fewer attention pass). The base ctor built it because the
+        # value heads demand with_consolidator=True; drop it here.
+        self.consolidator = None
         # Short-horizon aux heads: direct supervision for the SHORT
         # branch (bypasses the zero-init fusion gate, which blocks main-
         # loss gradient to the branch until fusion weights move). Train-
@@ -76,6 +82,116 @@ class EntityPretrainModelV3(EntityPretrainModel):
             )
         else:
             self.short_heads = None
+
+    def forward_with_context(
+        self,
+        planet_tokens: torch.Tensor,
+        fleet_tokens: torch.Tensor,
+        routing: dict[str, torch.Tensor],
+        planet_mask: torch.Tensor,
+        is_comet: torch.Tensor | None = None,
+        pair_type_ids: torch.Tensor | None = None,
+        planet_owner_oh: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """v3.1 override of the base method: the FULL owner one-hot stack
+        is zero-init projected onto the entity tokens before the dual L2
+        (the base only sliced ``[:, -1]`` for the consolidator), and
+        ``player_state`` is read from the in-L2 player tokens instead of
+        the removed PlayerConsolidator. Everything else mirrors the base.
+        """
+        is_temporal = planet_tokens.dim() == 4
+        if is_temporal:
+            B, T, P, d = planet_tokens.shape
+            F = fleet_tokens.shape[2]
+            entity_tokens = self.entity(
+                planet_tokens.reshape(B * T, P, d),
+                fleet_tokens.reshape(B * T, F, d),
+                routing["fleet_target_idx"].reshape(B * T, F),
+                routing["fleet_source_idx"].reshape(B * T, F),
+                routing["fleet_owner_slot"].reshape(B * T, F),
+                routing["fleet_ships_log"].reshape(B * T, F),
+                routing["fleet_eta_norm"].reshape(B * T, F),
+                routing["fleet_mask"].reshape(B * T, F),
+                planet_mask=planet_mask.reshape(B * T, P),
+            ).reshape(B, T, P, d)
+        else:
+            entity_tokens = self.entity(
+                planet_tokens, fleet_tokens,
+                routing["fleet_target_idx"], routing["fleet_source_idx"],
+                routing["fleet_owner_slot"], routing["fleet_ships_log"],
+                routing["fleet_eta_norm"], routing["fleet_mask"],
+                planet_mask=planet_mask,
+            )
+
+        ctx_full, glob = self.cross(
+            entity_tokens, planet_mask, owner_oh=planet_owner_oh,
+        )
+        if is_temporal:
+            ctx_now = ctx_full[:, -1]
+            planet_mask_now = planet_mask[:, -1]
+            l1_now = entity_tokens[:, -1]
+        else:
+            ctx_now = ctx_full
+            planet_mask_now = planet_mask
+            l1_now = entity_tokens
+
+        if is_comet is None:
+            is_comet_now = torch.zeros(
+                planet_mask_now.shape, dtype=torch.bool,
+                device=planet_mask_now.device,
+            )
+        elif is_comet.dim() == 3:
+            is_comet_now = is_comet[:, -1].to(torch.bool)
+        else:
+            is_comet_now = is_comet.to(torch.bool)
+
+        if pair_type_ids is not None and pair_type_ids.dim() == 4:
+            pair_type_now = pair_type_ids[:, -1].to(torch.long)
+        elif pair_type_ids is not None:
+            pair_type_now = pair_type_ids.to(torch.long)
+        else:
+            pair_type_now = None
+
+        player_state = self.cross.last_player_state
+
+        if self.skip_l34:
+            source_joint = ctx_now
+            target_joint = ctx_now
+        else:
+            source_aware, target_aware = self.dual_role(ctx_now, planet_mask_now)
+            source_joint, target_joint = self.joint_role(
+                source_aware, target_aware, planet_mask_now,
+            )
+
+        B_now, P_now = planet_mask_now.shape
+        pair_valid = (
+            planet_mask_now.unsqueeze(2)
+            & planet_mask_now.unsqueeze(1)
+        )
+        eye = torch.eye(P_now, dtype=torch.bool, device=pair_valid.device)
+        pair_valid = pair_valid & ~eye.unsqueeze(0)
+
+        heads = self.pair_head(
+            source_joint, target_joint, ctx_now,
+            l1_tokens=l1_now,
+            is_comet=is_comet_now,
+            pair_type_ids=pair_type_now,
+            pair_valid=pair_valid,
+        )
+        out = {
+            "pair_logits": heads["pair_logits"],
+            "pair_frac": heads["pair_frac"],
+            "glob": glob,
+            "ctx_now": ctx_now,
+            "player_state": player_state,
+            "source_joint": source_joint,
+            "target_joint": target_joint,
+            "l1_now": l1_now,
+        }
+        # Same merge as the base: one forward yields action + value preds.
+        if self.value_heads is not None and player_state is not None:
+            out.update(self.value_heads(glob, player_state))
+        return out
 
     def short_aux_loss(
         self, batch: dict[str, torch.Tensor],
@@ -106,6 +222,8 @@ class EntityPretrainModelV3(EntityPretrainModel):
             "long_history_offsets": list(LONG_HISTORY_OFFSETS),
             "short_history_offsets": list(SHORT_HISTORY_OFFSETS),
             "with_short_aux": self.with_short_aux,
+            "with_consolidator": False,
+            "player_state_source": "l2_player_tokens",
         }
 
 
@@ -130,8 +248,20 @@ def adapt_v2_state_dict(
     Use with ``model.load_state_dict(adapted, strict=False)`` and assert
     the only missing keys are ``cross.fuse_*``.
     """
+    if any(k.startswith("cross.long.") for k in sd):
+        # Already v3-shaped (e.g. warm-starting v3.1 from a stopped v3
+        # dual-rate run): branch/fusion/aux keys map 1:1 — only the
+        # removed consolidator is dropped; the player-token machinery
+        # (owner_proj / player_tokens / fuse_player) stays fresh.
+        return {k: v for k, v in sd.items()
+                if not k.startswith("consolidator.")}
+
     out: dict[str, torch.Tensor] = {}
     for k, v in sd.items():
+        if k.startswith("consolidator."):
+            # v3.1: PlayerConsolidator removed — player_state comes from
+            # the in-L2 player tokens. Nothing to map these onto.
+            continue
         if not k.startswith("cross."):
             out[k] = v
             continue

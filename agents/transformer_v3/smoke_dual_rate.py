@@ -83,20 +83,27 @@ def main() -> None:
 
     # ---- 1. warm-start mapping --------------------------------------
     adapted = adapt_v2_state_dict(v2.state_dict())
+    assert not any(k.startswith("consolidator.") for k in adapted), (
+        "consolidator keys must be dropped by the adapter (v3.1)")
     res = v3.load_state_dict(adapted, strict=False)
     fuse_missing = sorted(
         k for k in res.missing_keys if k.startswith("cross.fuse_")
     )
+    fresh_ok = (
+        "cross.fuse_", "short_heads.", "cross.owner_proj",
+        "cross.long.player_tokens", "cross.short.player_tokens",
+    )
     other_missing = sorted(
-        k for k in res.missing_keys
-        if not k.startswith(("cross.fuse_", "short_heads."))
+        k for k in res.missing_keys if not k.startswith(fresh_ok)
     )
     assert fuse_missing == [
         "cross.fuse_glob.bias", "cross.fuse_glob.weight",
+        "cross.fuse_player.bias", "cross.fuse_player.weight",
         "cross.fuse_tokens.bias", "cross.fuse_tokens.weight",
     ], f"unexpected fusion missing set: {fuse_missing}"
-    assert not other_missing, f"non-fusion/non-aux missing: {other_missing}"
+    assert not other_missing, f"non-fresh missing: {other_missing}"
     assert not res.unexpected_keys, res.unexpected_keys
+    assert v3.consolidator is None and v3.cross.owner_proj.weight.abs().sum() == 0
     se_v2 = v2.cross.step_embed
     se_s = v3.cross.short.step_embed
     for off in (10, 0):
@@ -119,13 +126,22 @@ def main() -> None:
     with torch.no_grad():
         out2 = _fwd(v2, *long_views)
         out3 = _fwd(v3, pt, ft, routing, pm, ic, pti, oh)
-    for k in ("pair_logits", "pair_frac", "glob", "ctx_now", "player_state"):
+    # player_state intentionally differs (v2 = consolidator, v3.1 = in-L2
+    # player tokens). The four action/context outputs must match exactly —
+    # which simultaneously PROVES the asymmetric mask: the extra player
+    # tokens and the zero-init owner projection leave the planet/global
+    # path bit-identical.
+    for k in ("pair_logits", "pair_frac", "glob", "ctx_now"):
         a, b = out2[k], out3[k]
         assert a is not None and b is not None, k
         diff = (a - b).abs().max().item()
         assert diff < 1e-5, f"{k}: max diff {diff}"
-    print("[2] init equivalence OK (temporal: v3(union) == v2(long view), "
-          "max|diff| < 1e-5 on pair_logits/pair_frac/glob/ctx_now/player_state)")
+    ps = out3["player_state"]
+    assert ps is not None and ps.shape == (B, 4, D) and torch.isfinite(ps).all()
+    assert "win" in out3 and out3["win"].shape[:2] == (B, 4)
+    print("[2] init equivalence OK (v3(union+owner+player tokens) == "
+          "v2(long view) on pair_logits/pair_frac/glob/ctx_now — mask "
+          "invisibility + zero-init owner proven; player_state (B,4,d) live)")
 
     with torch.no_grad():
         s2 = _fwd(v2, *(t[:, -1] if isinstance(t, torch.Tensor) else
@@ -211,6 +227,25 @@ def main() -> None:
     print(f"[3b] short-horizon aux OK (|g| short={g_short_aux:.4f} > 0 at "
           f"zero-init fusion — gate bypassed; long untouched; terms: "
           f"{ {k: round(v, 3) for k, v in aux_terms.items()} })")
+
+    # ---- 3c. value path trains the player-token machinery ------------
+    v3.zero_grad()
+    out = _fwd(v3, pt, ft, routing, pm, ic, pti, oh)
+    # NOT the win head — its last Linear is deliberately zero-init
+    # (neutral V at start), so it passes no gradient at init. The fwd
+    # signal heads are default-init and train from step 1.
+    out["fwd"].square().mean().backward()
+    g_pl_long = v3.cross.long.player_tokens.grad.abs().sum().item()
+    g_pl_short = v3.cross.short.player_tokens.grad
+    g_pl_short = 0.0 if g_pl_short is None else g_pl_short.abs().sum().item()
+    g_fuse_pl = v3.cross.fuse_player.weight.grad.abs().sum().item()
+    g_owner = v3.cross.owner_proj.weight.grad.abs().sum().item()
+    assert g_pl_long > 0, "win loss must reach the long player tokens"
+    assert g_pl_short == 0.0, "short player tokens gated at zero-init fusion"
+    assert g_fuse_pl > 0 and g_owner > 0
+    print(f"[3c] player-token value path OK (long tokens |g|={g_pl_long:.4f}, "
+          f"fuse_player |g|={g_fuse_pl:.4f}, owner_proj |g|={g_owner:.4f}; "
+          f"short tokens gated at init as designed)")
 
     # ---- 4. freeze semantics ----------------------------------------
     report = v3.freeze_below_l2()
