@@ -181,7 +181,7 @@ class TransformerAgent:
         num_players: int = 4,
         inference_mode: str = "threshold",
         logit_threshold: float = 2.0,
-        select_k_max: int = 4,
+        select_k_max: int = 3,
     ):
         if inference_mode not in self.INFERENCE_MODES:
             raise ValueError(
@@ -357,7 +357,7 @@ class TransformerAgent:
             max_fleets=cfg.get("max_fleets", 1024),
             inference_mode=inference_mode,
             logit_threshold=logit_threshold,
-            select_k_max=int(cfg.get("select_k_max", 4)),
+            select_k_max=int(cfg.get("select_k_max", 3)),
         )
 
     @torch.no_grad()

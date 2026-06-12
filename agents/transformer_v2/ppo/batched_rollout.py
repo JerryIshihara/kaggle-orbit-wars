@@ -92,7 +92,7 @@ class _Seat:
 
 def _batched_act(seats, envs, active, policy, planet_enc, fleet_enc, comet_enc,
                  *, max_planets, max_fleets, noop_logit_bias, device,
-                 select_logit_bias=0.0, contract="v2", k_max=4):
+                 select_logit_bias=0.0, contract="v2", k_max=3):
     """Featurize every ACTIVE seat, run ONE batched forward, then per-seat
     sample/project/record. Writes ``seat.moves`` for each acting seat."""
     items = []   # (seat, obs, pid_to_idx, store)
@@ -173,12 +173,12 @@ def run_batched_episodes(
     sigma: float,
     noop_logit_bias: float = 0.0,
     select_logit_bias: float = 0.0,
-    target_cap_k_max: int = 4,
+    target_cap_k_max: int = 3,
     target_cap_lambda: float = 0.0,
     history_window: int = 1,
     max_steps: int = 1200,
     contract: str = "v2",        # learner's contract; opponent seats stay v2
-    select_k_max: int = 4,
+    select_k_max: int = 3,
     on_step=None,                # optional callback(step, n_active) for progress
 ) -> list[EpisodeBuffer]:
     """Run ``len(specs)`` orbit_wars games in lockstep, batching the forward.

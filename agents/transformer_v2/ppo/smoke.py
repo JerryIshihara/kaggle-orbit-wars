@@ -441,7 +441,7 @@ def _project_bounded_k(
 def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
                    store, learner_slot, num_players, noop_logit_bias,
                    select_logit_bias: float = 0.0,
-                   contract: str = "v2", k_max: int = 4):
+                   contract: str = "v2", k_max: int = 3):
     """Legality masks -> sample -> project to env moves -> StepRecord. This is the
     post-forward logic shared by the single-env closure (see agent_fn) and the
     batched rollout (batched_rollout.py) so both produce IDENTICAL records.

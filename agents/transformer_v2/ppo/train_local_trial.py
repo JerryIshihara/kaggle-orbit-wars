@@ -1007,7 +1007,7 @@ def main() -> int:
                         "extras multinomial over the remainder — floor-feasible "
                         "by construction). The FIXED OPPONENT always plays v2. "
                         "Under v3, --select-logit-bias is the SELF-token bias.")
-    p.add_argument("--select-k-max", type=int, default=4,
+    p.add_argument("--select-k-max", type=int, default=3,
                    help="v3 only: max select draws per source "
                         "(k = min(this, ships//min_launch))")
     p.add_argument("--reinit-frac-head", action="store_true",

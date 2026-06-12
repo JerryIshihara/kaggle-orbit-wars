@@ -551,7 +551,7 @@ def sample_bounded_k(
     pair_mask: torch.Tensor,           # (P, P) bool — legal off-diagonal targets
     source_mask: torch.Tensor,         # (P,) bool — owned/legal source rows
     min_launch: int,
-    k_max: int = 4,
+    k_max: int = 3,
     temperature: float = 1.0,
     self_logit_bias: float = 0.0,
 ) -> BoundedKAction:

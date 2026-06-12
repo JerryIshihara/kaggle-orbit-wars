@@ -169,7 +169,7 @@ def _worker_play_one(
                 # contract; opponent seats stay on the frozen baseline's v2.
                 contract=(str(cfg.get("contract", "v2"))
                           if seat == learner_seat else "v2"),
-                k_max=int(cfg.get("select_k_max", 4)),
+                k_max=int(cfg.get("select_k_max", 3)),
             )
             moves[seat] = env_moves
             if seat == learner_seat:
@@ -349,10 +349,10 @@ def run_infserver_rollout(
     progress_every: int = 25,
     log_every_s: float = 2.0,
     stall_timeout_s: float = 180.0,
-    target_cap_k_max: int = 4,
+    target_cap_k_max: int = 3,
     target_cap_lambda: float = 0.0,
     contract: str = "v2",
-    select_k_max: int = 4,
+    select_k_max: int = 3,
     spool_dir: str | Path | None = None,
     on_progress: Callable[[dict], None] | None = None,
     on_episode_done: Callable[[int, Any], None] | None = None,
