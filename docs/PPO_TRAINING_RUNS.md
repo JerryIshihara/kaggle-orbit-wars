@@ -427,3 +427,15 @@ flat 61%; seat0 pooled 29/64 = 45%, seat1 49/64 = 77%). Read: the graft
 moved deploy from 25% -> ~61% and PPO is HOLDING it there, not climbing.
 20/20 needs a different lever (topmeta re-anchor pretrain / opponent-form
 fix / ent phase), not more iters of this config.
+
+## 2026-06-12 — sigadv relaunch: reward what discriminates wins
+
+Run ppo_beatbase_v3topk_p48_f512_sigadv_20260612-033427, resumed from the
+env130 lineage's v0020 (md5-verified copy /root/ow/resume_sigadv.pt).
+ONE change (user-approved): --signal-weights 0.08,0.08,0.08,0,0.26 ->
+0.14,0.14,0.14,0,0.08. Rationale: across all 20 analyzed iters the W-L
+mid-game gaps were ship/prod/planet_adv +0.35-0.47 every iter vs
+fleet_spd +0.01-0.12 (and early-game identical W/L — consequence, not
+cause); the graft already owns fleet sizing. Safety stays 0, win 0.5,
+ent 0.0, epochs 2, lr unchanged. Watch: value_loss bump while the critic
+residual re-fits the new Phi; gates on the same 16-seed panel at v0005+.
