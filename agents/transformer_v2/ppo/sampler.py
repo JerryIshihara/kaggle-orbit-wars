@@ -697,3 +697,220 @@ def project_bounded_k_to_env(
         n_invalid=n_invalid,
         invalid_reasons=invalid_reasons,
     )
+
+
+# =========================================================================== #
+# bounded_k_select_dirichlet_alloc_v4                                         #
+# =========================================================================== #
+# Stage 1 — Selection: IDENTICAL to v3 (one multinomial of k draws over
+#   [legal targets, self], k = min(k_max, N_s // min_launch), coefficient-free
+#   ``sum draws*log p`` logprob).
+#
+# Stage 2 — Dirichlet allocation of the REMAINDER (replaces the multinomial
+#   extras): with F_s the fired set and the SAME masked softmax v3 used,
+#       mean = softmax([frac_loc[s, F_s], frac_loc[s, s]] / tau)
+#       α    = (α0(s).clamp(min=A0_FLOOR) · mean).clamp(min=ALPHA_FLOOR)
+#       x    ~ Dirichlet(α)  over [F_s…, self]
+#   The drawn share vector x IS the action (continuous); it is ε-clamped and
+#   renormalized ONCE at draw time and stored — the logprob recompute
+#   evaluates the closed-form Dirichlet log-density at the STORED x, so the
+#   PPO ratio is exactly 1 for an unchanged policy. Launch sizes are a
+#   deterministic projection (no logprob term): each fired target gets the
+#   min_launch floor + round(x_t · rem) of the remainder; the self share
+#   stays home. Floors/clamps mirror the runner's OW_V4_ALLOC=dirichlet arm
+#   (a0 min 1e-3, α min 1e-4) so train-time and deploy-time α agree.
+A0_FLOOR = 1e-3        # runner: preds["alloc_conc"].clamp(min=1e-3)
+ALPHA_FLOOR = 1e-4     # runner: (a0 * share).clamp(min=1e-4)
+PPO_SHARE_EPS = 1e-4   # draw-time simplex clamp; keeps log x finite forever
+
+
+def _dirichlet_logpdf(alpha: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Closed-form Dirichlet log-density over the LAST dim (no support mask —
+    callers pass support-only vectors). Shared by sample and recompute."""
+    return (
+        torch.lgamma(alpha.sum(-1))
+        - torch.lgamma(alpha).sum(-1)
+        + ((alpha - 1.0) * x.log()).sum(-1)
+    )
+
+
+@dataclass
+class DirichletKAction:
+    """One snapshot's ``bounded_k_select_dirichlet_alloc_v4`` action.
+
+    ``select_counts (P, P+1) long``: as :class:`BoundedKAction`.
+    ``alloc_shares (P, P+1) float``: the ε-clamped Dirichlet draw over
+        [target cols…, self] per acting row (rows with ≥ 1 fired target);
+        zeros elsewhere. Support cells sum to 1 per acting row.
+    ``logprob / logprob_select / logprob_alloc / n_terms``: as v3; the alloc
+        term is a log-DENSITY (may be positive — only differences matter).
+    """
+
+    select_counts: torch.Tensor     # (P, P+1) long
+    alloc_shares: torch.Tensor      # (P, P+1) float
+    logprob: torch.Tensor           # scalar
+    logprob_select: torch.Tensor    # scalar
+    logprob_alloc: torch.Tensor     # scalar
+    n_terms: int
+    diagnostics: dict[str, float] = field(default_factory=dict)
+
+
+def sample_dirichlet_k(
+    pair_logits: torch.Tensor,        # (P, P) — select head (diag = self token)
+    frac_loc: torch.Tensor,            # (P, P) — alloc head (diag = HOLD share)
+    alloc_conc: torch.Tensor,          # (P,) — α0 per source (conc head output)
+    source_ships: torch.Tensor,        # (P,) long
+    *,
+    pair_mask: torch.Tensor,           # (P, P) bool
+    source_mask: torch.Tensor,         # (P,) bool
+    min_launch: int,
+    k_max: int = 3,
+    temperature: float = 1.0,
+    self_logit_bias: float = 0.0,
+) -> DirichletKAction:
+    """Draw one ``bounded_k_select_dirichlet_alloc_v4`` action.
+
+    Recomputed EXACTLY by ``loss.action_logprob_dirichlet_k`` (same tau /
+    self_logit_bias there, and the model's own ``alloc_conc`` forward).
+    """
+    if pair_logits.dim() != 2:
+        raise ValueError("sample is per-snapshot; expected pair_logits (P, P)")
+    p = pair_logits.shape[0]
+    device = pair_logits.device
+    tau = float(temperature)
+    m = int(min_launch)
+
+    select_counts = torch.zeros((p, p + 1), dtype=torch.long, device=device)
+    alloc_shares = torch.zeros((p, p + 1), dtype=torch.float32, device=device)
+    logp_select = torch.zeros((), device=device)
+    logp_alloc = torch.zeros((), device=device)
+    n_terms = 0
+    n_launch_sources = 0
+    n_fired_total = 0
+    a0_sum = 0.0
+    k_sum = 0
+
+    src_rows = source_mask.nonzero(as_tuple=False).flatten().tolist()
+    for s in src_rows:
+        legal_cols = pair_mask[s].nonzero(as_tuple=False).flatten()
+        n_legal = int(legal_cols.numel())
+        if n_legal == 0:
+            continue
+        ship_n = int(source_ships[s].item())
+        k = min(int(k_max), ship_n // max(1, m))
+        if k <= 0:
+            continue
+        k_sum += k
+
+        # --- Stage 1: identical to v3 ---
+        sel_logits = torch.cat([
+            pair_logits[s, legal_cols],
+            (pair_logits[s, s] + self_logit_bias).reshape(1),
+        ]) / tau
+        log_probs1 = torch.log_softmax(sel_logits, dim=-1)
+        draws = Multinomial(total_count=k, logits=sel_logits).sample()
+        logp_select = logp_select + (draws * log_probs1).sum()
+        n_terms += 1
+        draws_long = draws.round().long()
+        select_counts[s, legal_cols] = draws_long[:n_legal]
+        select_counts[s, p] = draws_long[n_legal]
+
+        fired_local = draws_long[:n_legal] >= 1
+        fired_cols = legal_cols[fired_local]                       # ascending
+        n_fired = int(fired_cols.numel())
+        n_fired_total += n_fired
+        if n_fired == 0:
+            continue  # all-self: full hold, no alloc draw
+
+        # --- Stage 2: Dirichlet share draw over [fired…, self] ---
+        alloc_logits = torch.cat([
+            frac_loc[s, fired_cols],
+            frac_loc[s, s].reshape(1),
+        ]) / tau                                                   # (n_fired+1,)
+        mean = torch.softmax(alloc_logits, dim=-1)
+        a0 = alloc_conc[s].clamp(min=A0_FLOOR)
+        alpha = (a0 * mean).clamp(min=ALPHA_FLOOR)
+        x = torch.distributions.Dirichlet(alpha).sample()
+        # ε-clamp + renormalize ONCE; the stored x is the action.
+        x = x.clamp(min=PPO_SHARE_EPS)
+        x = x / x.sum()
+        logp_alloc = logp_alloc + _dirichlet_logpdf(alpha, x)
+        n_terms += 1
+        alloc_shares[s, fired_cols] = x[:n_fired]
+        alloc_shares[s, p] = x[n_fired]
+        n_launch_sources += 1
+        a0_sum += float(a0)
+
+    diagnostics = {
+        "n_valid_sources": int(source_mask.sum().item()),
+        "n_launch_sources": int(n_launch_sources),
+        "n_fired_total": int(n_fired_total),
+        "k_mean": (k_sum / max(1, len(src_rows))),
+        "alpha0_mean": (a0_sum / max(1, n_launch_sources)),
+    }
+    return DirichletKAction(
+        select_counts=select_counts,
+        alloc_shares=alloc_shares,
+        logprob=logp_select + logp_alloc,
+        logprob_select=logp_select,
+        logprob_alloc=logp_alloc,
+        n_terms=int(n_terms),
+        diagnostics=diagnostics,
+    )
+
+
+def project_dirichlet_k_to_env(
+    action: DirichletKAction,
+    *,
+    source_mask: torch.Tensor,
+    source_ships: torch.Tensor,       # (P,) long — same tensor sampling saw
+    source_planet_ids: list[int],
+    target_planet_ids: list[int],
+    min_launch: int,
+    plan_launch_fn,
+) -> ProjectionResult:
+    """Project a :class:`DirichletKAction` into env launches.
+
+    Launch size = ``min_launch + round(share_t · rem)`` with ``rem = N_s −
+    min_launch · |F_s|`` — the same floor-plus-share rule as the runner's
+    OW_V4_ALLOC=dirichlet arm, so every launch clears the floor by
+    construction. The self share (and rounding residue) stays home.
+    """
+    env_actions: list[list[int]] = []
+    n_invalid = 0
+    n_emitted = 0
+    invalid_reasons: list[str] = []
+    p = action.select_counts.shape[0]
+
+    src_rows = source_mask.nonzero(as_tuple=False).flatten().tolist()
+    for s in src_rows:
+        fired_cols = (action.select_counts[s, :p] >= 1).nonzero(
+            as_tuple=False).flatten().tolist()
+        if not fired_cols:
+            continue
+        ship_n = int(source_ships[s].item())
+        rem = max(0, ship_n - int(min_launch) * len(fired_cols))
+        for t in fired_cols:
+            ships = int(min_launch) + int(round(
+                float(action.alloc_shares[s, t].item()) * rem))
+            src_pid = source_planet_ids[s]
+            tgt_pid = target_planet_ids[t]
+            if src_pid is None or src_pid < 0 or tgt_pid is None or tgt_pid < 0:
+                n_invalid += 1
+                invalid_reasons.append("pad_slot")
+                continue
+            launch = plan_launch_fn(int(src_pid), int(tgt_pid), int(ships))
+            if not getattr(launch, "ok", False):
+                n_invalid += 1
+                invalid_reasons.append(str(getattr(launch, "reason", "unknown")))
+                continue
+            env_actions.append([int(src_pid), float(launch.angle), int(ships)])
+            n_emitted += 1
+
+    return ProjectionResult(
+        env_actions=env_actions,
+        ok=(n_invalid == 0),
+        n_emitted=n_emitted,
+        n_invalid=n_invalid,
+        invalid_reasons=invalid_reasons,
+    )

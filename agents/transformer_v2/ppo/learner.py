@@ -121,6 +121,7 @@ def _move_ppo_minibatch(mb: PPOMinibatch, device: torch.device) -> PPOMinibatch:
         select_counts=_mv(mb.select_counts),
         alloc_extras=_mv(mb.alloc_extras),
         self_extras=_mv(mb.self_extras),
+        alloc_shares=_mv(mb.alloc_shares),
         noop_logit_bias=mb.noop_logit_bias,
     )
 

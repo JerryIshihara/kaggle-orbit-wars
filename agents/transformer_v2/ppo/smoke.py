@@ -72,6 +72,7 @@ from .sampler import (
     legality_masks,
     project_multi_target_to_env,
     sample_bounded_k,
+    sample_dirichlet_k,
     sample_multi_target,
 )
 
@@ -438,10 +439,49 @@ def _project_bounded_k(
     return env_moves, n_invalid, n_emitted, invalid_reasons
 
 
+def _project_dirichlet_k(
+    action, *, source_mask, source_ships, slot_to_pid, planets, min_launch,
+):
+    """Projection for ``bounded_k_select_dirichlet_alloc_v4``: fired cell
+    sizes = ``min_launch + round(share · rem)`` with ``rem = N_s − min_launch
+    · |F_s|`` — the runner's OW_V4_ALLOC=dirichlet floor-plus-share rule."""
+    env_moves: list[list[float]] = []
+    n_invalid = 0
+    n_emitted = 0
+    invalid_reasons: list[str] = []
+    if not planets:
+        return env_moves, n_invalid, n_emitted, invalid_reasons
+    by_id = {int(p.id): p for p in planets}
+    P = action.select_counts.shape[0]
+    src_rows = source_mask.nonzero(as_tuple=False).flatten().tolist()
+    for s in src_rows:
+        fired_cols = (action.select_counts[s, :P] >= 1).nonzero(
+            as_tuple=False).flatten().tolist()
+        if not fired_cols:
+            continue
+        rem = max(0, int(source_ships[s].item()) - int(min_launch) * len(fired_cols))
+        for t in fired_cols:
+            ships = int(min_launch) + int(round(
+                float(action.alloc_shares[s, t].item()) * rem))
+            src_pid = slot_to_pid[s]
+            tgt_pid = slot_to_pid[t]
+            if src_pid < 0 or tgt_pid < 0:
+                n_invalid += 1; invalid_reasons.append("pad_slot"); continue
+            src_planet = by_id.get(int(src_pid))
+            tgt_planet = by_id.get(int(tgt_pid))
+            if src_planet is None or tgt_planet is None:
+                n_invalid += 1; invalid_reasons.append("no_planet"); continue
+            angle = math.atan2(tgt_planet.y - src_planet.y, tgt_planet.x - src_planet.x)
+            env_moves.append([int(src_pid), float(angle), int(ships)])
+            n_emitted += 1
+    return env_moves, n_invalid, n_emitted, invalid_reasons
+
+
 def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
                    store, learner_slot, num_players, noop_logit_bias,
                    select_logit_bias: float = 0.0,
-                   contract: str = "v2", k_max: int = 3):
+                   contract: str = "v2", k_max: int = 3,
+                   alloc_conc=None):
     """Legality masks -> sample -> project to env moves -> StepRecord. This is the
     post-forward logic shared by the single-env closure (see agent_fn) and the
     batched rollout (batched_rollout.py) so both produce IDENTICAL records.
@@ -481,7 +521,24 @@ def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
         planet_owner=planet_owner_rel, surplus=planet_surplus,
         planet_exists=planet_exists, min_launch=int(min_launch),
     )
-    if contract == "v3":
+    if contract == "v4":
+        # bounded_k select + Dirichlet alloc: needs the α0 head output.
+        if alloc_conc is None:
+            raise RuntimeError(
+                "contract v4 sampling needs alloc_conc (the α0 head output) "
+                "threaded through to _finalize_step."
+            )
+        action = sample_dirichlet_k(
+            pair_logits, frac_loc, alloc_conc, source_ships,
+            pair_mask=pair_mask, source_mask=source_mask,
+            min_launch=int(min_launch), k_max=int(k_max),
+            self_logit_bias=select_logit_bias,
+        )
+        env_moves, n_invalid, n_emitted, invalid_reasons = _project_dirichlet_k(
+            action, source_mask=source_mask, source_ships=source_ships,
+            slot_to_pid=slot_to_pid, planets=planets, min_launch=int(min_launch),
+        )
+    elif contract == "v3":
         # bounded_k v3: select_logit_bias doubles as the SELF-token bias
         # (same sign convention — positive fires less).
         action = sample_bounded_k(
@@ -1032,7 +1089,14 @@ def _pack_episode_for_ppo(ep: EpisodeBuffer) -> dict | None:
             dtype=torch.float32,
         ),
     }
-    if hasattr(steps[0].action, "select_counts"):
+    if hasattr(steps[0].action, "alloc_shares"):
+        # bounded_k_select_dirichlet_alloc_v4 action fields (float32 shares:
+        # the recompute evaluates log x at the stored values).
+        out["select_counts"] = torch.stack(
+            [s.action.select_counts for s in steps]).cpu().long()
+        out["alloc_shares"] = torch.stack(
+            [s.action.alloc_shares for s in steps]).cpu().float()
+    elif hasattr(steps[0].action, "select_counts"):
         # bounded_k_select_multinomial_alloc_v3 action fields.
         out["select_counts"] = torch.stack(
             [s.action.select_counts for s in steps]).cpu().long()
@@ -1095,8 +1159,12 @@ def _packed_episodes_to_ppo(
     }
     pair_mask = _cat_tensors([p["pair_mask"] for p in packed], device=device)
     source_mask = _cat_tensors([p["source_mask"] for p in packed], device=device)
-    is_v3 = "select_counts" in packed[0]
-    if is_v3:
+    is_v4 = "alloc_shares" in packed[0]
+    is_v3 = (not is_v4) and "select_counts" in packed[0]
+    if is_v4:
+        select_counts = _cat_tensors([p["select_counts"] for p in packed], device=device)
+        alloc_shares = _cat_tensors([p["alloc_shares"] for p in packed], device=device)
+    elif is_v3:
         select_counts = _cat_tensors([p["select_counts"] for p in packed], device=device)
         alloc_extras = _cat_tensors([p["alloc_extras"] for p in packed], device=device)
         self_extras = _cat_tensors([p["self_extras"] for p in packed], device=device)
@@ -1115,15 +1183,17 @@ def _packed_episodes_to_ppo(
                 else {kk: vv[idx] for kk, vv in v.items()})
             for k, v in feats.items()
         }
-        action_kw = (
-            dict(select_counts=select_counts[idx],
-                 alloc_extras=alloc_extras[idx],
-                 self_extras=self_extras[idx])
-            if is_v3 else
-            dict(select_mask=select_mask[idx],
-                 alloc_counts=alloc_counts[idx],
-                 self_counts=self_counts[idx])
-        )
+        if is_v4:
+            action_kw = dict(select_counts=select_counts[idx],
+                             alloc_shares=alloc_shares[idx])
+        elif is_v3:
+            action_kw = dict(select_counts=select_counts[idx],
+                             alloc_extras=alloc_extras[idx],
+                             self_extras=self_extras[idx])
+        else:
+            action_kw = dict(select_mask=select_mask[idx],
+                             alloc_counts=alloc_counts[idx],
+                             self_counts=self_counts[idx])
         # The minibatch carries raw features; train-time _PPOWithL0 runs frozen L0.
         minibatches.append(PPOMinibatch(
             feats=feats_slice,

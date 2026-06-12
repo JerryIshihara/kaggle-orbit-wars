@@ -75,11 +75,18 @@ class PPOMinibatch:
     select_counts: torch.Tensor | None = None   # (B, P, P+1) long — draws incl. self token
     alloc_extras: torch.Tensor | None = None    # (B, P, P) long — extras beyond the floor
     self_extras: torch.Tensor | None = None     # (B, P) long — extras held on acting rows
+    # bounded_k_select_dirichlet_alloc_v4: select_counts (shared with v3) +
+    # the stored ε-clamped Dirichlet draw. alloc_extras/self_extras stay None.
+    alloc_shares: torch.Tensor | None = None    # (B, P, P+1) float — draw over [tgts…, self]
     noop_logit_bias: float = 0.0
 
     @property
+    def is_dirichlet_k(self) -> bool:
+        return self.alloc_shares is not None
+
+    @property
     def is_bounded_k(self) -> bool:
-        return self.select_counts is not None
+        return self.select_counts is not None and self.alloc_shares is None
 
     @property
     def is_multi_target(self) -> bool:
@@ -514,6 +521,119 @@ def bounded_k_entropy(
     return ent_sel.sum(dim=1) + ent_al.sum(dim=1)
 
 
+def action_logprob_dirichlet_k(
+    pair_logits: torch.Tensor,        # (B, P, P)
+    frac_loc: torch.Tensor,            # (B, P, P)
+    alloc_conc: torch.Tensor,          # (B, P) — conc head output (α0 pre-clamp)
+    *,
+    pair_mask: torch.Tensor,           # (B, P, P) bool
+    source_mask: torch.Tensor,         # (B, P) bool
+    act,                               # carries select_counts / alloc_shares
+    temperature: float = 1.0,
+    self_logit_bias: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recompute the ``bounded_k_select_dirichlet_alloc_v4`` logprob.
+
+    Selection is byte-identical to v3 (``sum draws * masked log_softmax``).
+    Allocation evaluates the closed-form Dirichlet log-density at the STORED
+    ε-clamped draw, with α rebuilt from the CURRENT policy:
+    ``α = (α0.clamp(A0_FLOOR) · exp(logp_al)).clamp(ALPHA_FLOOR)`` on the
+    [fired…, self] support — ``exp(logp_al)`` is exactly the masked alloc
+    softmax the v3 path (and the sampler) uses, so an unchanged policy gives
+    ratio == 1. Returns ``(logp (B,), n_terms (B,))``.
+    """
+    from .sampler import A0_FLOOR, ALPHA_FLOOR  # single source of truth
+
+    if pair_logits.dim() != 3:
+        raise ValueError("expected pair_logits (B, P, P)")
+    tau = float(temperature)
+    B, P, _ = pair_logits.shape
+    select_counts = act.select_counts.to(pair_logits.dtype)
+    logp_sel, logp_al, drew, has_fired = _bounded_k_log_softmaxes(
+        pair_logits, frac_loc, pair_mask, source_mask,
+        act.select_counts, tau, float(self_logit_bias),
+    )
+    logp_select = (select_counts * logp_sel).sum(dim=(1, 2))
+
+    # Support = fired cells + self on acting rows (matches the sampler).
+    fired = act.select_counts[..., :P] >= 1                          # (B,P,P)
+    support = torch.cat([fired, has_fired.unsqueeze(-1)], dim=-1)    # (B,P,P+1)
+    mean = torch.where(support, logp_al.exp(), torch.zeros_like(logp_al))
+    a0 = alloc_conc.clamp(min=A0_FLOOR).unsqueeze(-1)                # (B,P,1)
+    alpha = (a0 * mean).clamp(min=ALPHA_FLOOR)                       # (B,P,P+1)
+
+    x = act.alloc_shares.to(pair_logits.dtype)                       # (B,P,P+1)
+    alpha_sup = torch.where(support, alpha, torch.zeros_like(alpha))
+    # log-density per acting row: lgamma(Σα) − Σ lgamma(α) + Σ (α−1) log x,
+    # summed over support cells only. lgamma/log args are clamped on the
+    # OFF-support cells (which contribute 0 via the where) to stay finite.
+    a0_sum = alpha_sup.sum(-1)                                       # (B,P)
+    lg_a = torch.where(support, torch.lgamma(alpha.clamp(min=1e-12)),
+                       torch.zeros_like(alpha)).sum(-1)
+    xlog = torch.where(support, (alpha - 1.0) * x.clamp(min=1e-12).log(),
+                       torch.zeros_like(alpha)).sum(-1)
+    row_logp = torch.lgamma(a0_sum.clamp(min=1e-12)) - lg_a + xlog   # (B,P)
+    row_logp = torch.where(has_fired, row_logp, torch.zeros_like(row_logp))
+    logp_alloc = row_logp.sum(dim=1)
+
+    n_terms = (drew.float().sum(dim=1)
+               + has_fired.float().sum(dim=1)).clamp_min(1.0)
+    return logp_select + logp_alloc, n_terms
+
+
+def dirichlet_k_entropy(
+    pair_logits: torch.Tensor,
+    frac_loc: torch.Tensor,
+    alloc_conc: torch.Tensor,
+    *,
+    pair_mask: torch.Tensor,
+    source_mask: torch.Tensor,
+    act,
+    temperature: float = 1.0,
+    self_logit_bias: float = 0.0,
+) -> torch.Tensor:
+    """Entropy bonus for v4: select categorical entropy per drawing row (as
+    v3) + ANALYTIC Dirichlet entropy per acting row:
+
+        H(Dir(α)) = Σ lgamma(α_i) − lgamma(α0) + (α0 − K)·ψ(α0)
+                    − Σ (α_i − 1)·ψ(α_i)
+
+    over the [fired…, self] support (K = support size, α0 = Σ α_i). H falls
+    as α0 grows, so the ent-coef directly prices the policy's allocation
+    CONFIDENCE — the α0-saturation guard that replaces the old fixed-σ
+    exploration knob. Differentiable end-to-end (lgamma/digamma autograd).
+    """
+    from .sampler import A0_FLOOR, ALPHA_FLOOR
+
+    tau = float(temperature)
+    B, P, _ = pair_logits.shape
+    logp_sel, logp_al, drew, has_fired = _bounded_k_log_softmaxes(
+        pair_logits, frac_loc, pair_mask, source_mask,
+        act.select_counts, tau, float(self_logit_bias),
+    )
+    ent_sel = -(logp_sel.exp() * logp_sel).sum(dim=-1)               # (B,P)
+    ent_sel = torch.where(drew, ent_sel, torch.zeros_like(ent_sel))
+
+    fired = act.select_counts[..., :P] >= 1
+    support = torch.cat([fired, has_fired.unsqueeze(-1)], dim=-1)
+    mean = torch.where(support, logp_al.exp(), torch.zeros_like(logp_al))
+    a0 = alloc_conc.clamp(min=A0_FLOOR).unsqueeze(-1)
+    alpha = (a0 * mean).clamp(min=ALPHA_FLOOR)
+    alpha_c = alpha.clamp(min=1e-12)
+
+    k_sup = support.float().sum(-1)                                   # (B,P)
+    a0_sum = torch.where(support, alpha, torch.zeros_like(alpha)).sum(-1)
+    a0_c = a0_sum.clamp(min=1e-12)
+    lg_a = torch.where(support, torch.lgamma(alpha_c),
+                       torch.zeros_like(alpha)).sum(-1)
+    dig = torch.where(support, (alpha - 1.0) * torch.digamma(alpha_c),
+                      torch.zeros_like(alpha)).sum(-1)
+    ent_dir = (lg_a - torch.lgamma(a0_c)
+               + (a0_sum - k_sup) * torch.digamma(a0_c) - dig)        # (B,P)
+    ent_dir = torch.where(has_fired, ent_dir, torch.zeros_like(ent_dir))
+    return ent_sel.sum(dim=1) + ent_dir.sum(dim=1)
+
+
 @torch.no_grad()
 def bounded_k_ent_breakdown(
     pair_logits: torch.Tensor,
@@ -777,16 +897,32 @@ def ppo_minibatch_loss(
     # ``launch`` downstream; but ``Normal(loc=NaN)`` validates and RAISES
     # before that masking runs. Zero out the non-finite entries.
     _n_guarded = 0
-    for _k in ("pair_logits", "frac_loc"):
+    for _k in ("pair_logits", "frac_loc", "alloc_conc"):
         _v = out.get(_k)
         if _v is not None and not torch.isfinite(_v).all():
             _n_guarded += int((~torch.isfinite(_v)).any(dim=tuple(range(1, _v.dim()))).sum())
             out[_k] = torch.nan_to_num(_v, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Contract switch: detect by action-field presence on the minibatch.
+    # ``alloc_shares is not None`` -> bounded_k_select_dirichlet_alloc_v4;
     # ``select_counts is not None`` -> bounded_k_select_multinomial_alloc_v3;
     # ``select_mask is not None`` -> bernoulli_select_multinomial_alloc_v2.
-    if getattr(mb, "select_counts", None) is not None:
+    if getattr(mb, "alloc_shares", None) is not None:
+        if out.get("alloc_conc") is None:
+            raise RuntimeError(
+                "v4 minibatch needs the policy's alloc_conc head output "
+                "(EntityPretrainModelV3 with_alloc_conc=True)."
+            )
+        new_logp, n_terms = action_logprob_dirichlet_k(
+            pair_logits=out["pair_logits"],
+            frac_loc=out["frac_loc"],
+            alloc_conc=out["alloc_conc"],
+            pair_mask=mb.pair_mask,
+            source_mask=mb.source_mask,
+            act=mb,
+            self_logit_bias=select_logit_bias,
+        )
+    elif getattr(mb, "select_counts", None) is not None:
         # v3 reuses the select_logit_bias knob as the SELF-token bias (same
         # sign convention: positive -> fires less).
         new_logp, n_terms = action_logprob_bounded_k(
@@ -825,7 +961,13 @@ def ppo_minibatch_loss(
 
     value_loss = F.mse_loss(out["value"], mb.returns)
 
-    if getattr(mb, "select_counts", None) is not None:
+    if getattr(mb, "alloc_shares", None) is not None:
+        entropy = (dirichlet_k_entropy(
+            out["pair_logits"], out["frac_loc"], out["alloc_conc"],
+            pair_mask=mb.pair_mask, source_mask=mb.source_mask, act=mb,
+            self_logit_bias=select_logit_bias,
+        ) / n_terms).mean()
+    elif getattr(mb, "select_counts", None) is not None:
         entropy = (bounded_k_entropy(
             out["pair_logits"], out["frac_loc"],
             pair_mask=mb.pair_mask, source_mask=mb.source_mask, act=mb,

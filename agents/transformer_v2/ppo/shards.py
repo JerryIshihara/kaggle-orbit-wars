@@ -63,6 +63,12 @@ ACTION_TENSOR_FIELDS = ("select_mask", "alloc_counts", "self_counts")
 #   alloc_extras (P, P) long — extras beyond the min_launch floor per fired,
 #   self_extras (P,) long — extras held on acting rows.
 ACTION_TENSOR_FIELDS_V3 = ("select_counts", "alloc_extras", "self_extras")
+# bounded_k_select_dirichlet_alloc_v4 (sampler.DirichletKAction):
+#   select_counts (P, P+1) long — as v3,
+#   alloc_shares (P, P+1) float32 — the stored ε-clamped Dirichlet draw
+#   (float32 REQUIRED: the logprob recompute evaluates log x at these values,
+#   so any dtype round-trip would desync the PPO ratio).
+ACTION_TENSOR_FIELDS_V4 = ("select_counts", "alloc_shares")
 ACTION_LOGPROB_FIELDS = ("logprob", "logprob_select", "logprob_alloc")
 
 
@@ -113,9 +119,12 @@ def episode_buffer_to_dict(ep: Any) -> dict[str, Any]:
     for f in STEP_SCALAR_FIELDS:
         d[f] = torch.tensor([getattr(s, f) for s in steps])
     d["invalid_reasons"] = [list(s.invalid_reasons or []) for s in steps]
-    is_v3 = hasattr(steps[0].action, "select_counts")
-    d["action_contract"] = "v3" if is_v3 else "v2"
-    for f in (ACTION_TENSOR_FIELDS_V3 if is_v3 else ACTION_TENSOR_FIELDS):
+    is_v4 = hasattr(steps[0].action, "alloc_shares")
+    is_v3 = (not is_v4) and hasattr(steps[0].action, "select_counts")
+    d["action_contract"] = "v4" if is_v4 else ("v3" if is_v3 else "v2")
+    fields = (ACTION_TENSOR_FIELDS_V4 if is_v4
+              else ACTION_TENSOR_FIELDS_V3 if is_v3 else ACTION_TENSOR_FIELDS)
+    for f in fields:
         d["action_" + f] = torch.stack(
             [getattr(s.action, f).detach().cpu() for s in steps], dim=0
         )
@@ -132,14 +141,26 @@ def episode_buffer_to_dict(ep: Any) -> dict[str, Any]:
 
 def dict_to_episode_buffer(d: dict[str, Any]) -> Any:
     """Rebuild an EpisodeBuffer (list[StepRecord]) from ``episode_buffer_to_dict``."""
-    from .sampler import BoundedKAction, MultiTargetAction  # lazy import
+    from .sampler import BoundedKAction, DirichletKAction, MultiTargetAction  # lazy import
     from .smoke import EpisodeBuffer, StepRecord
 
     n = int(d["n_steps"])
-    is_v3 = d.get("action_contract") == "v3" or "action_select_counts" in d
+    is_v4 = d.get("action_contract") == "v4" or "action_alloc_shares" in d
+    is_v3 = (not is_v4) and (
+        d.get("action_contract") == "v3" or "action_select_counts" in d)
     steps: list[Any] = []
     for i in range(n):
-        if is_v3:
+        if is_v4:
+            action = DirichletKAction(
+                select_counts=d["action_select_counts"][i].long(),
+                alloc_shares=d["action_alloc_shares"][i].float(),
+                logprob=d["action_logprob"][i],
+                logprob_select=d["action_logprob_select"][i],
+                logprob_alloc=d["action_logprob_alloc"][i],
+                n_terms=int(d["action_n_terms"][i].item()),
+                diagnostics=dict(d["action_diagnostics"][i]),
+            )
+        elif is_v3:
             action = BoundedKAction(
                 select_counts=d["action_select_counts"][i].long(),
                 alloc_extras=d["action_alloc_extras"][i].long(),
@@ -203,10 +224,10 @@ def save_shard(
     ep_dict = episode_buffer_to_dict(ep)
     # Stamp the contract the episode was actually sampled under (the dict
     # carries "v3" for BoundedKAction steps); v2 keeps the module constant.
-    contract = (
-        "bounded_k_select_multinomial_alloc_v3"
-        if ep_dict.get("action_contract") == "v3" else POLICY_ACTION_CONTRACT
-    )
+    contract = {
+        "v4": "bounded_k_select_dirichlet_alloc_v4",
+        "v3": "bounded_k_select_multinomial_alloc_v3",
+    }.get(ep_dict.get("action_contract"), POLICY_ACTION_CONTRACT)
     payload = {
         "format_version": SHARD_FORMAT_VERSION,
         "policy_version": int(policy_version),

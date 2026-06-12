@@ -30,11 +30,13 @@ import torch.nn as nn
 
 from ..transformer_v2.pretrain.alloc_labels import build_alloc_targets
 
-ALPHA_MAX = 100.0     # α_0 ceiling — keeps NLL finite on decisive experts.
-                      # Was 200: stage-B detonated at ep17-19 (satfrac 0.46
-                      # then α_0 collapse) and stage-D pressed 0.53 by ep3;
-                      # halving the cap + a slower conc-head LR group are
-                      # the stability fixes.
+ALPHA_MAX = 200.0     # α_0 ceiling — keeps NLL finite on decisive experts.
+                      # The cap is part of checkpoint CALIBRATION: stage-B
+                      # (073132) and Colab jointv4 (085826) conc heads were
+                      # trained at 200, and loading them under cap 100 halves
+                      # every α_0 → diffuse alloc draws (the A100 20260612
+                      # deploy regression, 65.6%→42%). Detonation guard =
+                      # the slow conc-head LR group (5e-6), not a smaller cap.
 SHARE_EPS = 1e-3      # simplex smoothing for boundary expert shares
 
 ACTION_CONTRACT_V4 = "bounded_k_select_dirichlet_alloc_v4"
