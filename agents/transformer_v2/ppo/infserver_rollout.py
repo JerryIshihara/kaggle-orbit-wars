@@ -167,10 +167,13 @@ def _worker_play_one(
                 num_players=num_players,
                 noop_logit_bias=float(cfg.get("noop_logit_bias", 0.0)),
                 select_logit_bias=float(cfg.get("select_logit_bias", 0.0)),
-                # Per-seat contract: only the LEARNER samples the configured
-                # contract; opponent seats stay on the frozen baseline's v2.
+                # Per-seat contract: the LEARNER samples the configured
+                # contract; opponent seats use opponent_contract (default v2
+                # for v2-arch frozen baselines; set v4 when the opponent IS a
+                # v4 ckpt, e.g. frozen-jointv4 mirror training).
                 contract=(str(cfg.get("contract", "v2"))
-                          if seat == learner_seat else "v2"),
+                          if seat == learner_seat
+                          else str(cfg.get("opponent_contract", "v2"))),
                 k_max=int(cfg.get("select_k_max", 3)),
                 alloc_conc=conc,
             )
@@ -355,6 +358,7 @@ def run_infserver_rollout(
     target_cap_k_max: int = 3,
     target_cap_lambda: float = 0.0,
     contract: str = "v2",
+    opponent_contract: str = "v2",
     history_offsets: list[int] | None = None,
     select_k_max: int = 3,
     spool_dir: str | Path | None = None,
@@ -396,6 +400,7 @@ def run_infserver_rollout(
         # Learner's action contract; OPPONENT seats always decode v2 (the
         # frozen baseline's native contract) regardless of this value.
         "contract": str(contract),
+        "opponent_contract": str(opponent_contract),
         # v3-arch models walk the UNION offsets; plain list crosses spawn.
         "history_offsets": (list(history_offsets) if history_offsets else None),
         "select_k_max": int(select_k_max),

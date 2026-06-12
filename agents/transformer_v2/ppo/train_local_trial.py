@@ -1010,6 +1010,11 @@ def main() -> int:
                         "extras multinomial over the remainder — floor-feasible "
                         "by construction). The FIXED OPPONENT always plays v2. "
                         "Under v3, --select-logit-bias is the SELF-token bias. v4 = bounded_k_select_dirichlet_alloc_v4 (v3 select + Dirichlet share draw; needs a ckpt with the alloc_conc head; sizes = min_launch floor + share*remainder).")
+    p.add_argument("--opponent-contract", choices=("v2", "v3", "v4"), default="v2",
+                   help="contract for OPPONENT seats (infserver rollout). v2 for "
+                        "v2-arch frozen baselines; v4 when the opponent is a v4 "
+                        "ckpt (mirror training) - a T18 learner shares per-seat "
+                        "histories, so the opponent must be T18-compatible.")
     p.add_argument("--lr-conc", type=float, default=5e-6,
                help="v4 alpha0 conc-head lr (own AdamW group; the slow group "
                     "IS the saturation guard - sharing lr_heads detonated in "
@@ -1398,6 +1403,7 @@ def main() -> int:
                 noop_logit_bias=0.0,
                 select_logit_bias=args.select_logit_bias,
                 contract=args.action_contract,
+                opponent_contract=args.opponent_contract,
                 select_k_max=args.select_k_max,
                 history_window=args.history_window,
                 history_offsets=_history_offsets,
