@@ -32,6 +32,14 @@ import time
 from pathlib import Path
 
 import torch
+import torch.multiprocessing as _tmp
+try:
+    # Paired value batches ship ~50 tensors per sample; the default
+    # file_descriptor sharing strategy exhausts FDs with workers > 0
+    # ("received 0 items of ancdata" — hit on the A100 run).
+    _tmp.set_sharing_strategy("file_system")
+except RuntimeError:
+    pass
 from torch.utils.data import DataLoader, Dataset
 
 from ..transformer_v2.pretrain.joint_pretrain import (
