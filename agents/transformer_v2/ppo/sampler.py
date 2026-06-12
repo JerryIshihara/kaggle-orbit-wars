@@ -752,6 +752,13 @@ class DirichletKAction:
     logprob_select: torch.Tensor    # scalar
     logprob_alloc: torch.Tensor     # scalar
     n_terms: int
+    # Per-COMPONENT logps for per-component PPO clipping: one select term per
+    # drawing row, one Dirichlet log-density per acting row; zeros elsewhere.
+    # The loss recomputes the same rows from the current policy and clips each
+    # component's ratio independently (a wild alloc-density swing on one row
+    # no longer zeroes the whole step's gradient).
+    select_row_logp: torch.Tensor | None = None   # (P,) float
+    alloc_row_logp: torch.Tensor | None = None    # (P,) float
     diagnostics: dict[str, float] = field(default_factory=dict)
 
 
@@ -782,6 +789,8 @@ def sample_dirichlet_k(
 
     select_counts = torch.zeros((p, p + 1), dtype=torch.long, device=device)
     alloc_shares = torch.zeros((p, p + 1), dtype=torch.float32, device=device)
+    select_row_logp = torch.zeros(p, dtype=torch.float32, device=device)
+    alloc_row_logp = torch.zeros(p, dtype=torch.float32, device=device)
     logp_select = torch.zeros((), device=device)
     logp_alloc = torch.zeros((), device=device)
     n_terms = 0
@@ -809,7 +818,9 @@ def sample_dirichlet_k(
         ]) / tau
         log_probs1 = torch.log_softmax(sel_logits, dim=-1)
         draws = Multinomial(total_count=k, logits=sel_logits).sample()
-        logp_select = logp_select + (draws * log_probs1).sum()
+        row_sel = (draws * log_probs1).sum()
+        select_row_logp[s] = row_sel
+        logp_select = logp_select + row_sel
         n_terms += 1
         draws_long = draws.round().long()
         select_counts[s, legal_cols] = draws_long[:n_legal]
@@ -834,7 +845,9 @@ def sample_dirichlet_k(
         # ε-clamp + renormalize ONCE; the stored x is the action.
         x = x.clamp(min=PPO_SHARE_EPS)
         x = x / x.sum()
-        logp_alloc = logp_alloc + _dirichlet_logpdf(alpha, x)
+        row_al = _dirichlet_logpdf(alpha, x)
+        alloc_row_logp[s] = row_al
+        logp_alloc = logp_alloc + row_al
         n_terms += 1
         alloc_shares[s, fired_cols] = x[:n_fired]
         alloc_shares[s, p] = x[n_fired]
@@ -855,6 +868,8 @@ def sample_dirichlet_k(
         logprob_select=logp_select,
         logprob_alloc=logp_alloc,
         n_terms=int(n_terms),
+        select_row_logp=select_row_logp,
+        alloc_row_logp=alloc_row_logp,
         diagnostics=diagnostics,
     )
 

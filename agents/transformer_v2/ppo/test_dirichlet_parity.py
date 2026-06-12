@@ -74,11 +74,22 @@ def test_ratio_is_one(n: int = 64, bias: float = 0.7) -> None:
     )
     assert mb.is_dirichlet_k and not mb.is_bounded_k
 
-    new_logp, n_terms = action_logprob_dirichlet_k(
+    new_logp, n_terms, parts = action_logprob_dirichlet_k(
         torch.stack(pls), torch.stack(fls), torch.stack(cons),
         pair_mask=mb.pair_mask, source_mask=mb.source_mask, act=mb,
         self_logit_bias=bias,
     )
+    # per-component parity: the batched per-row recompute must match the
+    # sampler's stored row logps (the per-component clip ratios are built
+    # from exactly these pairs).
+    sel_old = torch.stack([a.select_row_logp for a in acts])
+    al_old = torch.stack([a.alloc_row_logp for a in acts])
+    d_sel = (parts["sel_rows"] - sel_old).abs()[parts["drew"]]
+    d_al = (parts["al_rows"] - al_old).abs()[parts["has_fired"]]
+    print(f"  per-row |diff| sel max={float(d_sel.max() if d_sel.numel() else 0):.3e} "
+          f"al max={float(d_al.max() if d_al.numel() else 0):.3e}")
+    assert float(d_sel.max() if d_sel.numel() else 0) < 1e-3
+    assert float(d_al.max() if d_al.numel() else 0) < 1e-3
     diff = (new_logp - mb.old_logp).abs()
     ratio = (new_logp - mb.old_logp).exp()
     print(f"  logp |diff| max={float(diff.max()):.3e} "

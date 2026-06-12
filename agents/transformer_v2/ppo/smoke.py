@@ -1139,6 +1139,11 @@ def _pack_episode_for_ppo(ep: EpisodeBuffer) -> dict | None:
             [s.action.select_counts for s in steps]).cpu().long()
         out["alloc_shares"] = torch.stack(
             [s.action.alloc_shares for s in steps]).cpu().float()
+        if steps[0].action.select_row_logp is not None:
+            out["select_row_logp"] = torch.stack(
+                [s.action.select_row_logp for s in steps]).cpu().float()
+            out["alloc_row_logp"] = torch.stack(
+                [s.action.alloc_row_logp for s in steps]).cpu().float()
     elif hasattr(steps[0].action, "select_counts"):
         # bounded_k_select_multinomial_alloc_v3 action fields.
         out["select_counts"] = torch.stack(
@@ -1207,6 +1212,10 @@ def _packed_episodes_to_ppo(
     if is_v4:
         select_counts = _cat_tensors([p["select_counts"] for p in packed], device=device)
         alloc_shares = _cat_tensors([p["alloc_shares"] for p in packed], device=device)
+        has_rows = "select_row_logp" in packed[0]
+        if has_rows:
+            sel_row_lp = _cat_tensors([p["select_row_logp"] for p in packed], device=device)
+            al_row_lp = _cat_tensors([p["alloc_row_logp"] for p in packed], device=device)
     elif is_v3:
         select_counts = _cat_tensors([p["select_counts"] for p in packed], device=device)
         alloc_extras = _cat_tensors([p["alloc_extras"] for p in packed], device=device)
@@ -1229,6 +1238,9 @@ def _packed_episodes_to_ppo(
         if is_v4:
             action_kw = dict(select_counts=select_counts[idx],
                              alloc_shares=alloc_shares[idx])
+            if has_rows:
+                action_kw.update(select_row_logp=sel_row_lp[idx],
+                                 alloc_row_logp=al_row_lp[idx])
         elif is_v3:
             action_kw = dict(select_counts=select_counts[idx],
                              alloc_extras=alloc_extras[idx],

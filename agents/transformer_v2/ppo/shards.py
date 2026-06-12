@@ -68,7 +68,8 @@ ACTION_TENSOR_FIELDS_V3 = ("select_counts", "alloc_extras", "self_extras")
 #   alloc_shares (P, P+1) float32 — the stored ε-clamped Dirichlet draw
 #   (float32 REQUIRED: the logprob recompute evaluates log x at these values,
 #   so any dtype round-trip would desync the PPO ratio).
-ACTION_TENSOR_FIELDS_V4 = ("select_counts", "alloc_shares")
+ACTION_TENSOR_FIELDS_V4 = ("select_counts", "alloc_shares",
+                           "select_row_logp", "alloc_row_logp")
 ACTION_LOGPROB_FIELDS = ("logprob", "logprob_select", "logprob_alloc")
 
 
@@ -154,6 +155,10 @@ def dict_to_episode_buffer(d: dict[str, Any]) -> Any:
             action = DirichletKAction(
                 select_counts=d["action_select_counts"][i].long(),
                 alloc_shares=d["action_alloc_shares"][i].float(),
+                select_row_logp=d["action_select_row_logp"][i].float()
+                if "action_select_row_logp" in d else None,
+                alloc_row_logp=d["action_alloc_row_logp"][i].float()
+                if "action_alloc_row_logp" in d else None,
                 logprob=d["action_logprob"][i],
                 logprob_select=d["action_logprob_select"][i],
                 logprob_alloc=d["action_logprob_alloc"][i],

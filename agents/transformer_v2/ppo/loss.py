@@ -78,6 +78,11 @@ class PPOMinibatch:
     # bounded_k_select_dirichlet_alloc_v4: select_counts (shared with v3) +
     # the stored ε-clamped Dirichlet draw. alloc_extras/self_extras stay None.
     alloc_shares: torch.Tensor | None = None    # (B, P, P+1) float — draw over [tgts…, self]
+    # v4 per-component clipping: the sampler's per-row logps (zeros on
+    # inactive rows). When present, the policy surrogate clips each
+    # component's ratio independently instead of the whole-action ratio.
+    select_row_logp: torch.Tensor | None = None  # (B, P) float
+    alloc_row_logp: torch.Tensor | None = None   # (B, P) float
     noop_logit_bias: float = 0.0
 
     @property
@@ -574,11 +579,17 @@ def action_logprob_dirichlet_k(
                        torch.zeros_like(alpha)).sum(-1)
     row_logp = torch.lgamma(a0_sum.clamp(min=1e-12)) - lg_a + xlog   # (B,P)
     row_logp = torch.where(has_fired, row_logp, torch.zeros_like(row_logp))
-    logp_alloc = row_logp.sum(dim=1)
+    logp_alloc = row_logp.sum(dim=1)   # row_logp reused in the parts dict
 
     n_terms = (drew.float().sum(dim=1)
                + has_fired.float().sum(dim=1)).clamp_min(1.0)
-    return logp_select + logp_alloc, n_terms
+    parts = {
+        "sel_rows": (select_counts * logp_sel).sum(dim=-1),   # (B, P)
+        "al_rows": row_logp,                                   # (B, P)
+        "drew": drew,                                          # (B, P) bool
+        "has_fired": has_fired,                                # (B, P) bool
+    }
+    return logp_select + logp_alloc, n_terms, parts
 
 
 def dirichlet_k_entropy(
@@ -913,7 +924,7 @@ def ppo_minibatch_loss(
                 "v4 minibatch needs the policy's alloc_conc head output "
                 "(EntityPretrainModelV3 with_alloc_conc=True)."
             )
-        new_logp, n_terms = action_logprob_dirichlet_k(
+        new_logp, n_terms, _v4_parts = action_logprob_dirichlet_k(
             pair_logits=out["pair_logits"],
             frac_loc=out["frac_loc"],
             alloc_conc=out["alloc_conc"],
@@ -954,10 +965,40 @@ def ppo_minibatch_loss(
             noop_logit_bias=mb.noop_logit_bias,
         )
 
-    ratio = torch.exp(new_logp - mb.old_logp)
-    unclipped = ratio * mb.adv
-    clipped = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * mb.adv
-    policy_loss = -(torch.minimum(unclipped, clipped)).mean()
+    if (getattr(mb, "alloc_shares", None) is not None
+            and getattr(mb, "select_row_logp", None) is not None):
+        # PER-COMPONENT clipping (v4): each select row and each alloc row is
+        # its own importance ratio against the step's shared advantage. A
+        # Dirichlet-density outlier on one row clips ONLY that row — the
+        # whole-action ratio no longer zeroes the entire step's gradient
+        # (which hit 30-60% of samples on the total-ratio path).
+        drew = _v4_parts["drew"]
+        fired = _v4_parts["has_fired"]
+        adv_b = mb.adv.unsqueeze(-1)                              # (B, 1)
+        comp_losses = []
+        comp_clip = []
+        for new_rows, old_rows, mask in (
+            (_v4_parts["sel_rows"], mb.select_row_logp, drew),
+            (_v4_parts["al_rows"], mb.alloc_row_logp, fired),
+        ):
+            r = torch.exp(new_rows - old_rows)                    # (B, P)
+            unc = r * adv_b
+            cl = torch.clamp(r, 1.0 - clip, 1.0 + clip) * adv_b
+            term = torch.minimum(unc, cl)
+            comp_losses.append(torch.where(mask, term, torch.zeros_like(term)))
+            comp_clip.append(torch.where(
+                mask, ((r - 1.0).abs() > clip).float(), torch.zeros_like(r)))
+        n_comp = (drew.float().sum() + fired.float().sum()).clamp_min(1.0)
+        policy_loss = -(comp_losses[0].sum() + comp_losses[1].sum()) / n_comp
+        _pc_clip_frac = float(
+            (comp_clip[0].sum() + comp_clip[1].sum()) / n_comp)
+        ratio = torch.exp((new_logp - mb.old_logp) / n_terms)     # diag only
+    else:
+        _pc_clip_frac = None
+        ratio = torch.exp(new_logp - mb.old_logp)
+        unclipped = ratio * mb.adv
+        clipped = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * mb.adv
+        policy_loss = -(torch.minimum(unclipped, clipped)).mean()
 
     value_loss = F.mse_loss(out["value"], mb.returns)
 
@@ -1035,9 +1076,8 @@ def ppo_minibatch_loss(
         # PER-COMPONENT KL: divide the summed-over-sub-actions logp diff by the
         # action's component count so target_kl is a sensible per-decision scale.
         approx_kl = ((mb.old_logp - new_logp) / n_terms.clamp_min(1.0)).mean().item()
-        clip_frac = (
-            ((ratio - 1.0).abs() > clip).float().mean().item()
-        )
+        clip_frac = (_pc_clip_frac if _pc_clip_frac is not None else
+                     ((ratio - 1.0).abs() > clip).float().mean().item())
 
     diagnostics = {
         "policy_loss": float(policy_loss.detach().item()),
