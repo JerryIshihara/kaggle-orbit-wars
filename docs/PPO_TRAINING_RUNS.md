@@ -457,3 +457,12 @@ is real policy movement (p_self collapse -> seat0 openings overextend?)
 but within one-gate noise. Structural conclusion unchanged: next jump
 expected from the v3 base lineage (stage A L2-only -> joint -> v3 PPO),
 not further knob-turning here. Run finishes its 20 iters ~+1.7h.
+SIGADV GATE at v0015: seat0 6/16, seat1 5/16, OVERALL 11/32 = 34.4% —
+monotone deploy collapse (65.6 -> 50.0 -> 34.4, ~3.5 SE cumulative), and
+by iters 15-16 the SAMPLED winrate degraded too (24-25W/64). Post-mortem
+read: the advantage-only mix removed the de-facto anchor on decisive
+allocation (fleet_spd 0.26 -> 0.08); ALLOC top1 oscillated to 0.74 with
+ent 0.55 by mid-run (graft erosion), SEL entropy climbed to 1.5-1.75.
+v2-base lineage CLOSED: across env130 + sigadv, 35 updates, two signal
+mixes, one graft — deploy never sustainably exceeded ~61%. All future
+training moves to the v3 base (stage A done; stage B actor_v4 ready).
