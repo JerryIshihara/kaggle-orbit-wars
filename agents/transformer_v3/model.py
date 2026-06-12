@@ -45,6 +45,7 @@ class EntityPretrainModelV3(EntityPretrainModel):
         *,
         n_steps: int | None = None,
         with_short_aux: bool = True,
+        with_alloc_conc: bool = False,
         **kw,
     ):
         if n_steps is not None and int(n_steps) != N_UNION:
@@ -82,6 +83,14 @@ class EntityPretrainModelV3(EntityPretrainModel):
             )
         else:
             self.short_heads = None
+        # Contract v4: per-source Dirichlet concentration α0 off the L4
+        # source tokens (the mean stays the existing frac softmax).
+        self.with_alloc_conc = bool(with_alloc_conc)
+        if self.with_alloc_conc:
+            from .dirichlet_alloc import AllocConcentrationHead
+            self.alloc_conc_head = AllocConcentrationHead(d_model)
+        else:
+            self.alloc_conc_head = None
 
     def forward_with_context(
         self,
@@ -188,6 +197,8 @@ class EntityPretrainModelV3(EntityPretrainModel):
             "target_joint": target_joint,
             "l1_now": l1_now,
         }
+        if self.alloc_conc_head is not None:
+            out["alloc_conc"] = self.alloc_conc_head(source_joint)
         # Same merge as the base: one forward yields action + value preds.
         if self.value_heads is not None and player_state is not None:
             out.update(self.value_heads(glob, player_state))
@@ -224,6 +235,15 @@ class EntityPretrainModelV3(EntityPretrainModel):
             "with_short_aux": self.with_short_aux,
             "with_consolidator": False,
             "player_state_source": "l2_player_tokens",
+            **(
+                {
+                    "action_contract":
+                        "bounded_k_select_dirichlet_alloc_v4",
+                    "select_k_max": 3,
+                    "with_alloc_conc": True,
+                }
+                if self.with_alloc_conc else {}
+            ),
         }
 
 
