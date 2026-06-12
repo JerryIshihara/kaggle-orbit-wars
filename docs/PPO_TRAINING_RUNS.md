@@ -466,3 +466,9 @@ ent 0.55 by mid-run (graft erosion), SEL entropy climbed to 1.5-1.75.
 v2-base lineage CLOSED: across env130 + sigadv, 35 updates, two signal
 mixes, one graft — deploy never sustainably exceeded ~61%. All future
 training moves to the v3 base (stage A done; stage B actor_v4 ready).
+SIGADV FINAL GATE at v0020: seat0 4/16, seat1 10/16, OVERALL 14/32 = 43.8%.
+Full sigadv curve: 65.6 -> 50.0 -> 34.4 -> 43.8 (RUN DONE at 20 iters,
+14376s). Lineage best deployed ckpt remains policy_v0005_sigadv (65.6%),
+backed up locally. v2-base book closed; pod idle pending terminate/reuse
+decision. The v3/v4 staged pipeline (stage A done, stage B GO'd on
+topmeta300) is the active line.
