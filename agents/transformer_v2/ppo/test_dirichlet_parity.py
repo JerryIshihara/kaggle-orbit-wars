@@ -182,7 +182,25 @@ def test_shards_roundtrip() -> None:
     assert torch.equal(rebuilt.select_counts, act.select_counts)
     assert torch.equal(rebuilt.alloc_shares, act.alloc_shares), \
         "alloc_shares must round-trip bit-for-bit (float32)"
-    assert shards.ACTION_TENSOR_FIELDS_V4 == ("select_counts", "alloc_shares")
+    assert shards.ACTION_TENSOR_FIELDS_V4 == (
+        "select_counts", "alloc_shares", "select_row_logp", "alloc_row_logp")
+    # row logps round-trip via the same float32 path
+    d2 = {**d,
+          "action_select_row_logp": act.select_row_logp.unsqueeze(0),
+          "action_alloc_row_logp": act.alloc_row_logp.unsqueeze(0)}
+    rb2 = DirichletKAction(
+        select_counts=d2["action_select_counts"][0].long(),
+        alloc_shares=d2["action_alloc_shares"][0].float(),
+        select_row_logp=d2["action_select_row_logp"][0].float(),
+        alloc_row_logp=d2["action_alloc_row_logp"][0].float(),
+        logprob=d2["action_logprob"][0],
+        logprob_select=d2["action_logprob_select"][0],
+        logprob_alloc=d2["action_logprob_alloc"][0],
+        n_terms=int(d2["action_n_terms"][0].item()),
+        diagnostics=dict(d2["action_diagnostics"][0]),
+    )
+    assert torch.equal(rb2.select_row_logp, act.select_row_logp)
+    assert torch.equal(rb2.alloc_row_logp, act.alloc_row_logp)
     print("  shards round-trip: bit-exact")
 
 
