@@ -446,3 +446,14 @@ Behavior shift under the new mix: SEL p_self collapsed 0.24 -> 0.06 (fires
 nearly every step), SEL ppl ~4.5 (broader targeting), ALLOC decisive
 (top1 0.85-0.91, hold 0.05-0.07), KL clean 0.013-0.016 throughout.
 Next sigadv gate at v0010.
+SIGADV GATE at v0010 (same panel, FIRST gate on the parity-fixed runner
+e0e4e64 — symmetric for both sides): seat0 4/16 = 25.0%, seat1 12/16 =
+75.0%, OVERALL 16/32 = 50.0% (-15.6pp vs v0005, ~1.8 SE). Pooled sigadv
+37/64 = 57.8% — statistically the same ~58-61% band as the env130
+lineage. Read: the advantage-weighted mix did not break the plateau
+either; across 30+ updates and two signal mixes, PPO on the v2 base
+holds ~60% deployed and does not climb. Seat0's 7->4 on identical seeds
+is real policy movement (p_self collapse -> seat0 openings overextend?)
+but within one-gate noise. Structural conclusion unchanged: next jump
+expected from the v3 base lineage (stage A L2-only -> joint -> v3 PPO),
+not further knob-turning here. Run finishes its 20 iters ~+1.7h.
