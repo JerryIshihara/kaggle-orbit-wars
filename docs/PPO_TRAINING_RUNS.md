@@ -439,3 +439,10 @@ fleet_spd +0.01-0.12 (and early-game identical W/L — consequence, not
 cause); the graft already owns fleet sizing. Safety stays 0, win 0.5,
 ent 0.0, epochs 2, lr unchanged. Watch: value_loss bump while the critic
 residual re-fits the new Phi; gates on the same 16-seed panel at v0005+.
+SIGADV GATE at v0005 (16-seed panel): seat0 7/16 = 43.8%, seat1 14/16 =
+87.5%, OVERALL 21/32 = 65.6% — +9.4pp over the v0020 resume point after 5
+updates on the advantage-weighted mix; best seat-1 panel of the lineage.
+Behavior shift under the new mix: SEL p_self collapsed 0.24 -> 0.06 (fires
+nearly every step), SEL ppl ~4.5 (broader targeting), ALLOC decisive
+(top1 0.85-0.91, hold 0.05-0.07), KL clean 0.013-0.016 throughout.
+Next sigadv gate at v0010.
