@@ -16,6 +16,7 @@ parent process, so there is exactly one GPU model instance.
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import queue
 import tempfile
 import time
@@ -75,6 +76,26 @@ def _oget(obs, key, default=None):
     return obs.get(key, default) if isinstance(obs, dict) else getattr(obs, key, default)
 
 
+_HEURISTIC_FNS: dict = {}
+
+
+def _heuristic_moves(label: str, obs):
+    """League opponent move from a registry heuristic (e.g. ``physical_v4``).
+
+    The heuristic reads its own seat from ``obs.player``, so no learner_slot
+    threading is needed; it returns env-format moves directly. Cached per
+    worker process. These agents are stateless on obs (no FleetTracker), so
+    skipping featurization for their seats is safe."""
+    fn = _HEURISTIC_FNS.get(label)
+    if fn is None:
+        from agents import registry
+        if label not in registry._REGISTRY:
+            raise KeyError(f"league opponent {label!r} not in agent registry")
+        fn = registry._REGISTRY[label].fn
+        _HEURISTIC_FNS[label] = fn
+    return fn(obs) or []
+
+
 def _worker_play_one(
     *,
     wid: int,
@@ -111,11 +132,21 @@ def _worker_play_one(
         stores = [None] * num_players
 
         a = time.perf_counter()
+        # League opponent for THIS game (default "self"). "self" / "ckpt" route
+        # through the forwarder (learner vs opponent_policy); "physical_v4" (any
+        # heuristic id) is computed worker-LOCALLY and never hits the GPU plane.
+        opp_label = str(cfg.get("opponent_labels", {}).get(idx, "self")) \
+            if isinstance(cfg.get("opponent_labels"), dict) else "self"
+        local_moves = {}  # seat -> env moves for heuristic opponent seats
         for seat in range(num_players):
             st = states[seat]
             if _oget(st, "status", "ACTIVE") != "ACTIVE":
                 continue
             obs = st["observation"] if isinstance(st, dict) else st.observation
+            # Heuristic opponent seats: compute moves locally, skip the forwarder.
+            if seat != learner_seat and opp_label not in ("self", "ckpt"):
+                local_moves[seat] = _heuristic_moves(opp_label, obs)
+                continue
             batch, pid_to_idx = featurize_observation(
                 obs,
                 learner_slot=seat,
@@ -134,10 +165,13 @@ def _worker_play_one(
                 else histories[seat].stack(step_idx)
             )
             req_id = (idx, step_idx, seat)
-            # 5th field: is_learner — routes to the learner policy (B) vs the
-            # fixed opponent policy (A) in the two-policy forwarder; ignored in
-            # self-play (single policy serves all seats).
-            req_q.put((wid, req_id, seat, _store_to_ipc(store), seat == learner_seat))
+            # 5th field: use_learner_policy — routes to the learner policy (B)
+            # vs the fixed opponent policy (A) in the two-policy forwarder. The
+            # recorded-learner seat AND self-play opponent seats both use the
+            # learner policy; only "ckpt"-labeled opponent seats use A. (Self-
+            # play single-policy forwarder ignores the field.)
+            use_learner = (seat == learner_seat) or (opp_label == "self")
+            req_q.put((wid, req_id, seat, _store_to_ipc(store), use_learner))
             obss[seat] = obs
             pid_maps[seat] = pid_to_idx
             stores[seat] = store
@@ -180,6 +214,9 @@ def _worker_play_one(
             moves[seat] = env_moves
             if seat == learner_seat:
                 buffer.steps.append(record)
+        # Heuristic-opponent seats (computed locally, no forwarder round-trip).
+        for seat, mv in local_moves.items():
+            moves[seat] = mv
         t_decode += time.perf_counter() - c
 
         d = time.perf_counter()
@@ -359,6 +396,7 @@ def run_infserver_rollout(
     target_cap_lambda: float = 0.0,
     contract: str = "v2",
     opponent_contract: str = "v2",
+    opponent_labels: list[str] | None = None,
     history_offsets: list[int] | None = None,
     select_k_max: int = 3,
     spool_dir: str | Path | None = None,
@@ -369,8 +407,9 @@ def run_infserver_rollout(
     """Run rollout with CPU env workers and one parent-owned GPU forwarder."""
     if not specs:
         return [], {"batch_sizes": [], "fwd_ms": [], "game_stats": {}}
-    if str(device).startswith("cpu"):
-        raise ValueError("infserver rollout is for GPU forward; pass --device cuda")
+    if str(device).startswith("cpu") and not os.environ.get("OW_INFSERVER_ALLOW_CPU"):
+        raise ValueError("infserver rollout is for GPU forward; pass --device cuda "
+                         "(set OW_INFSERVER_ALLOW_CPU=1 for a CPU parity/smoke test)")
 
     n_workers = max(1, min(int(n_workers), len(specs)))
     ctx = mp.get_context("spawn")
@@ -401,6 +440,10 @@ def run_infserver_rollout(
         # frozen baseline's native contract) regardless of this value.
         "contract": str(contract),
         "opponent_contract": str(opponent_contract),
+        # League: per-game opponent label {idx: "self"|"ckpt"|"physical_v4"}.
+        # "ckpt" needs opponent_policy loaded; heuristics are worker-local.
+        "opponent_labels": ({i: str(l) for i, l in enumerate(opponent_labels)}
+                            if opponent_labels else {}),
         # v3-arch models walk the UNION offsets; plain list crosses spawn.
         "history_offsets": (list(history_offsets) if history_offsets else None),
         "select_k_max": int(select_k_max),

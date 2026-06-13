@@ -1015,6 +1015,14 @@ def main() -> int:
                         "v2-arch frozen baselines; v4 when the opponent is a v4 "
                         "ckpt (mirror training) - a T18 learner shares per-seat "
                         "histories, so the opponent must be T18-compatible.")
+    p.add_argument("--opponent-pool", type=str, default=None,
+                   help="LEAGUE: comma list of opponent labels cycled across "
+                        "games, e.g. 'self,physical_v4,ckpt'. 'self'=self-play "
+                        "(learner policy), 'ckpt'=the --opponent-ckpt policy, "
+                        "any other token=a registry heuristic computed worker-"
+                        "locally (physical_v4). Repeat a token to weight it. "
+                        "Breaks the self-mirror plateau with a directional "
+                        "signal. None = legacy single-opponent / self-play.")
     p.add_argument("--ent-target", type=float, default=None,
                    help="adaptive entropy: per-component entropy floor target "
                         "(e.g. -2.0). Each iter ent-coef <- ent-coef * "
@@ -1213,6 +1221,23 @@ def main() -> int:
     train_policy = _PPOWithL0(policy, planet_enc, fleet_enc, comet_enc).to(args.device)
 
     # ---- FIXED opponent (agent A) for agent-B training (else self-play) ----
+    # League opponent pool (cycled per game in the rollout loop below).
+    _opp_pool = ([t.strip() for t in args.opponent_pool.split(",") if t.strip()]
+                 if args.opponent_pool else [])
+    if _opp_pool:
+        from agents import registry as _reg
+        for _lbl in set(_opp_pool):
+            if _lbl in ("self", "ckpt"):
+                continue
+            if _lbl not in _reg._REGISTRY:
+                raise SystemExit(f"--opponent-pool label {_lbl!r} not a registry "
+                                 f"agent (and not 'self'/'ckpt')")
+        if "ckpt" in _opp_pool and args.opponent_ckpt is None:
+            raise SystemExit("--opponent-pool includes 'ckpt' but no --opponent-ckpt given")
+        if args.rollout != "infserver":
+            raise SystemExit("--opponent-pool (league) is wired for --rollout infserver only")
+        _log(f"LEAGUE opponent pool: {_opp_pool}")
+
     fixed_opponent = None
     if args.opponent_ckpt is not None:
         import copy as _copy
@@ -1299,6 +1324,13 @@ def main() -> int:
                  "(single model; batched rollout merges all seats)")
 
         specs = build_specs(args.games, args.seed_base + K * args.games, args.num_players)
+        # League: cycle the opponent pool across games (deterministic, balanced).
+        # "self" → self-play seats use the learner policy; "ckpt" → the loaded
+        # fixed opponent; any other id → a registry heuristic (worker-local).
+        _opp_labels = (
+            [_opp_pool[i % len(_opp_pool)] for i in range(len(specs))]
+            if _opp_pool else None
+        )
         n2 = sum(1 for s in specs if s[1] == 2)
         _mode = "vs FIXED agent A" if fixed_opponent is not None else "self-play"
         _log(f"rollout[{args.rollout}]: {args.games} games (2P={n2} 4P={args.games - n2}) "
@@ -1411,6 +1443,7 @@ def main() -> int:
                 select_logit_bias=args.select_logit_bias,
                 contract=args.action_contract,
                 opponent_contract=args.opponent_contract,
+                opponent_labels=_opp_labels,
                 select_k_max=args.select_k_max,
                 history_window=args.history_window,
                 history_offsets=_history_offsets,
