@@ -97,7 +97,8 @@ class KRankAgent:
                 frac[s, s].reshape(1),
             ])
             mean = torch.softmax(alloc_logits, dim=-1)
-            a0 = conc[s].clamp(min=1e-3)
+            from agents.transformer_v2.ppo.sampler import alpha0_ceil
+            a0 = conc[s].clamp(min=1e-3, max=alpha0_ceil())
             x = torch.distributions.Dirichlet(
                 (a0 * mean).clamp(min=1e-4)).sample()
             rem = max(0, n_ships - min_launch * len(mis))

@@ -775,7 +775,9 @@ class TransformerAgent:
                 # OW_V4_ALLOC=dirichlet; requires the α0 head (v4 ckpts).
                 if (os.environ.get("OW_V4_ALLOC") == "dirichlet"
                         and "alloc_conc" in preds):
-                    a0 = preds["alloc_conc"].squeeze(0)[s].clamp(min=1e-3)
+                    from .ppo.sampler import alpha0_ceil
+                    a0 = preds["alloc_conc"].squeeze(0)[s].clamp(
+                        min=1e-3, max=alpha0_ceil())   # same cap as training
                     share = torch.distributions.Dirichlet(
                         (a0 * share).clamp(min=1e-4)).sample()
                 if getattr(self, "_shape_debug", False):

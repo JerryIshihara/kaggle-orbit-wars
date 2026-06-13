@@ -722,6 +722,22 @@ def project_bounded_k_to_env(
 A0_FLOOR = 1e-3        # runner: preds["alloc_conc"].clamp(min=1e-3)
 ALPHA_FLOOR = 1e-4     # runner: (a0 * share).clamp(min=1e-4)
 PPO_SHARE_EPS = 1e-4   # draw-time simplex clamp; keeps log x finite forever
+A0_CEIL_DEFAULT = 200.0   # = ALPHA_MAX (no-op cap; matches the head's range)
+
+
+def alpha0_ceil() -> float:
+    """α0 ceiling read from ``OW_V4_ALPHA0_CEIL`` (default = no-op 200).
+
+    Capping the concentration head's EFFECT floors the Dirichlet entropy:
+    the determinism crater (H ≤ −7) that tanked run3-iter20 / run4-iter10
+    becomes physically unreachable during training. MUST be read identically
+    at sample time (sampler), update time (loss recompute + entropy), and
+    deploy (runner / krank) or the PPO ratio and train/deploy distributions
+    desync. Read at call (not import) so one env var governs every process a
+    spawn fans out to. C≈40 keeps a typical K=3 row near H=−2.7 (run3-iter10's
+    good band)."""
+    import os
+    return float(os.environ.get("OW_V4_ALPHA0_CEIL", A0_CEIL_DEFAULT))
 
 
 def _dirichlet_logpdf(alpha: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -839,7 +855,7 @@ def sample_dirichlet_k(
             frac_loc[s, s].reshape(1),
         ]) / tau                                                   # (n_fired+1,)
         mean = torch.softmax(alloc_logits, dim=-1)
-        a0 = alloc_conc[s].clamp(min=A0_FLOOR)
+        a0 = alloc_conc[s].clamp(min=A0_FLOOR, max=alpha0_ceil())
         alpha = (a0 * mean).clamp(min=ALPHA_FLOOR)
         x = torch.distributions.Dirichlet(alpha).sample()
         # ε-clamp + renormalize ONCE; the stored x is the action.

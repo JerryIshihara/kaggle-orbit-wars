@@ -547,7 +547,7 @@ def action_logprob_dirichlet_k(
     softmax the v3 path (and the sampler) uses, so an unchanged policy gives
     ratio == 1. Returns ``(logp (B,), n_terms (B,))``.
     """
-    from .sampler import A0_FLOOR, ALPHA_FLOOR  # single source of truth
+    from .sampler import A0_FLOOR, ALPHA_FLOOR, alpha0_ceil  # single source of truth
 
     if pair_logits.dim() != 3:
         raise ValueError("expected pair_logits (B, P, P)")
@@ -564,7 +564,7 @@ def action_logprob_dirichlet_k(
     fired = act.select_counts[..., :P] >= 1                          # (B,P,P)
     support = torch.cat([fired, has_fired.unsqueeze(-1)], dim=-1)    # (B,P,P+1)
     mean = torch.where(support, logp_al.exp(), torch.zeros_like(logp_al))
-    a0 = alloc_conc.clamp(min=A0_FLOOR).unsqueeze(-1)                # (B,P,1)
+    a0 = alloc_conc.clamp(min=A0_FLOOR, max=alpha0_ceil()).unsqueeze(-1)                # (B,P,1)
     alpha = (a0 * mean).clamp(min=ALPHA_FLOOR)                       # (B,P,P+1)
 
     x = act.alloc_shares.to(pair_logits.dtype)                       # (B,P,P+1)
@@ -614,7 +614,7 @@ def dirichlet_k_entropy(
     CONFIDENCE — the α0-saturation guard that replaces the old fixed-σ
     exploration knob. Differentiable end-to-end (lgamma/digamma autograd).
     """
-    from .sampler import A0_FLOOR, ALPHA_FLOOR
+    from .sampler import A0_FLOOR, ALPHA_FLOOR, alpha0_ceil
 
     tau = float(temperature)
     B, P, _ = pair_logits.shape
@@ -628,7 +628,7 @@ def dirichlet_k_entropy(
     fired = act.select_counts[..., :P] >= 1
     support = torch.cat([fired, has_fired.unsqueeze(-1)], dim=-1)
     mean = torch.where(support, logp_al.exp(), torch.zeros_like(logp_al))
-    a0 = alloc_conc.clamp(min=A0_FLOOR).unsqueeze(-1)
+    a0 = alloc_conc.clamp(min=A0_FLOOR, max=alpha0_ceil()).unsqueeze(-1)
     alpha = (a0 * mean).clamp(min=ALPHA_FLOOR)
     alpha_c = alpha.clamp(min=1e-12)
 
