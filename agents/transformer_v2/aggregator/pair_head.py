@@ -115,6 +115,7 @@ class PairHead(nn.Module):
         pair_type_embed_dim: int = PAIR_TYPE_EMBED_DIM,
         c_scalars: int = 0,
         dropout: float = 0.0,
+        with_q_head: bool = False,
     ):
         super().__init__()
         if d_pair is None:
@@ -215,6 +216,22 @@ class PairHead(nn.Module):
             nn.init.zeros_(final.bias)
             nn.init.normal_(final.weight, std=0.02)
 
+        # ---- Optional Q head (per-pair launch value) --------------------------
+        # Q[s,t] = scalar value of launching s→t, on the SAME h_film features
+        # the select head reads. Off by default (v2/v3 ckpts byte-identical).
+        # Trained on PPO-ROLLOUT data (NOT expert pretrain — experts never make
+        # doomed launches, so a pretrain-trained Q is blind to them): a dense
+        # plan_launch reachability label (every legal pair) + a sparse TD return
+        # on fired pairs. See agents.transformer_v3.q_head.compute_q_loss.
+        self.with_q_head = bool(with_q_head)
+        if self.with_q_head:
+            self.q_head = self._build_head(trunk_hidden, head_n_layers, dropout)
+            final = self.q_head if isinstance(self.q_head, nn.Linear) else self.q_head[-1]
+            nn.init.zeros_(final.bias)
+            nn.init.normal_(final.weight, std=0.02)
+        else:
+            self.q_head = None
+
     @staticmethod
     def _build_head(
         hidden: int, n_layers: int, dropout: float,
@@ -276,7 +293,10 @@ class PairHead(nn.Module):
         if self.disable_film:
             pair_logits = self.pair_head(h).squeeze(-1)
             pair_frac = self.pair_frac_head(h).squeeze(-1)
-            return {"pair_logits": pair_logits, "pair_frac": pair_frac}
+            out = {"pair_logits": pair_logits, "pair_frac": pair_frac}
+            if self.q_head is not None:
+                out["q_value"] = self.q_head(h).squeeze(-1)
+            return out
 
         # ---- FiLM conditioner ----
         # Broadcast L1 tokens + 27-way pair-type embedding across (P, P).
@@ -317,7 +337,10 @@ class PairHead(nn.Module):
         pair_logits = self.pair_head(h_film).squeeze(-1)       # (B, P, P)
         pair_frac   = self.pair_frac_head(h_film).squeeze(-1)  # (B, P, P) raw
 
-        return {"pair_logits": pair_logits, "pair_frac": pair_frac}
+        out = {"pair_logits": pair_logits, "pair_frac": pair_frac}
+        if self.q_head is not None:
+            out["q_value"] = self.q_head(h_film).squeeze(-1)   # (B, P, P) launch value
+        return out
 
     # ------------------------------------------------------------------ #
     # Backward-compat state_dict loader                                  #

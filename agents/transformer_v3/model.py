@@ -199,6 +199,8 @@ class EntityPretrainModelV3(EntityPretrainModel):
         }
         if self.alloc_conc_head is not None:
             out["alloc_conc"] = self.alloc_conc_head(source_joint)
+        if "q_value" in heads:
+            out["q_value"] = heads["q_value"]   # (B, P, P) per-pair launch Q
         # Same merge as the base: one forward yields action + value preds.
         if self.value_heads is not None and player_state is not None:
             out.update(self.value_heads(glob, player_state))

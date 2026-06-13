@@ -286,6 +286,8 @@ class PPOActorCritic(nn.Module):
             "frac_loc": out["pair_frac"],
             # v4 contract: α0 head output (None on models without the head).
             "alloc_conc": out.get("alloc_conc"),
+            # v5: per-pair launch Q (None on models without the q head).
+            "q_value": out.get("q_value"),
             "glob": out["glob"],
             "ctx_now": out["ctx_now"],
             "player_state": out["player_state"],

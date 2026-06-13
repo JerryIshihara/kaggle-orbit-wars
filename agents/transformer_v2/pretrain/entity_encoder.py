@@ -762,6 +762,7 @@ class EntityPretrainModel(nn.Module):
         value_trunk_n_layers: int = 2,
         value_head_n_layers: int = 2,
         value_dropout: float | None = None,
+        with_q_head: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -882,6 +883,7 @@ class EntityPretrainModel(nn.Module):
             conditioner_n_layers=self.conditioner_n_layers,
             head_n_layers=self.head_n_layers,
             dropout=dropout,
+            with_q_head=bool(with_q_head),
         )
 
         # Explicit value-pretrain heads (the /tmp value_pretrain_design.md set,
@@ -1266,6 +1268,8 @@ class EntityPretrainModel(nn.Module):
             "target_joint": target_joint,
             "l1_now": l1_now,
         }
+        if "q_value" in heads:
+            out["q_value"] = heads["q_value"]   # (B, P, P) per-pair launch value
         # Value branch off the SAME L2 (via player_state). Keys merge in
         # alongside the action heads so one forward yields both action and
         # value predictions for joint training.
