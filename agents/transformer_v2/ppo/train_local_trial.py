@@ -1853,6 +1853,17 @@ def main() -> int:
                 f"nan_guarded={em.get('nan_guarded', 0):.1f}"
                 f"{' early_stop' if em.get('early_stopped') else ''}"
             )
+            if "q_loss" in em:
+                # v5 Q head: separation = mean Q(doomed) − mean Q(reachable);
+                # a working head drives it NEGATIVE (doomed ranks below
+                # reachable — the anti-doomed signal).
+                _log(
+                    f"  q: loss={em.get('q_loss', float('nan')):.4f} "
+                    f"sep={em.get('q_separation', float('nan')):+.3f} "
+                    f"(doomed={em.get('q_doomed_mean', float('nan')):+.2f} "
+                    f"reach={em.get('q_reach_mean', float('nan')):+.2f}) "
+                    f"n_doomed={int(em.get('n_doomed', 0))}"
+                )
             if "ent/sel_ent" in em:
                 # v3 per-stage entropy split: SELECT (targets+self softmax on
                 # drawing rows) vs ALLOC ([fired..., HOLD] softmax on acting
