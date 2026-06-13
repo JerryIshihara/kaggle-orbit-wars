@@ -37,6 +37,7 @@ import copy
 import gc
 import json
 import multiprocessing as mp
+import os
 import queue
 import shutil
 import socket
@@ -1015,6 +1016,15 @@ def main() -> int:
                         "v2-arch frozen baselines; v4 when the opponent is a v4 "
                         "ckpt (mirror training) - a T18 learner shares per-seat "
                         "histories, so the opponent must be T18-compatible.")
+    p.add_argument("--with-q-head", action="store_true",
+                   help="v5: enable the per-pair Q head (fresh-init, warm the "
+                        "rest from --ckpt). Auto-sets OW_PPO_DENSE_DOOMED=1 so "
+                        "the rollout stores the dense plan_launch doomed label "
+                        "the Q head regresses on. Pair with --q-coef.")
+    p.add_argument("--q-coef", type=float, default=0.5,
+                   help="v5 Q-head loss weight (dense doomed + sparse TD).")
+    p.add_argument("--lr-q", type=float, default=3e-4,
+                   help="v5 Q-head lr (own fast group).")
     p.add_argument("--opponent-pool", type=str, default=None,
                    help="LEAGUE: comma list of opponent labels cycled across "
                         "games, e.g. 'self,physical_v4,ckpt'. 'self'=self-play "
@@ -1119,11 +1129,14 @@ def main() -> int:
 
     # ---- load actor backbone + L0 encoders ----
     t0 = time.time()
+    if args.with_q_head:
+        os.environ["OW_PPO_DENSE_DOOMED"] = "1"   # rollout stores doomed label
     entity_model, fleet_enc, planet_enc, comet_enc, cfg = load_supervised(
         args.ckpt, args.device,
         planet_run_dir=args.planet_run_dir,
         fleet_run_dir=args.fleet_run_dir,
         comet_run_dir=args.comet_run_dir,
+        force_q_head=args.with_q_head,
     )
     _log(f"loaded actor in {time.time()-t0:.1f}s (d_model={cfg.get('d_model')} "
          f"n_steps={cfg.get('n_steps')} action_contract={cfg.get('action_contract')})")
@@ -1275,10 +1288,11 @@ def main() -> int:
         clip=args.clip, target_kl=args.target_kl, epochs=args.epochs,
         minibatch_size=args.minibatch_size, lr_heads=args.lr_heads, lr_trunk=args.lr_trunk,
         lr_perception=args.lr_perception,
-        lr_conc=args.lr_conc,
+        lr_conc=args.lr_conc, lr_q=args.lr_q,
         value_coef=args.value_coef, ent_coef=args.ent_coef, bc_coef=0.0,
         bc_target_weight=1.0,
         select_logit_bias=args.select_logit_bias,
+        q_coef=(args.q_coef if args.with_q_head else 0.0),
     )
 
     init_ckpt, init_legacy = _save_policy_checkpoint(

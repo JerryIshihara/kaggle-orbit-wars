@@ -32,8 +32,10 @@ class PPOConfig:
     bc_target_weight: float = 1.0
     max_grad_norm: float = 0.5
     lr_conc: float = 5e-6                 # v4 α0 conc head — ALWAYS its own slow group (pretrain detonated when it shared the head lr; the cap is calibration, the slow lr is the guard)
+    lr_q: float = 3e-4                    # v5 Q head — fresh-init, trains FAST (its own group; the actor heads stay slow)
     early_stop_kl_factor: float = 1.5     # break the epoch if running avg KL > this * target_kl
     select_logit_bias: float = 0.0        # multi-target selection-Bernoulli logit shift; MUST match the rollout sampler's value (else the PPO ratio desyncs)
+    q_coef: float = 0.0                   # v5 Q-head loss weight (0 = off)
 
 
 def build_optimizer(policy: nn.Module, cfg: PPOConfig) -> torch.optim.Optimizer:
@@ -101,6 +103,17 @@ def build_optimizer(policy: nn.Module, cfg: PPOConfig) -> torch.optim.Optimizer:
         groups.append({"params": perception_params, "lr": cfg.lr_perception})
     if conc_params:
         groups.append({"params": conc_params, "lr": cfg.lr_conc})
+    # v5 Q head: fresh-init, own fast group (the dense doomed label is a clean
+    # supervised target — it can train quickly without dragging the actor).
+    q_mod = getattr(policy.entity_model, "pair_head", None)
+    q_mod = getattr(q_mod, "q_head", None) if q_mod is not None else None
+    if q_mod is not None:
+        q_ids = {id(p) for p in q_mod.parameters()}
+        # q_head params were swept into head_params above (pair_head is a head
+        # module); pull them OUT into their own group.
+        for g in groups:
+            g["params"] = [p for p in g["params"] if id(p) not in q_ids]
+        groups.append({"params": list(q_mod.parameters()), "lr": cfg.lr_q})
     return torch.optim.AdamW(groups, weight_decay=0.0)
 
 
@@ -140,6 +153,7 @@ def _move_ppo_minibatch(mb: PPOMinibatch, device: torch.device) -> PPOMinibatch:
         alloc_shares=_mv(mb.alloc_shares),
         select_row_logp=_mv(mb.select_row_logp),
         alloc_row_logp=_mv(mb.alloc_row_logp),
+        doomed_mask=_mv(mb.doomed_mask),
         noop_logit_bias=mb.noop_logit_bias,
     )
 
@@ -210,6 +224,7 @@ def ppo_update_local(
                 bc_coef=cfg.bc_coef,
                 bc_target_weight=cfg.bc_target_weight,
                 select_logit_bias=cfg.select_logit_bias,
+                q_coef=cfg.q_coef,
                 # entropy-shape diagnostic on the first minibatch of each epoch
                 # only (a subsample — cheap but not free)
                 collect_shape=(n_mb == 0),

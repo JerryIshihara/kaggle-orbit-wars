@@ -112,6 +112,12 @@ class StepRecord:
     score_my: int = 0           # total ships of learner at end of THIS turn
     score_enemy_max: int = 0
     phi: float = 0.0            # calculated potential Φ(s)=Σwᵢsᵢ (design-A critic −Φ term)
+    # v5 Q head: DENSE plan_launch verdict over every legal pair this step —
+    # (P, P) bool, True where launching s→t would be DOOMED (sun/boundary/
+    # expired). Populated only when OW_PPO_DENSE_DOOMED=1 (the Q-run); else
+    # None and the Q loss is skipped. This is the dense reachability label the
+    # Q head regresses doomed cells to Q_DOOMED on.
+    doomed_mask: torch.Tensor | None = None    # (P, P) bool
 
     def __post_init__(self):
         if self.invalid_reasons is None:
@@ -175,6 +181,7 @@ def load_supervised(
     planet_run_dir: Path | None = None,
     fleet_run_dir: Path | None = None,
     comet_run_dir: Path | None = None,
+    force_q_head: bool = False,
 ) -> tuple[EntityPretrainModel, Any, Any, Any, dict]:
     """Mirror TransformerAgent.load — but return raw pieces for PPO wrapping."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -280,6 +287,8 @@ def load_supervised(
                 k.startswith("short_heads.") for k in _keys),
             with_alloc_conc=bool(cfg.get("with_alloc_conc", False)) or any(
                 k.startswith("alloc_conc_head.") for k in _keys),
+            with_q_head=bool(force_q_head) or any(
+                k.startswith("pair_head.q_head.") for k in _keys),
         )
     else:
         model = EntityPretrainModel(
@@ -519,6 +528,49 @@ def _project_dirichlet_k(
     return env_moves, n_invalid, n_emitted, invalid_reasons
 
 
+def _dense_doomed_mask(source_mask, pair_mask, slot_to_pid, planets, fleets,
+                       obs, learner_slot, min_launch):
+    """(P, P) bool — True where launching s→t is plan_launch-DOOMED.
+
+    The v5 Q head's dense reachability label: validate EVERY legal pair (not
+    just fired ones) with the deploy planner, so the Q head learns the doomed
+    structure of targets the policy didn't pick. Cost = one plan_launch per
+    legal cell; only owned sources × existing targets are checked."""
+    P = pair_mask.shape[0]
+    out = torch.zeros((P, P), dtype=torch.bool)
+    if not planets:
+        return out
+    from agents.physics_utils import plan_launch as _plan
+    get = obs.get if isinstance(obs, dict) else (lambda k, d=None: getattr(obs, k, d))
+    by_id = {int(p.id): p for p in planets}
+    av = float(get("angular_velocity") or 0.0)
+    comet_ids = set(int(c) for c in (get("comet_planet_ids") or []))
+    comets = get("comets")
+    fleet_tuples = [tuple(f) for f in (get("fleets") or [])]
+    src_rows = source_mask.nonzero(as_tuple=False).flatten().tolist()
+    for s in src_rows:
+        src_pid = slot_to_pid[s]
+        sp = by_id.get(int(src_pid)) if src_pid is not None and src_pid >= 0 else None
+        if sp is None:
+            continue
+        for t in pair_mask[s].nonzero(as_tuple=False).flatten().tolist():
+            tgt_pid = slot_to_pid[t]
+            tp = by_id.get(int(tgt_pid)) if tgt_pid is not None and tgt_pid >= 0 else None
+            if tp is None:
+                continue
+            try:
+                res = _plan(tuple(sp), tuple(tp),
+                            planets=[tuple(p_) for p_ in planets],
+                            fleets=fleet_tuples, player=int(learner_slot),
+                            angular_velocity=av, comet_planet_ids=comet_ids,
+                            comets=comets, fleet_ships=int(min_launch))
+                if not getattr(res, "ok", True):
+                    out[s, t] = True
+            except Exception:
+                pass
+    return out
+
+
 def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
                    store, learner_slot, num_players, noop_logit_bias,
                    select_logit_bias: float = 0.0,
@@ -662,6 +714,11 @@ def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
     # Index/enum fields stored int16 (values are slot indices < 32k): the
     # T18 packs' int64 routing tensors were a top RAM cost at iter packing
     # (109GB-cgroup OOMs). _PPOWithL0.forward widens back to long at use.
+    doomed_mask = None
+    if os.environ.get("OW_PPO_DENSE_DOOMED") == "1":
+        doomed_mask = _dense_doomed_mask(
+            source_mask, pair_mask, slot_to_pid, planets, fleets,
+            obs, learner_slot, int(min_launch))
     record = StepRecord(
         planet_features=store["planet_features"].detach().cpu(),
         fleet_features=store["fleet_features"].detach().cpu(),
@@ -679,6 +736,7 @@ def _finalize_step(obs, pid_to_idx, *, pair_logits, frac_loc, value, sigma_val,
         n_selected_targets=int(action.diagnostics.get("n_fired_total", 0)),
         invalid_reasons=list(invalid_reasons),
         score_my=score_my, score_enemy_max=score_enemy_max,
+        doomed_mask=doomed_mask,
     )
     return env_moves, record
 
@@ -1177,6 +1235,9 @@ def _pack_episode_for_ppo(ep: EpisodeBuffer) -> dict | None:
             dtype=torch.float32,
         ),
     }
+    if getattr(steps[0], "doomed_mask", None) is not None:
+        out["doomed_mask"] = torch.stack(
+            [s.doomed_mask for s in steps]).cpu().bool()
     if hasattr(steps[0].action, "alloc_shares"):
         # bounded_k_select_dirichlet_alloc_v4 action fields (float32 shares:
         # the recompute evaluates log x at the stored values).
@@ -1252,6 +1313,9 @@ def _packed_episodes_to_ppo(
     }
     pair_mask = _cat_tensors([p["pair_mask"] for p in packed], device=device)
     source_mask = _cat_tensors([p["source_mask"] for p in packed], device=device)
+    has_doomed = "doomed_mask" in packed[0]
+    doomed_mask_all = (_cat_tensors([p["doomed_mask"] for p in packed], device=device)
+                       if has_doomed else None)
     is_v4 = "alloc_shares" in packed[0]
     is_v3 = (not is_v4) and "select_counts" in packed[0]
     if is_v4:
@@ -1303,6 +1367,7 @@ def _packed_episodes_to_ppo(
             adv=adv[idx],
             returns=ret[idx],
             noop_logit_bias=0.0,
+            doomed_mask=(doomed_mask_all[idx] if doomed_mask_all is not None else None),
             **action_kw,
         ))
     return ep_objs, minibatches

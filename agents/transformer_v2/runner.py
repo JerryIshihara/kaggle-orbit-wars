@@ -539,6 +539,17 @@ class TransformerAgent:
 
         pair_logits = preds["pair_logits"].squeeze(0)               # (P, P)
         pair_frac_raw = preds["pair_frac"].squeeze(0)               # (P, P) raw logit
+        # v5 Q-gate deploy: bias select logits toward high-Q (reachable) targets,
+        # away from low-Q (doomed) ones. OW_V5_QGATE=<weight>; needs a q-head
+        # ckpt. OW_V5_QFLOOR (optional) hard-masks cells at the doomed Q level.
+        if os.environ.get("OW_V5_QGATE") and preds.get("q_value") is not None:
+            from ..transformer_v3.q_head import q_gate_select_logits
+            _qw = float(os.environ.get("OW_V5_QGATE", "1.0"))
+            _qfloor = (float(os.environ["OW_V5_QFLOOR"])
+                       if os.environ.get("OW_V5_QFLOOR") else None)
+            pair_logits = q_gate_select_logits(
+                pair_logits, preds["q_value"].squeeze(0),
+                weight=_qw, doomed_floor=_qfloor)
         idx_to_pid = {i: pid for pid, i in pid_to_idx.items()}
         # Stash this step's head outputs + slot map for callers that re-draw
         # allocations WITHOUT a second forward (KRankAgent's N×M candidates).

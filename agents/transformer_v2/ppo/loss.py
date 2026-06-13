@@ -83,6 +83,8 @@ class PPOMinibatch:
     # component's ratio independently instead of the whole-action ratio.
     select_row_logp: torch.Tensor | None = None  # (B, P) float
     alloc_row_logp: torch.Tensor | None = None   # (B, P) float
+    # v5 Q head: dense plan_launch doomed label per step (None on non-Q runs).
+    doomed_mask: torch.Tensor | None = None      # (B, P, P) bool
     noop_logit_bias: float = 0.0
 
     @property
@@ -886,6 +888,7 @@ def ppo_minibatch_loss(
     bc_target_weight: float = 1.0,
     collect_shape: bool = False,
     select_logit_bias: float = 0.0,
+    q_coef: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """One PPO minibatch loss.
 
@@ -1065,11 +1068,30 @@ def ppo_minibatch_loss(
             noop_logit_bias=mb.noop_logit_bias,
         )
 
+    # v5 Q head: per-pair launch value. Dense plan_launch doomed label +
+    # sparse TD return on fired pairs. Only when the policy has a q head, the
+    # minibatch carries the doomed mask, and q_coef > 0.
+    q_loss = torch.zeros((), device=out["value"].device)
+    q_diag: dict[str, float] = {}
+    if (q_coef > 0 and out.get("q_value") is not None
+            and getattr(mb, "doomed_mask", None) is not None
+            and getattr(mb, "alloc_shares", None) is not None):
+        from agents.transformer_v3.q_head import compute_q_loss
+        fired = mb.select_counts[..., :out["q_value"].shape[-1]] >= 1   # (B,P,P)
+        q_loss, q_diag = compute_q_loss(
+            out["q_value"],
+            fired_mask=fired,
+            fired_return=mb.returns,
+            doomed_mask=mb.doomed_mask.bool(),
+            legal_mask=mb.pair_mask.bool(),
+        )
+
     total = (
         policy_loss
         + value_coef * value_loss
         - ent_coef * entropy
         + bc_coef * bc_loss
+        + q_coef * q_loss
     )
 
     with torch.no_grad():
@@ -1088,7 +1110,9 @@ def ppo_minibatch_loss(
         "clip_frac": clip_frac,
         "ratio_mean": float(ratio.mean().detach().item()),
         "nan_guarded": _n_guarded,
+        "q_loss": float(q_loss.detach().item()),
         **shape_diag,
         **bc_diag,
+        **q_diag,
     }
     return total, diagnostics
