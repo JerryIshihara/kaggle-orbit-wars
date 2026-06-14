@@ -1020,6 +1020,78 @@ class TransformerAgent:
                     os.environ[k] = v
         return cands
 
+    @torch.no_grad()
+    def qrank_act(self, obs, n_draws: int) -> list[list]:
+        """Q-RANK deploy decode. ONE actor forward yields ``q_value[s,t]`` for
+        every pair; sample ``n_draws`` select-sets, score each as the SUM of
+        ``q_value`` over its launched pairs (DET argmax is the always-present
+        floor), then SIZE ONLY the winner. Ranking is pure vectorized math, so
+        the candidate count adds NO forwards and NO per-candidate sizing — it
+        scales to huge sampling spaces and stays trivially under the 1s deploy
+        budget. Q is per-pair/state, so this ranks target SELECTION; it is blind
+        to ship sizing (use value-sim if sizing must matter)."""
+        from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
+        learner_slot = int(obs.get("player", 0)) if isinstance(obs, dict) else int(obs.player)
+        preds, pid_to_idx = self._featurize_forward(obs, learner_slot)
+        q = preds.get("q_value")
+        if q is None:                       # no Q head -> plain det
+            return self._size_actions(
+                self._predict(obs, learner_slot, cached=(preds, pid_to_idx)),
+                obs, learner_slot)
+        q = q.squeeze(0)
+        pair_logits = preds["pair_logits"].squeeze(0)
+        pair_frac = preds["pair_frac"].squeeze(0)
+        P = pair_logits.size(0); device = pair_logits.device
+        idx_to_pid = {i: pid for pid, i in pid_to_idx.items()}
+        get = obs.get if isinstance(obs, dict) else (lambda k, d=None: getattr(obs, k, d))
+        _nb, defense_buffer, min_launch, _s, _fw, _et = PHASE_TABLE[phase_of(int(get("step") or 0))]
+        planets = [Planet(*p) for p in (get("planets") or [])]
+        enemy = [f for f in (Fleet(*x) for x in (get("fleets") or []))
+                 if f.owner != learner_slot and f.owner >= 0]
+        real_idx = torch.zeros(P, dtype=torch.bool, device=device)
+        src_legal = torch.zeros(P, dtype=torch.bool, device=device)
+        for pl in planets:
+            i = pid_to_idx.get(int(pl.id))
+            if i is None or i >= P:
+                continue
+            real_idx[i] = True
+            if int(pl.owner) == learner_slot and \
+                    compute_surplus(pl, enemy, defense_buffer) >= min_launch:
+                src_legal[i] = True
+        if not bool(src_legal.any()):
+            return []
+        eye = torch.eye(P, dtype=torch.bool, device=device)
+        diag = torch.arange(P, device=device)
+        row_legal = src_legal.unsqueeze(1) & real_idx.unsqueeze(0) & ~eye
+        row_legal[diag, diag] = src_legal           # HOLD slot per launchable src
+        neg_inf = torch.finfo(pair_logits.dtype).min
+        row_masked = pair_logits.masked_fill(~row_legal, neg_inf)
+        owned = torch.nonzero(src_legal, as_tuple=False).flatten()   # (n,)
+        own_slot = owned.unsqueeze(1)
+
+        def _score(tgts):                            # tgts (n,) or (n,K) -> (K,)
+            if tgts.dim() == 1:
+                tgts = tgts.unsqueeze(1)
+            fire = tgts != own_slot
+            return (q[own_slot, tgts] * fire).sum(0)
+
+        det_t = row_masked[owned].argmax(-1)         # (n,)
+        samp = torch.multinomial(                    # (n, n_draws) — pure math
+            torch.softmax(row_masked[owned], -1), n_draws, replacement=True)
+        det_score = float(_score(det_t)[0])
+        draw_scores = _score(samp)
+        best = int(draw_scores.argmax())
+        win = samp[:, best] if float(draw_scores[best]) > det_score else det_t
+        actions = []
+        for i, s in enumerate(owned.tolist()):
+            t = int(win[i])
+            if t == s:
+                continue
+            sp, tp = idx_to_pid.get(s), idx_to_pid.get(t)
+            if sp is not None and tp is not None:
+                actions.append((sp, tp, float(torch.sigmoid(pair_frac[s, t]))))
+        return self._size_actions(actions, obs, learner_slot)
+
     def act(self, obs: dict[str, Any]) -> list[list]:
         """Return ``[[planet_id, angle, ships], ...]`` action triples.
 

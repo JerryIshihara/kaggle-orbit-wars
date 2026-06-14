@@ -40,13 +40,23 @@ class SingleTargetKRankAgent:
 
     @torch.no_grad()
     def act(self, obs) -> list[list]:
+        # Q-RANK (deploy default): one forward -> q_value; rank n*m sampled
+        # select-sets by SUM-Q over launches (det = floor); size winner only.
+        # No per-candidate forward/sizing -> fits the 1s CPU budget to ~1e6
+        # draws. Q is per-pair, so this ranks target selection (sizing-blind).
+        return self.agent.qrank_act(obs, int(os.environ.get("OW_V4_N", self.n))
+                                    * int(os.environ.get("OW_V4_M", self.m)))
+
+    @torch.no_grad()
+    def act_value_sim(self, obs) -> list[list]:
+        """OFFLINE-ONLY alt: simulate-then-score with the value head V(s'). Sees
+        the resulting ships (Q-rank can't) but costs a forward PER candidate ->
+        OOM/over-budget past ~5x5; never ships (CPU 1s deploy)."""
         n = int(os.environ.get("OW_V4_N", self.n))
         m = int(os.environ.get("OW_V4_M", self.m))
         cands = self.agent.act_candidates_st(obs, n * m)     # cand 0 = DET
         if len(cands) == 1:
             return cands[0]
-        posts = [KRankAgent._apply(obs, mv) for mv in cands]
-        preds = self.agent.batched_value_forward(posts)      # ONE forward
-        win = torch.sigmoid(preds["win"][:, 0])              # (B,) learner win-prob
-        best = int(torch.argmax(win).item())
-        return cands[best]
+        preds = self.agent.batched_value_forward(
+            [KRankAgent._apply(obs, mv) for mv in cands])
+        return cands[int(torch.argmax(torch.sigmoid(preds["win"][:, 0])).item())]
