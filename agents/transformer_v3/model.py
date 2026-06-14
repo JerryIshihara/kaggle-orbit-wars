@@ -46,6 +46,7 @@ class EntityPretrainModelV3(EntityPretrainModel):
         n_steps: int | None = None,
         with_short_aux: bool = True,
         with_alloc_conc: bool = False,
+        with_frac_sigma: bool = False,
         **kw,
     ):
         if n_steps is not None and int(n_steps) != N_UNION:
@@ -91,6 +92,15 @@ class EntityPretrainModelV3(EntityPretrainModel):
             self.alloc_conc_head = AllocConcentrationHead(d_model)
         else:
             self.alloc_conc_head = None
+        # SINGLE-TARGET contract: per-source LogitNormal log-sigma (the alloc
+        # CONFIDENCE) off the L4 source tokens; the loc stays pair_frac. The
+        # logit-normal-sigmoid alloc the meta single-target style needs.
+        self.with_frac_sigma = bool(with_frac_sigma)
+        if self.with_frac_sigma:
+            from .single_target_alloc import FracSigmaHead
+            self.frac_sigma_head = FracSigmaHead(d_model)
+        else:
+            self.frac_sigma_head = None
 
     def forward_with_context(
         self,
@@ -199,6 +209,8 @@ class EntityPretrainModelV3(EntityPretrainModel):
         }
         if self.alloc_conc_head is not None:
             out["alloc_conc"] = self.alloc_conc_head(source_joint)
+        if self.frac_sigma_head is not None:
+            out["frac_sigma_log"] = self.frac_sigma_head(source_joint)  # (B,P)
         if "q_value" in heads:
             out["q_value"] = heads["q_value"]   # (B, P, P) per-pair launch Q
         # Same merge as the base: one forward yields action + value preds.
