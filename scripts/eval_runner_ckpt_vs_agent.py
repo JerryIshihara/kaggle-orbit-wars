@@ -108,13 +108,26 @@ def main() -> None:
 
     tot_w = sum(by_seat[s][0] for s in by_seat)
     tot_g = sum(by_seat[s][1] for s in by_seat)
+
+    def _wilson(w: int, n: int, z: float = 1.96) -> tuple[float, float]:
+        # Wilson 95% interval — well-behaved at small n / extreme rates,
+        # unlike the normal approx. Panel n is small so report it always.
+        if n == 0:
+            return 0.0, 0.0
+        p = w / n
+        d = 1.0 + z * z / n
+        c = p + z * z / (2 * n)
+        h = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)
+        return 100.0 * (c - h) / d, 100.0 * (c + h) / d
+
     print(f"\n=== RESULT {args.ckpt.name} vs {opponent_id} ===")
     for s in (0, 1):
         w, g = by_seat[s]
         if g:
             print(f"  seat {s}: {w}/{g} = {100.0 * w / g:.1f}%")
+    lo, hi = _wilson(tot_w, tot_g)
     print(f"  OVERALL: {tot_w}/{tot_g} = {100.0 * tot_w / max(1, tot_g):.1f}%  "
-          f"({time.time() - t0:.0f}s total)", flush=True)
+          f"[95% CI {lo:.0f}-{hi:.0f}]  ({time.time() - t0:.0f}s total)", flush=True)
 
 
 if __name__ == "__main__":

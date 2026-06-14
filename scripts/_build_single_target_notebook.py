@@ -304,8 +304,10 @@ LR_L34        = 5e-5   # dual_role + joint_role
 LR_L2         = 1e-5   # stage-A-pretrained dual L2 — gentle
 LR_SIGMA      = 5e-6   # fresh FracSigmaHead (confidence) — slow, own group
 WEIGHT_DECAY  = 1e-4
-LAUNCH_WEIGHT = 4.0    # up-weight launch rows so the dominant HOLD rows don't
-                       # drown the launch signal in the select CE
+LAUNCH_WEIGHT = 6.0    # up-weight launch rows so the dominant HOLD rows don't
+                       # drown the launch signal in the select CE. Bumped 4->6:
+                       # launch_acc (exact target hit on launch rows) trailed
+                       # hold_recall, so more launch-row gradient buys target acc.
 ALLOC_WEIGHT  = 1.0
 NUM_WORKERS   = 2
 # Watch in the logs (printed per epoch, val side):

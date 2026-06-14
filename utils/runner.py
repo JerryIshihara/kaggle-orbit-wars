@@ -67,24 +67,12 @@ def run_match(
 
     players = _validate_and_load(agent_ids)
     config: dict = {"seed": seed} if seed is not None else {}
-    if seed is None:
-        env = make("orbit_wars", configuration=config, debug=debug)
-        env.run([p.fn for p in players])
-    else:
-        # orbit_wars 1.28.x ignores env.configuration.seed for map/comet RNG
-        # and instead reads the module global named ``random``. Patch that
-        # module binding to a local RNG for the whole episode, then restore it
-        # so eval seeding does not perturb process-global Python random state
-        # used by other tools or stochastic agents.
-        import kaggle_environments.envs.orbit_wars.orbit_wars as orbit_wars
-
-        prev_random = orbit_wars.random
-        orbit_wars.random = random.Random(seed)
-        try:
-            env = make("orbit_wars", configuration=config, debug=debug)
-            env.run([p.fn for p in players])
-        finally:
-            orbit_wars.random = prev_random
+    # kaggle_environments >= 1.30 threads configuration.seed through a real
+    # rng object (verified: same-seed maps identical, diff-seed differ), so
+    # the old 1.28.x module-global ``random`` patch is gone — it CRASHED
+    # under 1.30 anyway (env code calls random.Random on the module global).
+    env = make("orbit_wars", configuration=config, debug=debug)
+    env.run([p.fn for p in players])
 
     scores = compute_scores(env)
     final = env.steps[-1]

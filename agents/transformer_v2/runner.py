@@ -247,7 +247,13 @@ class TransformerAgent:
         # ``action_contract`` and fall back to ``threshold`` exactly as before.
         if inference_mode is None:
             contract = cfg.get("action_contract")
-            if contract == "single_target_per_source_v1":
+            if contract in ("single_target_per_source_v1",
+                            "single_target_per_source_logitnormal_v5"):
+                # v5 == v1 select (per-source argmax over [targets + diagonal
+                # HOLD], drop if HOLD wins). The LogitNormal alloc's
+                # deterministic deploy fraction is sigmoid(loc) = the existing
+                # ``single_target`` sizing (line ~882); frac_sigma only matters
+                # for stochastic PPO sampling, so deploy needs no new branch.
                 inference_mode = "single_target"
             elif contract == "bernoulli_select_multinomial_alloc_v2":
                 # v2 pretrains train frac_loc as softmax-SHARE logits (incl.
@@ -363,6 +369,13 @@ class TransformerAgent:
                 with_value_heads=bool(cfg.get("with_value_heads", False)),
                 with_short_aux=bool(cfg.get("with_short_aux", False)),
                 with_alloc_conc=bool(cfg.get("with_alloc_conc", False)),
+                # v5 single-target LogitNormal alloc: the per-source confidence
+                # head (frac_sigma). Detect from config OR state-dict keys so
+                # the ckpt's frac_sigma_head tensors load instead of dropping as
+                # unexpected. Only needed for STOCHASTIC deploy (sample_frac);
+                # deterministic deploy reads sigmoid(loc) and never calls it.
+                with_frac_sigma=bool(cfg.get("with_frac_sigma", False)) or any(
+                    k.startswith("frac_sigma_head.") for k in _sd_keys),
                 # v5 Q head: detect from state-dict keys (PPO trial ckpts don't
                 # stamp it in config) — else q_value tensors load as unexpected
                 # and drop, silently no-op'ing the OW_V5_QGATE deploy gate.
@@ -545,13 +558,20 @@ class TransformerAgent:
         pair_logits = preds["pair_logits"].squeeze(0)               # (P, P)
         pair_frac_raw = preds["pair_frac"].squeeze(0)               # (P, P) raw logit
         # v5 Q-gate deploy: bias select logits toward high-Q (reachable) targets,
-        # away from low-Q (doomed) ones. OW_V5_QGATE=<weight>; needs a q-head
-        # ckpt. OW_V5_QFLOOR (optional) hard-masks cells at the doomed Q level.
-        if os.environ.get("OW_V5_QGATE") and preds.get("q_value") is not None:
+        # away from low-Q (doomed) ones. PER-INSTANCE `self.qgate_weight`/
+        # `qgate_floor` (set by a head-to-head match harness) override the
+        # OW_V5_QGATE / OW_V5_QFLOOR env vars, so two agents from the SAME ckpt
+        # can run gated vs ungated in one game. None on either → env fallback.
+        _qw_inst = getattr(self, "qgate_weight", None)
+        _qgate_on = (_qw_inst is not None) or bool(os.environ.get("OW_V5_QGATE"))
+        if _qgate_on and preds.get("q_value") is not None:
             from ..transformer_v3.q_head import q_gate_select_logits
-            _qw = float(os.environ.get("OW_V5_QGATE", "1.0"))
-            _qfloor = (float(os.environ["OW_V5_QFLOOR"])
-                       if os.environ.get("OW_V5_QFLOOR") else None)
+            _qw = float(_qw_inst if _qw_inst is not None
+                        else os.environ.get("OW_V5_QGATE", "1.0"))
+            _qfloor_inst = getattr(self, "qgate_floor", None)
+            _qfloor = (_qfloor_inst if _qfloor_inst is not None
+                       else (float(os.environ["OW_V5_QFLOOR"])
+                             if os.environ.get("OW_V5_QFLOOR") else None))
             pair_logits = q_gate_select_logits(
                 pair_logits, preds["q_value"].squeeze(0),
                 weight=_qw, doomed_floor=_qfloor)
@@ -641,36 +661,76 @@ class TransformerAgent:
             src_indices = torch.nonzero(keep, as_tuple=False).flatten()
             tgt_indices = row_best[src_indices]
         elif inference_mode == "single_target":
-            # single_target_per_source_v1 contract: each launchable source
-            # picks the argmax over [legal off-diagonal targets PLUS its own
-            # diagonal == NOOP/hold]. If the diagonal wins, the source HOLDS
-            # (no launch). Requires a model trained with the single-target CE
-            # so pair_logits[s, s] is the calibrated hold logit.
+            # single_target contract (v1 + v5 LogitNormal): each launchable
+            # source picks over [legal off-diagonal targets PLUS its own
+            # diagonal == NOOP/hold]. Diagonal wins -> the source HOLDS.
+            #   SELECT: argmax (det) or sampled from the row Categorical
+            #           (OW_ST_DECODE=sample -> qrank's stochastic half). The
+            #           Q-gate (OW_V5_QGATE) already biased pair_logits above,
+            #           so a Q-head ckpt samples/argmaxes Q-gated logits.
+            #   ALLOC : sigmoid(loc) median (det) or sample_frac from the
+            #           per-source LogitNormal sigma (stochastic).
+            # Self-contained (returns actions directly) so the sampled fraction
+            # and the per-source verbose log live together; the det path is
+            # byte-identical to the old shared-loop sizing (sigmoid(loc)).
+            from ..transformer_v3.single_target_alloc import sample_frac
+            st_sample = os.environ.get("OW_ST_DECODE", "argmax").lower() == "sample"
+            st_verbose = (os.environ.get("OW_ST_VERBOSE", "0") == "1"
+                          or getattr(self, "_decode_verbose", False))
             diag = torch.arange(P, device=device)
             row_legal = cell_legal.clone()
             row_legal[diag, diag] = src_legal          # add the hold slot per launchable src
             row_masked = pair_logits.masked_fill(~row_legal, neg_inf)
-            row_best = row_masked.argmax(dim=-1)                       # (P,) may be the diagonal
+            row_prob = torch.softmax(row_masked, dim=-1)               # (P,P)
+            fsl = preds.get("frac_sigma_log")
+            fsl = (fsl.squeeze(0) if fsl is not None
+                   else torch.full((P,), -0.7, device=device))         # (P,)
+            row_best = row_masked.argmax(dim=-1)                       # (P,) det
+            if st_sample and bool(src_legal.any()):
+                owned = src_legal
+                rp = torch.nan_to_num(row_prob[owned], nan=0.0)
+                rp = rp / rp.sum(-1, keepdim=True).clamp_min(1e-9)
+                row_best = row_best.clone()
+                row_best[owned] = torch.multinomial(rp, 1).squeeze(-1)
             keep = (
                 src_legal
                 & (row_best != diag)                  # diagonal winning == hold -> drop
                 & (row_masked.gather(1, row_best.unsqueeze(-1)).squeeze(-1) > neg_inf)
             )
-            src_indices = torch.nonzero(keep, as_tuple=False).flatten()
-            tgt_indices = row_best[src_indices]
-            # Opt-in decode diagnostics: how many launchable sources HELD
-            # (diagonal/NOOP won the row) vs LAUNCHED this turn. Set
-            # ``agent._debug_decode = True`` to accumulate into ``agent._dbg``.
+            actions: list[tuple[int, int, float]] = []
+            vlog_fire, n_hold = [], 0
+            for s in torch.nonzero(src_legal, as_tuple=False).flatten().tolist():
+                t = int(row_best[s].item())
+                sel_p = float(row_prob[s, t].item())
+                sigma = float(fsl[s].clamp(-3.0, 1.0).exp().item())
+                if bool(keep[s].item()):               # FIRE s -> t
+                    loc = pair_frac_raw[s, t]
+                    frac = (float(sample_frac(loc, fsl[s]).item()) if st_sample
+                            else float(torch.sigmoid(loc).item()))
+                    sp, tp = idx_to_pid.get(s), idx_to_pid.get(t)
+                    if sp is not None and tp is not None:
+                        actions.append((sp, tp, frac))
+                        if st_verbose:
+                            vlog_fire.append((s, t, sel_p, sigma, frac))
+                else:                                   # HOLD (diagonal won)
+                    n_hold += 1
+            if st_verbose and (vlog_fire or n_hold):
+                _t = int(get("step") or 0)
+                print(f"[decode t={_t:>3} {'SAMPLE' if st_sample else 'argmax'}] "
+                      f"{len(vlog_fire)} fire / {n_hold} hold "
+                      f"(of {int(src_legal.sum())} launchable src)", flush=True)
+                for (s, t, p, sg, f) in vlog_fire[:16]:
+                    print(f"    src{s:>2} -> tgt{t:>2}  sel_p={p:.2f}  "
+                          f"sigma={sg:.2f}  frac={f:.2f}", flush=True)
             if getattr(self, "_debug_decode", False):
                 dbg = self.__dict__.setdefault(
                     "_dbg", {"turns": 0, "src_legal": 0, "launched": 0, "held": 0}
                 )
-                nsl = int(src_legal.sum())
-                nl = int(keep.sum())
                 dbg["turns"] += 1
-                dbg["src_legal"] += nsl
-                dbg["launched"] += nl
-                dbg["held"] += nsl - nl
+                dbg["src_legal"] += int(src_legal.sum())
+                dbg["launched"] += len(actions)
+                dbg["held"] += n_hold
+            return actions
         elif inference_mode == "topk_self":
             # bounded_k v3 deploy decode. Per launchable row, the SELF logit
             # ``pair_logits[s, s]`` is the LEARNED firing threshold: fire every
@@ -1023,6 +1083,14 @@ class TransformerAgent:
         # Aligned target pids for the just-emitted moves — lets KRankAgent
         # re-draw allocations (N×M) without a second forward.
         self._last_move_tgt_pids = move_tgt_pids
+        if (os.environ.get("OW_ST_VERBOSE", "0") == "1"
+                or getattr(self, "_decode_verbose", False)) and actions:
+            # What actually got ACCEPTED after the per-source surplus / min_launch
+            # sizing — the decode proposes (src,tgt,frac); this is what flies.
+            _t = int(get("step") or 0)
+            acc = [(int(m[0]), int(m[2])) for m in moves]   # (from_pid, ships)
+            print(f"[act    t={_t:>3}] ACCEPTED {len(moves)}/{len(actions)} proposed "
+                  f"(min_launch={min_launch}) | (from,ships)={acc[:12]}", flush=True)
         return moves
 
     @staticmethod
