@@ -430,6 +430,46 @@ class TransformerAgent:
         )
 
     @torch.no_grad()
+    @torch.no_grad()
+    def _featurize_forward(self, obs, learner_slot: int):
+        """Single-frame featurize + L0 + model forward -> (preds, pid_to_idx).
+        Factored so qrank can run it ONCE and decode many candidates off the
+        same outputs (state-deterministic forward; only the sampling varies)."""
+        batch, pid_to_idx = featurize_observation(
+            obs, learner_slot=learner_slot, tracker=self._tracker,
+            num_players=self.num_players, max_planets=self.max_planets,
+            max_fleets=self.max_fleets, device=self.device)
+        B, P, _ = batch["planet_features"].shape
+        comet_features = torch.zeros(
+            (B, P, self.comet_enc.input_dim), device=self.device,
+            dtype=batch["planet_features"].dtype)
+        comet_features[..., :18] = batch["planet_features"][..., :18]
+        is_comet = batch["planet_features"][..., 0] > 0.5
+        planet_tok = self.planet_enc(batch["planet_features"])
+        comet_tok = self.comet_enc(comet_features)
+        fleet_tok = self.fleet_enc(batch["fleet_features"])
+        entity_self = _build_entity_self_tokens(planet_tok, comet_tok, is_comet)
+        routing = {k: batch[k] for k in (
+            "fleet_target_idx", "fleet_source_idx", "fleet_owner_slot",
+            "fleet_ships_log", "fleet_eta_norm", "fleet_mask")}
+        if getattr(self.model, "ARCH", "") == "dual_rate_l2_v3":
+            from .pretrain.entity_encoder import (
+                ENTITY_N_OWNER_CLASSES as _N_OWN,
+                _PLANET_OWNER_START_IDX as _OWN0)
+            preds = self.model.forward_with_context(
+                entity_self, fleet_tok, routing, batch["planet_mask"],
+                is_comet=is_comet,
+                pair_type_ids=build_pair_type_ids(
+                    batch["planet_features"], batch["planet_mask"]),
+                planet_owner_oh=batch["planet_features"][..., _OWN0:_OWN0 + _N_OWN])
+        else:
+            preds = self.model(
+                entity_self, fleet_tok, routing, batch["planet_mask"],
+                is_comet=is_comet,
+                pair_type_ids=build_pair_type_ids(
+                    batch["planet_features"], batch["planet_mask"]))
+        return preds, pid_to_idx
+
     def _predict(
         self,
         obs: dict[str, Any],
@@ -437,6 +477,7 @@ class TransformerAgent:
         *,
         logit_threshold: float | None = None,
         inference_mode: str | None = None,
+        cached: tuple | None = None,
     ) -> list[tuple[int, int, float]]:
         """Return ``(source_pid, target_pid, frac)`` triples for this turn.
 
@@ -477,83 +518,14 @@ class TransformerAgent:
             self._tracker = FleetTracker()
         self._last_step = step
 
-        # Single-frame featurization. The model was trained with T=6
-        # history but accepts T=1 via L2's step_embed[-T:] tail slice;
-        # the loss in fidelity is bounded by the L2 attention's
-        # step-position generalization.
-        batch, pid_to_idx = featurize_observation(
-            obs,
-            learner_slot=learner_slot,
-            tracker=self._tracker,
-            num_players=self.num_players,
-            max_planets=self.max_planets,
-            max_fleets=self.max_fleets,
-            device=self.device,
-        )
-
-        # Need comet_features too — the inference featurizer doesn't
-        # emit it (training-only key on the cached snapshots). Stub it
-        # with zeros for now; the comet_tok pathway will just produce
-        # zero-encoded tokens for comet planets, which `where` routes
-        # away from for non-comet planets anyway. is_comet is taken
-        # from f000 of planet_features per the comet specialist's input
-        # convention.
-        B, P, _ = batch["planet_features"].shape
-        comet_input_dim = self.comet_enc.input_dim
-        comet_features = torch.zeros(
-            (B, P, comet_input_dim), device=self.device,
-            dtype=batch["planet_features"].dtype,
-        )
-        # The first 18 dims of the planet feature vector are the same
-        # scalar block the comet specialist saw (f000 = is_comet flag,
-        # f001..f017 = sun-relative geometry + owner one-hot + ships).
-        comet_features[..., :18] = batch["planet_features"][..., :18]
-
-        # is_comet flag: f000 of the planet feature vector is the
-        # is_comet flag in the v2 featurizer.
-        is_comet = batch["planet_features"][..., 0] > 0.5
-
-        # L0 frozen forward.
-        planet_tok = self.planet_enc(batch["planet_features"])     # (B, P, d)
-        comet_tok = self.comet_enc(comet_features)                  # (B, P, d)
-        fleet_tok = self.fleet_enc(batch["fleet_features"])         # (B, F, d)
-        entity_self = _build_entity_self_tokens(planet_tok, comet_tok, is_comet)
-
-        routing = {
-            "fleet_target_idx": batch["fleet_target_idx"],
-            "fleet_source_idx": batch["fleet_source_idx"],
-            "fleet_owner_slot": batch["fleet_owner_slot"],
-            "fleet_ships_log": batch["fleet_ships_log"],
-            "fleet_eta_norm": batch["fleet_eta_norm"],
-            "fleet_mask": batch["fleet_mask"],
-        }
-        if getattr(self.model, "ARCH", "") == "dual_rate_l2_v3":
-            # v3.1: the trained owner projection must participate at
-            # inference (it's zero-init only at the START of training) —
-            # route through forward_with_context, which threads the
-            # learner-relative owner one-hot into the dual L2. Returns the
-            # same pair_logits / pair_frac keys.
-            from .pretrain.entity_encoder import (
-                ENTITY_N_OWNER_CLASSES as _N_OWN,
-                _PLANET_OWNER_START_IDX as _OWN0,
-            )
-            preds = self.model.forward_with_context(
-                entity_self, fleet_tok, routing, batch["planet_mask"],
-                is_comet=is_comet,
-                pair_type_ids=build_pair_type_ids(
-                    batch["planet_features"], batch["planet_mask"],
-                ),
-                planet_owner_oh=batch["planet_features"][
-                    ..., _OWN0:_OWN0 + _N_OWN],
-            )
+        # Featurize + forward ONCE. ``cached`` lets a multi-candidate ranker
+        # (qrank) forward a state once and decode N draws off the SAME outputs
+        # (the actor forward is state-deterministic; only the sampling varies),
+        # turning N forwards into 1 — the cached-generation win.
+        if cached is not None:
+            preds, pid_to_idx = cached
         else:
-            preds = self.model(
-                entity_self, fleet_tok, routing, batch["planet_mask"],
-                is_comet=is_comet,
-                pair_type_ids=build_pair_type_ids(
-                    batch["planet_features"], batch["planet_mask"],
-                ),
-            )
+            preds, pid_to_idx = self._featurize_forward(obs, learner_slot)
 
         pair_logits = preds["pair_logits"].squeeze(0)               # (P, P)
         pair_frac_raw = preds["pair_frac"].squeeze(0)               # (P, P) raw logit
@@ -985,6 +957,69 @@ class TransformerAgent:
             planet_owner_oh=batch["planet_features"][..., _OWN0:_OWN0 + _N_OWN],
         )
 
+    @torch.no_grad()
+    def batched_value_forward(self, obs_list: list) -> dict[str, torch.Tensor]:
+        """value_forward over a BATCH of obs in ONE forward — the qrank/K-rank
+        scorer. Each post-action state featurizes to the same padded shape
+        (max_planets/max_fleets), so they stack into batch B and the value
+        heads score all B in a single pass. ~free on GPU (batch parallel); on
+        CPU it's compute-bound so it matches B sequential calls (verified). Use
+        for ranking many candidate successors without B separate forwards."""
+        from .pretrain.entity_encoder import (
+            ENTITY_N_OWNER_CLASSES as _N_OWN, _PLANET_OWNER_START_IDX as _OWN0)
+        feats = []
+        for obs in obs_list:
+            ls = int(obs.get("player_id", 0) if isinstance(obs, dict)
+                     else getattr(obs, "player_id", 0))
+            b, _ = featurize_observation(
+                obs, learner_slot=ls, tracker=FleetTracker(),
+                num_players=self.num_players, max_planets=self.max_planets,
+                max_fleets=self.max_fleets, device=self.device)
+            feats.append(b)
+        batch = {k: torch.cat([f[k] for f in feats], dim=0) for k in feats[0]}
+        B, P, _ = batch["planet_features"].shape
+        comet = torch.zeros((B, P, self.comet_enc.input_dim), device=self.device,
+                            dtype=batch["planet_features"].dtype)
+        comet[..., :18] = batch["planet_features"][..., :18]
+        is_comet = batch["planet_features"][..., 0] > 0.5
+        entity_self = _build_entity_self_tokens(
+            self.planet_enc(batch["planet_features"]),
+            self.comet_enc(comet), is_comet)
+        routing = {k: batch[k] for k in (
+            "fleet_target_idx", "fleet_source_idx", "fleet_owner_slot",
+            "fleet_ships_log", "fleet_eta_norm", "fleet_mask")}
+        return self.model.forward_with_context(
+            entity_self, self.fleet_enc(batch["fleet_features"]), routing,
+            batch["planet_mask"], is_comet=is_comet,
+            pair_type_ids=build_pair_type_ids(
+                batch["planet_features"], batch["planet_mask"]),
+            planet_owner_oh=batch["planet_features"][..., _OWN0:_OWN0 + _N_OWN])
+
+    def act_candidates_st(self, obs, n_draws: int) -> list[list[list]]:
+        """Cached-forward qrank generation (single-target): forward the actor
+        ONCE, then decode the DET candidate (argmax) + ``n_draws`` SAMPLED
+        candidates off the SAME outputs — N forwards collapse to 1. Returns a
+        list of env-move sets, candidate 0 = DET (always in the pool)."""
+        learner_slot = int(obs.get("player", 0)) if isinstance(obs, dict) else int(obs.player)
+        cache = self._featurize_forward(obs, learner_slot)
+        prev_dec, prev_vrb = os.environ.get("OW_ST_DECODE"), os.environ.get("OW_ST_VERBOSE")
+        os.environ["OW_ST_VERBOSE"] = "0"           # no per-source spam during gen
+        try:
+            os.environ["OW_ST_DECODE"] = "argmax"
+            cands = [self._size_actions(
+                self._predict(obs, learner_slot, cached=cache), obs, learner_slot)]
+            os.environ["OW_ST_DECODE"] = "sample"
+            for _ in range(n_draws):
+                cands.append(self._size_actions(
+                    self._predict(obs, learner_slot, cached=cache), obs, learner_slot))
+        finally:
+            for k, v in (("OW_ST_DECODE", prev_dec), ("OW_ST_VERBOSE", prev_vrb)):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        return cands
+
     def act(self, obs: dict[str, Any]) -> list[list]:
         """Return ``[[planet_id, angle, ships], ...]`` action triples.
 
@@ -996,7 +1031,14 @@ class TransformerAgent:
         logit-descending order.
         """
         learner_slot = int(obs.get("player", 0)) if isinstance(obs, dict) else int(obs.player)
-        actions = self._predict(obs, learner_slot)
+        return self._size_actions(self._predict(obs, learner_slot), obs, learner_slot)
+
+    def _size_actions(self, actions, obs, learner_slot: int) -> list[list]:
+        """Size decoded ``(src, tgt, frac)`` triples into ``[planet_id, angle,
+        ships]`` env moves: per-source ``compute_surplus`` budget, ``frac *
+        ships``, ``min_launch`` floor. Factored from ``act`` so a multi-
+        candidate ranker (qrank) can size each candidate from ONE cached
+        forward without re-running the decode."""
         if not actions:
             return []
 
