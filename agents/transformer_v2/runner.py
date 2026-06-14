@@ -363,6 +363,11 @@ class TransformerAgent:
                 with_value_heads=bool(cfg.get("with_value_heads", False)),
                 with_short_aux=bool(cfg.get("with_short_aux", False)),
                 with_alloc_conc=bool(cfg.get("with_alloc_conc", False)),
+                # v5 Q head: detect from state-dict keys (PPO trial ckpts don't
+                # stamp it in config) — else q_value tensors load as unexpected
+                # and drop, silently no-op'ing the OW_V5_QGATE deploy gate.
+                with_q_head=bool(cfg.get("with_q_head", False)) or any(
+                    k.startswith("pair_head.q_head.") for k in _sd_keys),
                 # Dropout shifts the value-MLP 2nd Linear from idx 2 to 3;
                 # ckpts that trained with dropout but didn't stamp it (e.g.
                 # jointv4) would otherwise load FRESH value heads silently
