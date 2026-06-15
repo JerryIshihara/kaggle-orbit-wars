@@ -32,7 +32,7 @@ from .model import EntityPretrainModelV3, adapt_v2_state_dict
 from .history import UNION_HISTORY_OFFSETS
 from .l2_pretrain import _episode_split
 from .action_set_encoder import (
-    ActionSetEncoder, FracEmbed, SharedQTrunk, SetValueHeads)
+    ActionSetEncoder, FracEmbed, SharedQTrunk, SetValueHeads, AUX_SIGNALS)
 from .set_token_pretrain import _gather_launches
 
 
@@ -87,9 +87,14 @@ def _qset_step(model, set_enc, frac_embed, ships_embed, q_trunk, vh, encoders,
         tgt = batch["p1_future"]                           # (B,5,5)
         vmask = batch["p1_valid"].view(-1, 1, tgt.shape[-1])  # (B,1,5) per-horizon
         hub = F.huber_loss(heads["aux_fwd"], tgt, delta=0.25, reduction="none")
-        aux = (hub * vmask).sum() / vmask.expand_as(hub).sum().clamp(min=1)
+        vm = vmask.expand_as(hub)
+        aux = (hub * vmask).sum() / vm.sum().clamp(min=1)
         loss = loss + aux_weight * aux
         terms["aux_fwd"] = float(aux.detach())
+        with torch.no_grad():                              # per-signal forecast error
+            per_sig = (hub * vmask).sum((0, 2)) / vm.sum((0, 2)).clamp(min=1)
+            for i, nm in enumerate(AUX_SIGNALS):
+                terms[f"aux/{nm}"] = float(per_sig[i])
     with torch.no_grad():
         qd = q_set.detach()
         sign_acc = ((qd.sign() == y.sign()) | (y == 0)).float().mean().item()
@@ -219,6 +224,7 @@ def train_qset(args) -> Path:
                     run[k] = run.get(k, 0.0) + v; cnt[k] = cnt.get(k, 0) + 1
             if args.progress_every and i % args.progress_every == 0:
                 _log(f"ep{epoch} {i}/{len(tr_loader)} huber={terms['huber']:.3f} "
+                     f"aux={terms.get('aux_fwd', float('nan')):.3f} "
                      f"sign_acc={terms['sign_acc']:.3f} corr={terms['corr']:+.3f} "
                      f"(w {terms['q_win']:+.2f} / l {terms['q_loss']:+.2f}) "
                      f"({time.time()-t0:.0f}s)")
@@ -238,7 +244,12 @@ def train_qset(args) -> Path:
         vm = {k: vrun[k] / vcnt[k] for k in vrun}
         _log(f"epoch {epoch} {time.time()-t0:.0f}s | VAL sign_acc={vm.get('sign_acc', float('nan')):.3f} "
              f"corr={vm.get('corr', float('nan')):+.3f} huber={vm.get('huber', float('nan')):.3f} "
-             f"| Q win {vm.get('q_win', float('nan')):+.2f} vs loss {vm.get('q_loss', float('nan')):+.2f}")
+             f"| Q win {vm.get('q_win', float('nan')):+.2f} vs loss {vm.get('q_loss', float('nan')):+.2f} "
+             f"(gap {vm.get('q_win',0)-vm.get('q_loss',0):+.2f})")
+        if "aux_fwd" in vm:                                # verbose aux head (per-signal)
+            _log("    AUX fwd={:.4f} | ".format(vm["aux_fwd"]) + "  ".join(
+                f"{nm.replace('_adv','')}={vm.get(f'aux/{nm}', float('nan')):.3f}"
+                for nm in AUX_SIGNALS))
         logj.append({"epoch": epoch, "val": vm})
         (out_dir / "log.json").write_text(json.dumps(logj, indent=1))
         _save(out_dir / "qset_last.pt", epoch)
