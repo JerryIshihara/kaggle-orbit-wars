@@ -34,10 +34,10 @@ from google.colab import auth
 auth.authenticate_user()
 BUCKET = 'gs://orbit-wars-shipping/entity'
 PAIR_CACHE_PREFIX = 'pair_cache_topmeta300'           # ← swap to the doubled cache for MORE data
-OUTCOME_SRC = f'{BUCKET}/runs/topmeta300_outcome.pt'  # ← matching outcome sidecar
-# SET-TOKEN ckpt from Stage 2 (set the run tag you produced):
-WARM_START_SRC = f'{BUCKET}/runs/set_token_topmeta300_d256_REPLACE_WITH_YOUR_TS/set_token_best.pt'
-print('warm (set-token):', WARM_START_SRC, '\\noutcome:', OUTCOME_SRC)
+OUTCOME_SRC  = f'{BUCKET}/runs/topmeta300_outcome.pt'   # win/loss MC return → Q_set target
+FORECAST_SRC = f'{BUCKET}/runs/topmeta300_forecast.pt'  # 5 signals × 5 horizons → aux head target
+WARM_START_SRC = f'{BUCKET}/runs/set_token_topmeta300_d256_20260615-063723/set_token_best.pt'  # Stage-2 set-token
+print('warm (set-token):', WARM_START_SRC)
 """))
 
 C.append(("code", """\
@@ -86,13 +86,14 @@ def pull_cache(prefix, dst):
 assert _gcs_size(WARM_START_SRC) is not None, 'set WARM_START_SRC to your Stage-2 set-token ckpt!'
 _cp(f'{BUCKET}/code.tgz', WORK/'code.tgz'); _cp(f'{BUCKET}/weights.tgz', WORK/'weights.tgz')
 pull_cache(PAIR_CACHE_PREFIX, WORK/'pair_cache.pt')
-_cp(OUTCOME_SRC, WORK/'outcome.pt'); _cp(WARM_START_SRC, WORK/'warm_start.pt')
+_cp(OUTCOME_SRC, WORK/'outcome.pt'); _cp(FORECAST_SRC, WORK/'forecast.pt')
+_cp(WARM_START_SRC, WORK/'warm_start.pt')
 print('pull done')
 """))
 
 C.append(("code", """\
 !rm -rf agents scripts ckpts
-!find . -maxdepth 1 -name '*.pt' ! -name 'pair_cache.pt' ! -name 'outcome.pt' ! -name 'warm_start.pt' -delete
+!find . -maxdepth 1 -name '*.pt' ! -name 'pair_cache.pt' ! -name 'outcome.pt' ! -name 'forecast.pt' ! -name 'warm_start.pt' -delete
 !tar xzf code.tgz && tar xzf weights.tgz
 import sys, importlib, gc
 for m in list(sys.modules):
@@ -122,6 +123,7 @@ C.append(("code", """\
   --out-dir $OUT_DIR \\
   --pair-cache-path /content/orbit-wars/pair_cache.pt \\
   --outcome-sidecar /content/orbit-wars/outcome.pt \\
+  --forecast-sidecar /content/orbit-wars/forecast.pt --aux-weight 0.25 \\
   --fleet-run-dir ckpts/fleet --planet-run-dir ckpts/planet --comet-run-dir ckpts/comet \\
   --warm-start /content/orbit-wars/warm_start.pt \\
   --epochs 25 --batch-size 32 \\
