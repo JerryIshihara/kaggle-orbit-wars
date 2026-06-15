@@ -36,7 +36,8 @@ from .model import EntityPretrainModelV3, adapt_v2_state_dict
 from .history import UNION_HISTORY_OFFSETS
 from .l2_pretrain import _episode_split
 from .action_set_encoder import (
-    ActionSetEncoder, SetReconHead, FracEmbed, set_pretrain_loss)
+    ActionSetEncoder, SetReconHead, FracEmbed, set_pretrain_loss,
+    SharedQTrunk, SetValueHeads)
 
 
 def _log(m: str) -> None:
@@ -158,6 +159,11 @@ def train_set_token(args) -> Path:
     set_enc = ActionSetEncoder(args.d_model, 2 * args.d_model + d_frac + d_ships,
                                n_layers=args.set_layers).to(device)
     recon = SetReconHead(args.d_model).to(device)
+    # Shared Q-trunk + value/forecast heads — baked in NOW (saved fresh) so the
+    # ckpt is forward-compatible; TRAINED in the next stage (Q_set outcome + aux
+    # forecasts on the doubled good/bad cache). Not in this stage's LR groups.
+    q_trunk = SharedQTrunk(args.d_model).to(device)
+    set_value_heads = SetValueHeads(args.d_model).to(device)
 
     # ---- LR groups: set modules fast; L2/L3/L4 SMALL; L0/L1 + heads frozen ----
     for p in model.parameters():
@@ -201,6 +207,8 @@ def train_set_token(args) -> Path:
         torch.save({"model": model.state_dict(), "set_enc": set_enc.state_dict(),
                     "recon": recon.state_dict(), "frac_embed": frac_embed.state_dict(),
                     "ships_embed": ships_embed.state_dict(),
+                    "q_trunk": q_trunk.state_dict(),           # fresh stub (next stage)
+                    "set_value_heads": set_value_heads.state_dict(),
                     "epoch": ep, "config": config}, path)
 
     for epoch in range(1, args.epochs + 1):

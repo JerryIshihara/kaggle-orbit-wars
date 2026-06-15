@@ -96,6 +96,58 @@ class SetReconHead(nn.Module):
         return pair, hold
 
 
+#: action-conditioned forecast targets for the aux heads (next stage). The same
+#: 5 P1 signals value_v4's fwd head predicts (own/(own+max_enemy), 0.5=parity)
+#: and the 5 horizons — but here conditioned on the chosen action SET.
+AUX_SIGNALS = ("ship_adv", "production_adv", "planet_adv", "safety",
+               "fleet_speed_adv")
+AUX_HORIZONS = (5, 10, 15, 20, 50)
+
+
+class SharedQTrunk(nn.Module):
+    """Shared trunk for ALL set-level value/forecast heads: [set_token ⊕ glob ⊕
+    player] → q_emb (d). The aux dense forecasts shape this trunk toward
+    value-relevant structure BEFORE the sparse win target hits Q_set."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(3 * d_model, d_model), nn.GELU(),
+            nn.Linear(d_model, d_model), nn.GELU())
+
+    def forward(self, set_token, glob, player):
+        return self.net(torch.cat([set_token, glob, player], -1))   # (B,d)
+
+
+class SetValueHeads(nn.Module):
+    """Thin heads off the shared Q trunk. STUBS now (instantiated so the
+    set-token ckpt is forward-compatible) — trained in the next stage on the
+    doubled good/bad cache:
+      q_set    : value of the whole set            -> Huber to MC outcome (±1)
+      aux_fwd  : 5 signals × 5 horizons (=25)       -> Huber to realized t+h level
+      survives : alive @ each horizon               -> BCE
+      material : own−enemy ships Δ @ each horizon   -> Huber
+    The marginal (per-launch) heads read launch_ctx and live in their own trunk.
+    """
+
+    def __init__(self, d_model: int,
+                 n_sig: int = len(AUX_SIGNALS), n_hor: int = len(AUX_HORIZONS)):
+        super().__init__()
+        self.q_set = nn.Linear(d_model, 1)
+        self.aux_fwd = nn.Linear(d_model, n_sig * n_hor)
+        self.survives = nn.Linear(d_model, n_hor)
+        self.material = nn.Linear(d_model, n_hor)
+        self.n_sig, self.n_hor = n_sig, n_hor
+
+    def forward(self, q_emb):
+        return {
+            "q_set": self.q_set(q_emb).squeeze(-1),                 # (B,)
+            "aux_fwd": self.aux_fwd(q_emb).view(-1, self.n_sig, self.n_hor),
+            "survives": self.survives(q_emb),                      # (B, n_hor)
+            "material": self.material(q_emb),                      # (B, n_hor)
+        }
+
+
 def set_pretrain_loss(pair_logits, hold_logits, pair_labels, owned_mask,
                       pred_rows):
     """CE over [targets ... HOLD] for the rows we must predict.
