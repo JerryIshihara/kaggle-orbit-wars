@@ -31,6 +31,7 @@ from ..transformer_v2.pretrain.joint_pretrain import (
     _forward_context_from_batch, _load_encoders)
 from ..transformer_v2.pretrain.entity_encoder import (
     _pair_frac_targets_from_batch, _owned_source_rows)
+from ..transformer_v2.featurizer.fleet_featurizer import SHIPS_LOG_MAX
 from .model import EntityPretrainModelV3, adapt_v2_state_dict
 from .history import UNION_HISTORY_OFFSETS
 from .l2_pretrain import _episode_split
@@ -42,11 +43,17 @@ def _log(m: str) -> None:
     print(f"[set-tok {time.strftime('%H:%M:%S')}] {m}", flush=True)
 
 
-def _gather_launches(out, batch, frac_embed, d_frac):
+def _gather_launches(out, batch, frac_embed, ships_embed, d_frac, d_ships):
     """Build padded launch tokens for each turn's fired set.
 
-    Returns launch_tok (B,Kmax, 2d+d_frac), pad_mask (B,Kmax) True=pad,
-    src_slot (B,Kmax) long (-1 pad), owned (B,P) bool, fired_src (B,P) bool."""
+    Launch token = source_joint[s] ⊕ target_joint[t] ⊕ frac_embed(f) ⊕
+    ships_embed(log1p(ships_sent)). frac = size-INVARIANT signal; log-ships =
+    the ABSOLUTE sample-specific force (so equal-frac/diff-garrison launches get
+    different Q — the fleet-size fix). source/target_joint already carry the
+    garrison + the frac-head's latent context.
+
+    Returns launch_tok (B,Kmax, 2d+d_frac+d_ships), pad_mask, src_slot, owned,
+    fired_src."""
     sj = out["source_joint"]                       # (B,P,d)
     tj = out["target_joint"]                       # (B,P,d)
     B, P, d = sj.shape
@@ -60,7 +67,7 @@ def _gather_launches(out, batch, frac_embed, d_frac):
             if ships is not None else torch.zeros(B, P, P, device=device))
     Ks = fired_src.sum(-1)
     Kmax = int(Ks.max().clamp(min=1).item())
-    launch = torch.zeros(B, Kmax, 2 * d + d_frac, device=device)
+    launch = torch.zeros(B, Kmax, 2 * d + d_frac + d_ships, device=device)
     src_slot = torch.full((B, Kmax), -1, dtype=torch.long, device=device)
     pad = torch.ones(B, Kmax, dtype=torch.bool, device=device)
     for b in range(B):
@@ -68,14 +75,17 @@ def _gather_launches(out, batch, frac_embed, d_frac):
         for i, s in enumerate(srcs.tolist()):
             t = int(tgt_idx[b, s])
             fe = frac_embed(frac[b, s, t].view(1)).squeeze(0)
-            launch[b, i] = torch.cat([sj[b, s], tj[b, t], fe])
+            sh = ships[b, s, t] if ships is not None else torch.zeros((), device=device)
+            ls = (torch.log1p(sh) / SHIPS_LOG_MAX).clamp(0.0, 1.0)
+            se = ships_embed(ls.view(1)).squeeze(0)
+            launch[b, i] = torch.cat([sj[b, s], tj[b, t], fe, se])
             src_slot[b, i] = s
             pad[b, i] = False
     return launch, pad, src_slot, owned, fired_src
 
 
-def _step(model, set_enc, recon, frac_embed, encoders, batch, *,
-          d_frac, mask_ratio):
+def _step(model, set_enc, recon, frac_embed, ships_embed, encoders, batch, *,
+          d_frac, d_ships, mask_ratio):
     out = _forward_context_from_batch(
         model, encoders[0], encoders[1], encoders[2], batch)
     pair_labels = batch["pair_labels"].bool()
@@ -83,7 +93,7 @@ def _step(model, set_enc, recon, frac_embed, encoders, batch, *,
     glob = out["glob"]
     player = out["player_state"][:, 0]                  # learner-relative slot 0
     launch, pad, src_slot, owned, fired = _gather_launches(
-        out, batch, frac_embed, d_frac)
+        out, batch, frac_embed, ships_embed, d_frac, d_ships)
 
     # B) autoencoder — full set → reconstruct ALL owned rows
     set_b, _ = set_enc(launch, pad)
@@ -110,7 +120,7 @@ def _step(model, set_enc, recon, frac_embed, encoders, batch, *,
     total = loss_b + loss_a
     terms = {f"ae/{k}": v for k, v in d_b.items()}
     terms.update({f"mask/{k}": v for k, v in d_a.items()})
-    terms["total"] = float(total)
+    terms["total"] = float(total.detach())
     return total, terms
 
 
@@ -142,9 +152,10 @@ def train_set_token(args) -> Path:
     _log(f"warm-start {args.warm_start}: trunk loaded")
     del warm, sd
 
-    d_frac = args.d_frac
-    frac_embed = FracEmbed(d_frac).to(device)
-    set_enc = ActionSetEncoder(args.d_model, 2 * args.d_model + d_frac,
+    d_frac, d_ships = args.d_frac, args.d_ships
+    frac_embed = FracEmbed(d_frac).to(device)               # size-invariant
+    ships_embed = FracEmbed(d_ships).to(device)             # absolute force (log-ships)
+    set_enc = ActionSetEncoder(args.d_model, 2 * args.d_model + d_frac + d_ships,
                                n_layers=args.set_layers).to(device)
     recon = SetReconHead(args.d_model).to(device)
 
@@ -161,7 +172,7 @@ def train_set_token(args) -> Path:
             groups.append({"params": ps, "lr": lr})
             _log(f"  lr {name:<7s} lr={lr:g}  {sum(p.numel() for p in ps):,}")
 
-    _grp([set_enc, recon, frac_embed], args.lr_set, "set")
+    _grp([set_enc, recon, frac_embed, ships_embed], args.lr_set, "set")
     _grp([model.dual_role, model.joint_role], args.lr_l34, "l34")
     _grp([model.cross], args.lr_l2, "l2")
     opt = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
@@ -189,15 +200,18 @@ def train_set_token(args) -> Path:
     def _save(path, ep):
         torch.save({"model": model.state_dict(), "set_enc": set_enc.state_dict(),
                     "recon": recon.state_dict(), "frac_embed": frac_embed.state_dict(),
+                    "ships_embed": ships_embed.state_dict(),
                     "epoch": ep, "config": config}, path)
 
     for epoch in range(1, args.epochs + 1):
-        model.train(); set_enc.train(); recon.train(); frac_embed.train()
+        model.train(); set_enc.train(); recon.train()
+        frac_embed.train(); ships_embed.train()
         t0, run, cnt = time.time(), {}, {}
         for i, batch in enumerate(tr_loader, 1):
             batch = {k: v.to(device) for k, v in batch.items()}
-            loss, terms = _step(model, set_enc, recon, frac_embed, encoders,
-                                 batch, d_frac=d_frac, mask_ratio=args.mask_ratio)
+            loss, terms = _step(model, set_enc, recon, frac_embed, ships_embed,
+                                 encoders, batch, d_frac=d_frac, d_ships=d_ships,
+                                 mask_ratio=args.mask_ratio)
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 (p for g in groups for p in g["params"]), args.grad_clip)
@@ -212,13 +226,15 @@ def train_set_token(args) -> Path:
                      f"({time.time()-t0:.0f}s)")
         tr = {k: run[k] / cnt[k] for k in run}
 
-        model.eval(); set_enc.eval(); recon.eval(); frac_embed.eval()
+        model.eval(); set_enc.eval(); recon.eval()
+        frac_embed.eval(); ships_embed.eval()
         vrun, vcnt = {}, {}
         with torch.no_grad():
             for batch in va_loader:
                 batch = {k: v.to(device) for k, v in batch.items()}
-                _, terms = _step(model, set_enc, recon, frac_embed, encoders,
-                                 batch, d_frac=d_frac, mask_ratio=args.mask_ratio)
+                _, terms = _step(model, set_enc, recon, frac_embed, ships_embed,
+                                 encoders, batch, d_frac=d_frac, d_ships=d_ships,
+                                 mask_ratio=args.mask_ratio)
                 for k, v in terms.items():
                     if isinstance(v, float) and not math.isnan(v):
                         vrun[k] = vrun.get(k, 0.0) + v; vcnt[k] = vcnt.get(k, 0) + 1
@@ -245,6 +261,8 @@ def main() -> None:
     p.add_argument("--warm-start", type=Path, required=True)
     p.add_argument("--d-model", type=int, default=256)
     p.add_argument("--d-frac", type=int, default=32)
+    p.add_argument("--d-ships", type=int, default=32,
+                   help="embed dim for log1p(ships_sent) — the ABSOLUTE force")
     p.add_argument("--set-layers", type=int, default=2)
     p.add_argument("--mask-ratio", type=float, default=0.35)
     p.add_argument("--batch-size", type=int, default=16)
