@@ -44,9 +44,10 @@ class OutcomePairDataset(Dataset):
     """Pair-cache subset that attaches the episode outcome (+1/-1) per item,
     keyed by (episode_id, turn). Drops snapshots with no outcome label."""
 
-    def __init__(self, base, indices, outcome: dict):
+    def __init__(self, base, indices, outcome: dict, forecast: dict | None = None):
         self.base = base
         self.outcome = outcome
+        self.forecast = forecast or {}
         self.indices = [i for i in indices
                         if (base.keys[i][0], int(base.keys[i][1])) in outcome]
 
@@ -57,13 +58,17 @@ class OutcomePairDataset(Dataset):
         idx = self.indices[i]
         item = self.base[idx]
         ep, t = self.base.keys[idx]
-        item["outcome"] = torch.tensor(
-            float(self.outcome[(ep, int(t))]), dtype=torch.float32)
+        key = (ep, int(t))
+        item["outcome"] = torch.tensor(float(self.outcome[key]), dtype=torch.float32)
+        fc = self.forecast.get(key)
+        if fc is not None:                                  # aux 5×5 forecast labels
+            item["p1_future"] = fc["p1_future"].float()
+            item["p1_valid"] = fc["p1_valid"].float()
         return item
 
 
 def _qset_step(model, set_enc, frac_embed, ships_embed, q_trunk, vh, encoders,
-               batch, *, d_frac, d_ships):
+               batch, *, d_frac, d_ships, aux_weight=0.0):
     out = _forward_context_from_batch(
         model, encoders[0], encoders[1], encoders[2], batch)
     glob = out["glob"]
@@ -72,17 +77,27 @@ def _qset_step(model, set_enc, frac_embed, ships_embed, q_trunk, vh, encoders,
         out, batch, frac_embed, ships_embed, d_frac, d_ships)
     set_token, _ = set_enc(launch, pad)                    # full set
     q_emb = q_trunk(set_token, glob, player)
-    q_set = vh(q_emb)["q_set"]                             # (B,)
+    heads = vh(q_emb)
+    q_set = heads["q_set"]                                 # (B,)
     y = batch["outcome"]                                   # (B,) +1/-1
     loss = F.huber_loss(q_set, y, delta=1.0)
+    terms = {"huber": float(loss.detach())}
+    # AUX FORECAST — action-conditioned 5 signals × 5 horizons → realized t+h
+    if aux_weight > 0 and "p1_future" in batch:
+        tgt = batch["p1_future"]                           # (B,5,5)
+        vmask = batch["p1_valid"].view(-1, 1, tgt.shape[-1])  # (B,1,5) per-horizon
+        hub = F.huber_loss(heads["aux_fwd"], tgt, delta=0.25, reduction="none")
+        aux = (hub * vmask).sum() / vmask.expand_as(hub).sum().clamp(min=1)
+        loss = loss + aux_weight * aux
+        terms["aux_fwd"] = float(aux.detach())
     with torch.no_grad():
         qd = q_set.detach()
         sign_acc = ((qd.sign() == y.sign()) | (y == 0)).float().mean().item()
         corr = _corr(qd, y)
-    return loss, {"huber": float(loss.detach()), "sign_acc": sign_acc,
-                  "corr": corr, "q_mean": float(qd.mean()),
+    terms.update({"sign_acc": sign_acc, "corr": corr, "q_mean": float(qd.mean()),
                   "q_win": float(qd[y > 0].mean()) if (y > 0).any() else float("nan"),
-                  "q_loss": float(qd[y < 0].mean()) if (y < 0).any() else float("nan")}
+                  "q_loss": float(qd[y < 0].mean()) if (y < 0).any() else float("nan")})
+    return loss, terms
 
 
 def _corr(a, b):
@@ -154,15 +169,19 @@ def train_qset(args) -> Path:
 
     _log(f"loading outcome sidecar {args.outcome_sidecar} ...")
     outcome = torch.load(args.outcome_sidecar, weights_only=False)["outcome"]
-    _log(f"  {len(outcome)} acted snapshots have outcome labels")
+    forecast = (torch.load(args.forecast_sidecar, weights_only=False)["forecast"]
+                if args.forecast_sidecar else None)
+    _log(f"  {len(outcome)} outcome labels" + (
+        f" | {len(forecast)} forecast labels — aux 5×5 ON (w={args.aux_weight})"
+        if forecast else " — aux OFF"))
     pair_ds = CachedPairDataset(args.pair_cache_path)
     if tuple(pair_ds.history_offsets) != UNION_HISTORY_OFFSETS:
         pair_ds.history_offsets = UNION_HISTORY_OFFSETS
     acted = list(pair_ds.acted_indices)
     a_tr, a_va, _, _ = _episode_split(
         [pair_ds.keys[i] for i in acted], args.val_frac, args.seed)
-    tr = OutcomePairDataset(pair_ds, [acted[i] for i in a_tr], outcome)
-    va = OutcomePairDataset(pair_ds, [acted[i] for i in a_va], outcome)
+    tr = OutcomePairDataset(pair_ds, [acted[i] for i in a_tr], outcome, forecast)
+    va = OutcomePairDataset(pair_ds, [acted[i] for i in a_va], outcome, forecast)
     tr_loader = DataLoader(tr, batch_size=args.batch_size, shuffle=True,
                            num_workers=args.num_workers, drop_last=True)
     va_loader = DataLoader(va, batch_size=args.batch_size, num_workers=args.num_workers)
@@ -189,7 +208,8 @@ def train_qset(args) -> Path:
             batch = {k: v.to(device) for k, v in batch.items()}
             loss, terms = _qset_step(model, set_enc, frac_embed, ships_embed,
                                      q_trunk, vh, encoders, batch,
-                                     d_frac=d_frac, d_ships=d_ships)
+                                     d_frac=d_frac, d_ships=d_ships,
+                                     aux_weight=args.aux_weight)
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 (p for g in groups for p in g["params"]), args.grad_clip)
@@ -210,7 +230,8 @@ def train_qset(args) -> Path:
                 batch = {k: v.to(device) for k, v in batch.items()}
                 _, terms = _qset_step(model, set_enc, frac_embed, ships_embed,
                                       q_trunk, vh, encoders, batch,
-                                      d_frac=d_frac, d_ships=d_ships)
+                                      d_frac=d_frac, d_ships=d_ships,
+                                      aux_weight=args.aux_weight)
                 for k, v in terms.items():
                     if isinstance(v, float) and not math.isnan(v):
                         vrun[k] = vrun.get(k, 0.0) + v; vcnt[k] = vcnt.get(k, 0) + 1
@@ -232,6 +253,9 @@ def main() -> None:
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--pair-cache-path", type=Path, required=True)
     p.add_argument("--outcome-sidecar", type=Path, required=True)
+    p.add_argument("--forecast-sidecar", type=Path, default=None,
+                   help="aux 5×5 signal-forecast labels (cross-cache join); aux OFF if absent")
+    p.add_argument("--aux-weight", type=float, default=0.25)
     p.add_argument("--fleet-run-dir", type=Path, required=True)
     p.add_argument("--planet-run-dir", type=Path, required=True)
     p.add_argument("--comet-run-dir", type=Path, required=True)
